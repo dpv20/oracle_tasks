@@ -23,9 +23,12 @@ class UpdateBanner(ctk.CTkFrame):
         self._label.bind("<Button-1>", lambda _e: self._on_click())
         self.bind("<Button-1>", lambda _e: self._on_click())
 
-    def show(self, text: str) -> None:
+    def show(self, text: str, before=None) -> None:
         self._label.configure(text=text)
-        self.pack(side="top", fill="x")
+        if before is not None:
+            self.pack(side="top", fill="x", before=before)
+        else:
+            self.pack(side="top", fill="x")
 
     def hide(self) -> None:
         self.pack_forget()

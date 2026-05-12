@@ -28,6 +28,7 @@ T: dict[str, dict[str, str]] = {
 
         # Update banner
         "update.available": "Update available — click to install",
+        "update.available_v": "⬆  Update available v{version} — click to install",
         "update.installing": "Installing update...",
 
         # Spools view (placeholder — real labels come in Phase 3)
@@ -86,6 +87,13 @@ T: dict[str, dict[str, str]] = {
         "settings.general.detect": "Auto-detect",
         "settings.general.download": "Download from Oracle",
         "settings.general.test": "Test",
+        "settings.general.test_section": "Test connection",
+        "settings.general.test_db_label": "Credential",
+        "settings.general.test_running": "Connecting...",
+        "settings.general.test_ok": "Connected — query returned 1",
+        "settings.general.test_fail": "Failed (exit {code})",
+        "settings.general.test_no_sqlcl": "Set the SQLcl path first.",
+        "settings.general.test_no_creds": "No credentials saved. Add one in the Credentials tab.",
         "settings.general.apply": "Apply",
         "settings.general.restart_for_lang": "Language change applied. Some text updates after restart.",
 
@@ -120,6 +128,7 @@ T: dict[str, dict[str, str]] = {
 
         # Update banner
         "update.available": "Actualización disponible — haz click para instalar",
+        "update.available_v": "⬆  Actualización v{version} disponible — haz click para instalar",
         "update.installing": "Instalando actualización...",
 
         # Spools view
@@ -178,6 +187,13 @@ T: dict[str, dict[str, str]] = {
         "settings.general.detect": "Auto-detectar",
         "settings.general.download": "Descargar de Oracle",
         "settings.general.test": "Probar",
+        "settings.general.test_section": "Probar conexión",
+        "settings.general.test_db_label": "Credencial",
+        "settings.general.test_running": "Conectando...",
+        "settings.general.test_ok": "Conectado — el query retornó 1",
+        "settings.general.test_fail": "Falló (exit {code})",
+        "settings.general.test_no_sqlcl": "Configura primero la ruta de SQLcl.",
+        "settings.general.test_no_creds": "No hay credenciales guardadas. Agrega una en el tab Credenciales.",
         "settings.general.apply": "Aplicar",
         "settings.general.restart_for_lang": "Idioma actualizado. Algunos textos se refrescan al reiniciar.",
 

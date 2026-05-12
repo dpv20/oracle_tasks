@@ -3,12 +3,16 @@ from __future__ import annotations
 
 import logging
 import os
+import subprocess
+import sys
+import webbrowser
 
 import customtkinter as ctk
 
-from core.config import ConfigManager
+from settings.config import ConfigManager
 from i18n import set_language, t
-from paths import ASSETS_DIR
+from infra.updater import check_for_update
+from paths import ASSETS_DIR, REPO_ROOT
 from version import __version__
 
 from .home_view import HomeView
@@ -66,12 +70,38 @@ class OracleTasksApp:
         self.root.title(t("app.title"))
 
     # ── update banner ──
-    def show_update_banner(self) -> None:
-        self.banner.show(t("update.available"))
+    def show_update_banner(self, remote_version: str | None = None) -> None:
+        if remote_version:
+            text = t("update.available_v", version=remote_version)
+        else:
+            text = t("update.available")
+        self.banner.show(text, before=self.container)
+
+    def _on_remote_version(self, remote_version: str) -> None:
+        # Called on the updater's worker thread — marshal onto the UI thread.
+        self.root.after(0, lambda v=remote_version: self.show_update_banner(v))
 
     def _on_update_click(self) -> None:
-        # Phase 6: trigger update.bat. For now just log.
-        log.info("Update banner clicked — update flow lands in Phase 6.")
+        updater = REPO_ROOT / "update.bat"
+        if not updater.exists():
+            webbrowser.open("https://github.com/dpv20/oracle_tasks/releases/latest")
+            return
+        pythonw = sys.executable
+        if pythonw.lower().endswith("python.exe"):
+            candidate = pythonw[: -len("python.exe")] + "pythonw.exe"
+            if os.path.isfile(candidate):
+                pythonw = candidate
+        try:
+            subprocess.Popen(
+                ["cmd", "/c", "start", "", str(updater), pythonw],
+                cwd=str(REPO_ROOT),
+                creationflags=0x00000010,  # CREATE_NEW_CONSOLE
+            )
+        except OSError as e:
+            log.error("Failed to launch update.bat: %s", e)
+            return
+        self.banner.configure(text=t("update.installing"))
+        self.root.after(500, self.root.destroy)
 
     # ── theme/language switching ──
     def apply_language(self, lang: str) -> None:
@@ -100,4 +130,6 @@ class OracleTasksApp:
     def run(self) -> None:
         log.info("Oracle Tasks Chile v%s starting (lang=%s, theme=%s)",
                  __version__, self.config.get("language"), self.config.get("theme"))
+        # Silent background update check — fires the banner if origin/main is ahead.
+        check_for_update(self._on_remote_version)
         self.root.mainloop()

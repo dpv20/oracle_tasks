@@ -7,8 +7,8 @@ from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
 
-from core.config import decrypt_password, encrypt_password
-from core.credentials import (
+from settings.config import decrypt_password, encrypt_password
+from settings.credentials import (
     credential_dict,
     parse,
     parse_many,
@@ -262,6 +262,24 @@ class SettingsView(ctk.CTkFrame):
             command=self._on_detect_sqlcl,
         ).grid(row=6, column=2, padx=5, pady=2)
 
+        # Test connection
+        SectionLabel(wrap, text=t("settings.general.test_section")).grid(
+            row=7, column=0, columnspan=3, sticky="w", pady=(15, 4),
+        )
+        self._test_options = self._collect_test_options()
+        values = [opt[0] for opt in self._test_options] or [t("settings.general.test_no_creds")]
+        self.test_db_select = ctk.CTkOptionMenu(wrap, values=values)
+        self.test_db_select.grid(row=8, column=0, columnspan=2, sticky="ew", padx=20, pady=2)
+        ctk.CTkButton(
+            wrap, text=t("settings.general.test"), width=100,
+            command=self._on_test_connection,
+        ).grid(row=8, column=2, padx=5, pady=2)
+        self.test_status_label = ctk.CTkLabel(
+            wrap, text="", anchor="w", justify="left",
+            font=ctk.CTkFont(family="Consolas", size=11),
+        )
+        self.test_status_label.grid(row=9, column=0, columnspan=3, sticky="ew", padx=20, pady=(2, 4))
+
         wrap.grid_columnconfigure(0, weight=1)
         wrap.grid_columnconfigure(1, weight=1)
 
@@ -270,6 +288,77 @@ class SettingsView(ctk.CTkFrame):
             parent, text=t("settings.general.apply"),
             command=self._on_apply_general,
         ).pack(anchor="e", padx=10, pady=15)
+
+    def _collect_test_options(self) -> list[tuple[str, str, str, str]]:
+        """Flatten saved creds into (display, country, db_name, cred_key) tuples."""
+        out: list[tuple[str, str, str, str]] = []
+        all_creds = self.app.config.all_credentials()
+        for country, country_label in COUNTRIES:
+            for db_name, by_login in all_creds.get(country, {}).items():
+                for cred_key in by_login:
+                    display = f"{country_label} · {db_name} · {cred_key}"
+                    out.append((display, country, db_name, cred_key))
+        return out
+
+    def _on_test_connection(self):
+        sel = self.test_db_select.get()
+        opt = next((o for o in self._test_options if o[0] == sel), None)
+        if not opt:
+            self._show_test_result(False, t("settings.general.test_no_creds"))
+            return
+        sqlcl_path = (self.sqlcl_entry.get() or "").strip()
+        if not sqlcl_path or not os.path.exists(sqlcl_path):
+            self._show_test_result(False, t("settings.general.test_no_sqlcl"))
+            return
+        _, country, db_name, cred_key = opt
+        cred = self.app.config.get_credential(country, db_name, cred_key)
+        if not cred:
+            self._show_test_result(False, t("settings.general.test_no_creds"))
+            return
+
+        self.test_status_label.configure(
+            text=t("settings.general.test_running"),
+            text_color=("gray35", "gray70"),
+        )
+
+        import threading
+        threading.Thread(
+            target=self._do_test_connection,
+            args=(sqlcl_path, cred, db_name),
+            daemon=True,
+        ).start()
+
+    def _do_test_connection(self, sqlcl_path: str, cred: dict, db_name: str):
+        from spools_accounts.sqlcl import SqlclRunner
+        from settings.credentials import to_sqlcl_arg
+
+        password = decrypt_password(cred.get("password_enc", ""))
+        connection = to_sqlcl_arg(
+            cred.get("user", ""),
+            cred.get("schema") or None,
+            password,
+            cred.get("tns") or db_name,
+        )
+        result = SqlclRunner(sqlcl_path).run_query(connection, "select 1 from dual")
+
+        if result.ok and "1" in result.stdout:
+            msg = t("settings.general.test_ok")
+            ok = True
+        else:
+            ok = False
+            err_line = (result.stderr or result.stdout or "").strip().splitlines()
+            tail = err_line[-1] if err_line else ""
+            msg = t("settings.general.test_fail", code=result.exit_code)
+            if tail:
+                msg += f"\n{tail[:240]}"
+
+        log.info("Test connection result: ok=%s code=%s db=%s user=%s",
+                 ok, result.exit_code, db_name, cred.get("user"))
+        self.after(0, lambda: self._show_test_result(ok, msg))
+
+    def _show_test_result(self, ok: bool, msg: str):
+        color = ("#1A7F37", "#3FB950") if ok else ("#CF222E", "#FF6B6B")
+        self.test_status_label.configure(text=msg, text_color=color)
 
     def _on_language(self):
         self.app.apply_language(self.lang_var.get())
@@ -287,7 +376,7 @@ class SettingsView(ctk.CTkFrame):
             self.sqlcl_entry.insert(0, f)
 
     def _on_detect_sqlcl(self):
-        from core.sqlcl_locator import locate_sqlcl
+        from spools_accounts.sqlcl_locator import locate_sqlcl
         found = locate_sqlcl()
         if found:
             self.sqlcl_entry.delete(0, "end")

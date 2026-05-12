@@ -37,9 +37,34 @@ Convención:
 - ✅ Verificación: `python -m compileall src` OK; smoke import de `ui.settings_view` con `CountryCredentialsDialog`/`CredentialEditDialog`/`COUNTRIES` OK; lanzada manualmente, tiles muestran 6/5/5/2, popup abre + agrupa + edita + borra correctamente, popup centrado en pantalla.
 
 ### Próximos pasos restantes en Fase 2
-- Crear `src/core/sqlcl.py` con `SqlclRunner` (usando `sqlcl_locator.locate_sqlcl()` que ya existe).
-- Botón "Test connection" en Settings → General que corra `select 1 from dual` contra una DB del catálogo.
 - Actualizar `install.bat` para detectar también `sqlcl\sqlcl\bin\` (instalación nested del usuario).
+
+### SqlclRunner + Test connection
+- ✅ Creado `src/spools_accounts/sqlcl.py` con `SqlclRunner.run_query(connection, sql)` → `RunResult(exit_code, stdout, stderr)`. Invoca `sql.exe -S -L <conn>` y alimenta SQL vía stdin (evita problemas de quoting en Windows). `-S` silencia banner, `-L` falla rápido en error de login. `CREATE_NO_WINDOW` evita parpadeo de consola. Timeout 30s por default.
+- ✅ Settings → General → sección "Test connection": dropdown con todas las credenciales guardadas (`<País> · <DB> · <login>`) + botón Test que corre `select 1 from dual` en thread separado. Status label muestra OK (verde) o `Falló (exit N)` + última línea del error (rojo). UI no se congela.
+- 🔧 Decisión: el dropdown es plano por credencial (no por DB) — así se puede probar específicamente Colombia QA con su segundo login (`prov_oracle_nivel2[FUNREGCOQA]`) sin tener que adivinar cuál se selecciona automáticamente.
+
+### Refactor a estructura por dominio
+- 🔧 Decisión: `core/` se elimina y se divide por dominio antes de que Fase 3 agregue más archivos. Razones: dejar `core/` como grab-bag empezaba a confundir; cada nueva tarea (spools_engine, updater) iba a hacerlo peor.
+- ✅ Nueva estructura `src/`:
+  - `settings/` → `config.py`, `credentials.py` (dominio Settings)
+  - `spools_accounts/` → `databases.py`, `sqlcl.py`, `sqlcl_locator.py` (dominio Spools/Accounts)
+  - `infra/` → `logger.py`, `updater.py` (cross-cutting)
+  - `ui/`, `paths.py`, `i18n.py`, `version.py`, `main.py` → sin cambios
+- ✅ Movidos 5 archivos con `git mv` (renames detectados por git, history preservada); `sqlcl.py` quedó como untracked porque era nuevo del mismo día — se agrega con `git add` en el commit.
+- ✅ Imports actualizados en `main.py`, `ui/app.py`, `ui/settings_view.py`. `settings/credentials.py` mantiene `from .config import ...` (relative import sigue válido al estar en el mismo paquete).
+- ✅ Verificación: `compileall src` OK + smoke import de cada paquete nuevo OK.
+
+### Versión 0.0.1 + auto-updater
+- 🔧 Decisión: mirroreamos el patrón de la app vpn (`c:\...\vpn\`): `assets/version.json` para metadata + `src/version.py` como fuente de verdad que el updater consulta vía `git fetch origin main` y `git show origin/main:src/version.py`. **No usamos** `raw.githubusercontent.com` (idea original del plan §11) porque vpn ya probó que git es más confiable detrás del firewall corporativo.
+- ✅ Movido `version.json` de la raíz a `assets/version.json` (mirror de vpn) con `git mv`.
+- ✅ Bajada la versión a `0.0.1` en `src/version.py` y `assets/version.json`. Razón explícita del usuario: arrancar limpio en `0.0.1` antes de empezar releases reales.
+- ✅ Creado `src/infra/updater.py` clon del `_check_for_update` de vpn: thread background al arrancar, `git fetch origin main` + `git show origin/main:src/version.py`, compara tuplas y llama callback solo si remote > local. Silencioso en todos los failure modes (sin git, sin red, repo no-git).
+- ✅ Conectado `infra.updater.check_for_update` al startup de `OracleTasksApp.run()`. El callback `_on_remote_version` marshala al UI thread vía `root.after(0, ...)` antes de mostrar el banner.
+- ✅ `_on_update_click` ahora lanza `update.bat` con `subprocess.Popen(["cmd","/c","start","",updater,pythonw], creationflags=CREATE_NEW_CONSOLE)` y cierra la app — patrón exacto del vpn.
+- ⚠️ Bug + fix: el banner aparecía abajo en vez de arriba. Causa: `container.pack(fill="both", expand=True)` ocupaba toda la pantalla antes de que `banner.show()` corriera, así que el banner caía debajo. **Fix:** `UpdateBanner.show()` ahora acepta `before=widget`; `show_update_banner()` pasa `before=self.container` para forzar el orden.
+- ✅ i18n: agregada key `update.available_v` con interpolación de `{version}` ("⬆ Update available v{version} — click to install" / "⬆ Actualización v{version} disponible — haz click para instalar").
+- ⚠️ Estado transitorio: al correr la app con local=0.0.1, el banner muestra "Update available v0.1.0" porque `origin/main` aún apunta al commit inicial `570ce8b` que tenía 0.1.0. Se resuelve mergeando esta rama a main: una vez `main` esté en 0.0.1, local == remote y el banner desaparece.
 
 ---
 

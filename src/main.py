@@ -62,7 +62,7 @@ def main() -> None:
     from paths import ensure_dirs
     ensure_dirs()
 
-    from core.logger import setup_logger
+    from infra.logger import setup_logger
     setup_logger()
 
     from ui.app import OracleTasksApp
