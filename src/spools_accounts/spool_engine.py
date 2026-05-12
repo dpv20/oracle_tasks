@@ -105,6 +105,12 @@ def worker_count_for(account_count: int, max_workers: int = MAX_PARALLEL_ACCOUNT
     return min(account_count, max(1, max_workers))
 
 
+def _with_exit(sql_text: str) -> str:
+    if sql_text.rstrip().lower().endswith(("exit;", "exit")):
+        return sql_text
+    return sql_text.rstrip() + "\nexit;\n"
+
+
 class SpoolEngine:
     """EXTRACT_ONLY: run the country template against a source DB.
 
@@ -123,11 +129,16 @@ class SpoolEngine:
         """
         tmpl = template_path(country)
         text = tmpl.read_text(encoding="utf-8")
-        rendered = text.replace("{{SPOOL_OUT_DIR}}", str(SPOOLS_OUT_DIR))
-        if not rendered.rstrip().lower().endswith(("exit;", "exit")):
-            rendered = rendered.rstrip() + "\nexit;\n"
+        rendered = _with_exit(text.replace("{{SPOOL_OUT_DIR}}", str(SPOOLS_OUT_DIR)))
         out = Path(tempfile.gettempdir()) / f"oracle_tasks_{country.lower()}_{uuid.uuid4().hex[:8]}.sql"
         out.write_text(rendered, encoding="utf-8")
+        return out
+
+    def _render_existing_spool(self, spool_path: Path) -> Path:
+        """Copy a generated spool to temp and append exit if needed."""
+        text = spool_path.read_text(encoding="utf-8", errors="replace")
+        out = Path(tempfile.gettempdir()) / f"oracle_tasks_apply_{uuid.uuid4().hex[:8]}.sql"
+        out.write_text(_with_exit(text), encoding="utf-8")
         return out
 
     def extract_one(
@@ -222,6 +233,81 @@ class SpoolEngine:
                 except Exception as exc:
                     log.exception("Unhandled spool extraction error for %s", account_list[idx])
                     result = AccountResult(account_list[idx], SpoolStatus.ERROR, error=str(exc))
+                    results[idx] = result
+                    if on_status:
+                        on_status(result.account, result.status, result.error)
+
+        return [r for r in results if r is not None]
+
+    def apply_one(
+        self,
+        account: str,
+        connection: str,
+        spool_path: Path,
+        on_status: StatusCallback | None = None,
+    ) -> AccountResult:
+        if not spool_path.exists():
+            r = AccountResult(account, SpoolStatus.ERROR, error=f"Spool not found: {spool_path.name}")
+            if on_status:
+                on_status(account, r.status, r.error)
+            return r
+
+        if on_status:
+            on_status(account, SpoolStatus.RUNNING, "")
+
+        rendered = self._render_existing_spool(spool_path)
+        try:
+            result: RunResult = self.runner.run_script(connection, rendered, [], timeout=1800)
+        finally:
+            try:
+                rendered.unlink()
+            except OSError:
+                pass
+
+        if not result.ok:
+            tail = (result.stderr or result.stdout or "").strip().splitlines()
+            err = tail[-1][:240] if tail else f"exit {result.exit_code}"
+            r = AccountResult(account, SpoolStatus.ERROR, output_path=spool_path, error=err)
+            if on_status:
+                on_status(account, r.status, r.error)
+            return r
+
+        r = AccountResult(account, SpoolStatus.OK, output_path=spool_path)
+        if on_status:
+            on_status(account, r.status, "")
+        return r
+
+    def apply_many(
+        self,
+        items: Iterable[tuple[str, Path]],
+        connection: str,
+        on_status: StatusCallback | None = None,
+        max_workers: int = MAX_PARALLEL_ACCOUNTS,
+    ) -> list[AccountResult]:
+        item_list = list(items)
+        workers = worker_count_for(len(item_list), max_workers)
+        if workers == 0:
+            return []
+        if workers == 1:
+            return [
+                self.apply_one(account, connection, spool_path, on_status)
+                for account, spool_path in item_list
+            ]
+
+        results: list[AccountResult | None] = [None] * len(item_list)
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_to_index = {
+                executor.submit(self.apply_one, account, connection, spool_path, on_status): idx
+                for idx, (account, spool_path) in enumerate(item_list)
+            }
+            for future in as_completed(future_to_index):
+                idx = future_to_index[future]
+                account, spool_path = item_list[idx]
+                try:
+                    results[idx] = future.result()
+                except Exception as exc:
+                    log.exception("Unhandled spool inject error for %s", account)
+                    result = AccountResult(account, SpoolStatus.ERROR, output_path=spool_path, error=str(exc))
                     results[idx] = result
                     if on_status:
                         on_status(result.account, result.status, result.error)

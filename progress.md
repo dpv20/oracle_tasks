@@ -11,6 +11,18 @@ Convención:
 
 ## 2026-05-12
 
+### Fase 4 — inject FROM/TO con selección por cuenta 🚧
+- ✅ `src/ui/spools_view.py`: agregada DB destino (`Destination DB` / `DB destino`) bajo la DB origen. Source sigue mostrando todos los ambientes disponibles para permitir extracciones flexibles; Destination queda limitado a QA/BUP QA/DEV para evitar aplicar accidentalmente sobre PROD.
+- ✅ Lista de cuentas rediseñada en dos columnas verticales: `Extract` e `Inject`. `Extract` muestra todas las cuentas que se van a descargar; `Inject` muestra solo las que además se inyectarán. El `x` en `Extract` borra la cuenta completa (también de inject); el `x` en `Inject` solo la quita de inject y la deja en Extract.
+- ✅ Botón `Open spools folder` movido al bloque de acciones junto al botón principal, para que esté siempre visible antes/durante/después de correr un proceso.
+- ✅ CTA principal: muestra `Apply` cuando hay cuentas en la columna Inject; si no hay cuentas para inject, muestra `Extract`.
+- ✅ Flujo de ejecución: primero extrae todas las cuentas desde FROM con máximo 3 workers; luego inyecta solo las cuentas seleccionadas y extraídas correctamente en TO, también con máximo 3 workers. Si no hay ninguna cuenta marcada para inject, corre como extract-only.
+- ✅ Confirmación obligatoria antes de inject: muestra destino y cuentas seleccionadas. Se bloquea source == destination.
+- ✅ `src/spools_accounts/spool_engine.py`: agregado `apply_one()` / `apply_many()` para ejecutar spools existentes contra destino. Igual que con templates, crea una copia temporal con `exit;` agregado si falta, sin modificar el `.SQL` generado.
+- ✅ i18n EN/ES actualizado para labels FROM/TO, estados `extracting/injecting`, resumen extract+inject y validaciones.
+- ✅ Verificación: `python -m compileall src` OK; smoke test con runner falso OK para extract+apply de 7 cuentas con `max_active=3`; smoke import de `ui.spools_view` OK.
+- ⚠️ Pendiente: prueba real del inject contra ambiente QA/DEV con 1 cuenta antes de usar batch grande.
+
 ### Fase 3 — validación real + paralelismo de descarga
 - ✅ Verificación usuario: descarga real de cuentas desde ambientes DB funcionando; probada con 3 cuentas y spools generados correctamente.
 - 🔧 Decisión: los batches de cuentas corren con máximo 3 ejecuciones paralelas. Si el usuario entrega 1 o 2 cuentas, se usan 1 o 2 workers; si entrega 10/100, se procesan de a 3 hasta terminar. El mismo patrón se reutilizará para upload en Fase 4.
