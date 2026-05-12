@@ -66,9 +66,7 @@ class HomeView(ctk.CTkFrame):
         ).pack(side="right")
 
     def _on_spools(self) -> None:
-        # Phase 3 will swap this for a real spools view
-        from tkinter import messagebox
-        messagebox.showinfo(t("spools.title"), t("spools.coming_soon"))
+        self.app.show_view("spools")
 
     def _on_settings(self) -> None:
         self.app.show_view("settings")

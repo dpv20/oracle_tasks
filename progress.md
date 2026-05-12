@@ -39,6 +39,39 @@ Convención:
 ### Próximos pasos restantes en Fase 2
 - Actualizar `install.bat` para detectar también `sqlcl\sqlcl\bin\` (instalación nested del usuario).
 
+### Fase 3 — Spools view (EXTRACT_ONLY) 🚧
+- 🔧 Decisión: México queda fuera del dropdown de Spools por ahora (no hay `CL_ACCOUNT_SPOOL_MEXICO.sql`). Sigue apareciendo en Settings (tile + credenciales). `has_template(country)` filtra automáticamente.
+- 🔧 Decisión: dropdown de Source DB **muestra todas las envs** (PROD / BUP PROD / QA / BUP QA / DEV), no solo PROD. Razón: el usuario puede querer extraer desde QA o DEV (ej. mover QA1 → QA2). El plan §4 decía "solo prod" pero la realidad operativa es más flexible. Las opciones están etiquetadas con env tag para que no haya confusión: `QA · Peru QA 19c · PERU_QA_OCI_19C`.
+- 🔧 Decisión UI: input de cuentas pasa de textarea a **entry single-line + botón "+ Add" + lista dinámica** con botones [×] rojos por fila. Razón pedida por el usuario: menos propenso a errores de tipeo, deja la lista a la vista y confirma cada cuenta al agregarla (regex `^[A-Za-z0-9_-]{3,40}$`). Enter en el entry también agrega.
+- ✅ Templates: creada `spools_sql/` con `CL_ACCOUNT_SPOOL_<COUNTRY>.sql.tmpl` para Chile/Peru/Colombia, derivados de los `*2.sql` (los que usan `&1` posicional, no los interactivos con `Accept PROMPT`). Replace literal: `C:\Users\Diego Pavez\Desktop\sqlcl\spools\spools_files\Accounts` → `{{SPOOL_OUT_DIR}}`. Los originales en `spools/` quedan intactos como referencia.
+- ✅ `spools_accounts/sqlcl.py`: extendido con `SqlclRunner.run_script(connection, script_path, args, timeout)`. Refactor para que ambos métodos compartan `_invoke()`.
+- ✅ Creado `spools_accounts/spool_engine.py`:
+  - `SpoolStatus` enum (PENDING/RUNNING/OK/ERROR), `AccountResult` dataclass.
+  - `parse_accounts(text)` y `is_valid_account(s)` para validación.
+  - `SpoolEngine.extract_one(country, account, connection, on_status)` y `extract_many()`.
+  - Render: lee `.sql.tmpl`, sustituye `{{SPOOL_OUT_DIR}}` por `paths.SPOOLS_OUT_DIR` real, escribe a `%TEMP%\oracle_tasks_<country>_<uuid>.sql`, ejecuta y borra el temp.
+  - Pre-clean: elimina spool viejo antes de correr, así que la existencia del `.SQL` post-éxito significa write fresco (no archivo viejo huérfano).
+- ⚠️ Bug + fix: los `.sql` originales **no tienen `exit;` al final** (terminan en `SPOOL OFF`). Cuando SQLcl los ejecuta vía `@<file>`, después de procesar todo se queda al prompt esperando input, así que `subprocess.run` no retorna hasta el timeout. Síntoma: la primera cuenta se quedaba en ⟳ ~3 min y recién después marcaba ERROR por timeout. **Fix:** `_render_template` agrega `exit;` al final si el template no termina con uno. No modifica el archivo original (per regla de `agent.md`), solo el .sql temporal.
+- 🔧 Decisión timeout: 1800s (30 min) por cuenta. Razón: el usuario reportó que algunas cuentas legítimas tardan 5–10 min en extraerse (red lenta, cuentas grandes). 180s del MVP era demasiado agresivo. `subprocess.run(timeout=N)` es wallclock total, no idle, así que hay que cubrir el peor caso real.
+- ✅ Creado widget `AccountStatusRow` en `ui/widgets.py`: glyph + cuenta + mensaje. Estados: `…` gris (pending), `⟳` azul (running), `✓` verde (OK), `✗` rojo (error).
+- ✅ Creado `ui/spools_view.py`:
+  - Header con Back + título.
+  - Form: País dropdown + Source DB dropdown (filtrado por país + ordenado por env).
+  - Account number entry + [+ Add] button + Enter binding.
+  - `pending_frame` scrollable con la lista de cuentas agregadas (cada una con su [×] rojo).
+  - [Extract spools] button + summary label.
+  - `results_frame` scrollable con un `AccountStatusRow` por cuenta procesada.
+  - [Open spools folder] al fondo (usa `os.startfile` para abrir Explorer).
+  - Threading: `_do_run` corre en daemon thread; callbacks per-cuenta se marshalean al UI thread con `app.root.after(0, ...)`. Continúa en error (no aborta el batch).
+- ✅ Wire: `app.show_view("spools")`, `HomeView._on_spools` reemplazado para abrir la view real (antes solo mostraba un messagebox de "coming soon").
+- ✅ i18n: agregadas keys `spools.*` (country, source_db, account_number, add_account, added_accounts, run, running, summary_ok, summary_mixed, open_folder, no_template, no_creds, no_sqlcl, no_pending, invalid_account, duplicate_account, invalid_db) en EN/ES.
+- ✅ Verificación: `python -m compileall src` OK; smoke import de `spools_view`, `spool_engine`, `AccountStatusRow` OK; templates detectados para chile/peru/colombia (mexico=False); `parse_accounts` clasifica correctamente válidos e inválidos; output path se construye en `%LOCALAPPDATA%\OracleTasksChile\spools_out\<Country>\CL_Acc_Spool_<account>.SQL`.
+
+### Próximos pasos
+- Validar end-to-end con cuenta real en QA (extracción exitosa → archivo en `spools_out/<Country>/`).
+- Commit + push de Fase 3 en `feat/spools-view`.
+- Fase 4: dropdown `destination` + modo EXTRACT_AND_APPLY + diálogo de confirmación obligatorio antes de aplicar en QA/DEV.
+
 ### SqlclRunner + Test connection
 - ✅ Creado `src/spools_accounts/sqlcl.py` con `SqlclRunner.run_query(connection, sql)` → `RunResult(exit_code, stdout, stderr)`. Invoca `sql.exe -S -L <conn>` y alimenta SQL vía stdin (evita problemas de quoting en Windows). `-S` silencia banner, `-L` falla rápido en error de login. `CREATE_NO_WINDOW` evita parpadeo de consola. Timeout 30s por default.
 - ✅ Settings → General → sección "Test connection": dropdown con todas las credenciales guardadas (`<País> · <DB> · <login>`) + botón Test que corre `select 1 from dual` en thread separado. Status label muestra OK (verde) o `Falló (exit N)` + última línea del error (rojo). UI no se congela.

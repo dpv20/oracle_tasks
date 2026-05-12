@@ -1,9 +1,5 @@
 """SqlclRunner: thin wrapper around invoking `sql.exe`.
 
-For Phase 2 only `run_query` is needed (one-shot SELECT used by the Test
-connection button). `run_script` (streaming output for the spool engine) lands
-in Phase 3.
-
 `-S` silences the banner, `-L` makes login failures fail fast (no interactive
 password retry). `CREATE_NO_WINDOW` keeps the SQLcl console from flashing.
 """
@@ -47,10 +43,26 @@ class SqlclRunner:
             f"{sql.rstrip().rstrip(';')};\n"
             "exit\n"
         )
+        return self._invoke([self.exe, "-S", "-L", connection], stdin=script, timeout=timeout)
+
+    def run_script(
+        self,
+        connection: str,
+        script_path: str | Path,
+        args: list[str] | None = None,
+        timeout: float = 180.0,
+    ) -> RunResult:
+        """Run a SQL script file with optional positional args (`&1`, `&2`, ...)."""
+        cmd: list[str] = [self.exe, "-S", "-L", connection, f"@{script_path}"]
+        if args:
+            cmd.extend(args)
+        return self._invoke(cmd, stdin=None, timeout=timeout)
+
+    def _invoke(self, cmd: list[str], stdin: str | None, timeout: float) -> RunResult:
         try:
             proc = subprocess.run(
-                [self.exe, "-S", "-L", connection],
-                input=script,
+                cmd,
+                input=stdin,
                 capture_output=True,
                 text=True,
                 encoding="utf-8",

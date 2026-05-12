@@ -31,9 +31,26 @@ T: dict[str, dict[str, str]] = {
         "update.available_v": "⬆  Update available v{version} — click to install",
         "update.installing": "Installing update...",
 
-        # Spools view (placeholder — real labels come in Phase 3)
+        # Spools view
         "spools.title": "Spools / Accounts",
         "spools.coming_soon": "Spools workflow — implemented in Phase 3.",
+        "spools.country": "Country",
+        "spools.source_db": "Source DB",
+        "spools.account_number": "Account number",
+        "spools.add_account": "+ Add",
+        "spools.added_accounts": "Accounts to extract ({n})",
+        "spools.run": "Extract spools",
+        "spools.running": "Running... {done}/{total}",
+        "spools.summary_ok": "{ok}/{total} OK",
+        "spools.summary_mixed": "{ok}/{total} OK · {err} errors",
+        "spools.open_folder": "Open spools folder",
+        "spools.no_template": "No spool template for {country}. Add it to spools_sql/ first.",
+        "spools.no_creds": "No credential saved for {db}. Add one in Settings.",
+        "spools.no_sqlcl": "Set the SQLcl path in Settings → General first.",
+        "spools.no_pending": "Add at least one account before extracting.",
+        "spools.invalid_account": "Invalid account format: {acc}",
+        "spools.duplicate_account": "Already in the list.",
+        "spools.invalid_db": "Pick a source database.",
 
         # Settings view
         "settings.title": "Settings",
@@ -134,6 +151,23 @@ T: dict[str, dict[str, str]] = {
         # Spools view
         "spools.title": "Spools / Cuentas",
         "spools.coming_soon": "Flujo de spools — se implementa en la Fase 3.",
+        "spools.country": "País",
+        "spools.source_db": "DB origen",
+        "spools.account_number": "Número de cuenta",
+        "spools.add_account": "+ Agregar",
+        "spools.added_accounts": "Cuentas a extraer ({n})",
+        "spools.run": "Extraer spools",
+        "spools.running": "Procesando... {done}/{total}",
+        "spools.summary_ok": "{ok}/{total} OK",
+        "spools.summary_mixed": "{ok}/{total} OK · {err} con error",
+        "spools.open_folder": "Abrir carpeta de spools",
+        "spools.no_template": "No hay template de spool para {country}. Agrégalo a spools_sql/ primero.",
+        "spools.no_creds": "No hay credencial para {db}. Agrega una en Configuración.",
+        "spools.no_sqlcl": "Configura la ruta de SQLcl en Configuración → General primero.",
+        "spools.no_pending": "Agrega al menos una cuenta antes de extraer.",
+        "spools.invalid_account": "Formato inválido: {acc}",
+        "spools.duplicate_account": "Ya está en la lista.",
+        "spools.invalid_db": "Selecciona una DB origen.",
 
         # Settings view
         "settings.title": "Configuración",
