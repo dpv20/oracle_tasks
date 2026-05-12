@@ -12,6 +12,7 @@ Convención:
 ## 2026-05-12
 
 ### Fase 4 — inject FROM/TO con selección por cuenta 🚧
+- ✅ `.gitignore`: agregado `to-do.md` como nota local no versionada.
 - ✅ `src/ui/spools_view.py`: agregada DB destino (`Destination DB` / `DB destino`) bajo la DB origen. Source sigue mostrando todos los ambientes disponibles para permitir extracciones flexibles; Destination queda limitado a QA/BUP QA/DEV para evitar aplicar accidentalmente sobre PROD.
 - ✅ Lista de cuentas rediseñada en dos columnas verticales: `Extract` e `Inject`. `Extract` muestra todas las cuentas que se van a descargar; `Inject` muestra solo las que además se inyectarán. El `x` en `Extract` borra la cuenta completa (también de inject); el `x` en `Inject` solo la quita de inject y la deja en Extract.
 - ✅ Botón `Open spools folder` movido al bloque de acciones junto al botón principal, para que esté siempre visible antes/durante/después de correr un proceso.

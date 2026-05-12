@@ -14,6 +14,7 @@ env/
 .vscode/
 .idea/
 .claude/
+to-do.md
 
 # PyInstaller (not used now but reserved)
 build/
