@@ -6,7 +6,8 @@ add EXTRACT_AND_APPLY (Phase 4) and APPLY_EXISTING (Phase 5).
 
 Threading: the engine is blocking by design. The UI calls `extract_one` /
 `extract_many` from a worker thread and marshals status callbacks back via
-`Tk.after(0, ...)`. Errors per account never abort the batch.
+`Tk.after(0, ...)`. Batch extraction uses a small worker pool so long runs can
+move several accounts at once. Errors per account never abort the batch.
 """
 from __future__ import annotations
 
@@ -14,6 +15,7 @@ import logging
 import re
 import tempfile
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -53,6 +55,8 @@ _COUNTRY_FOLDER = {
 _ACCOUNT_RE = re.compile(r"^[A-Za-z0-9_-]{3,40}$")
 
 StatusCallback = Callable[[str, SpoolStatus, str], None]
+
+MAX_PARALLEL_ACCOUNTS = 3
 
 
 def template_path(country: str) -> Path:
@@ -95,9 +99,16 @@ def output_path_for(country: str, account: str) -> Path:
     return SPOOLS_OUT_DIR / folder / f"CL_Acc_Spool_{account}.SQL"
 
 
+def worker_count_for(account_count: int, max_workers: int = MAX_PARALLEL_ACCOUNTS) -> int:
+    if account_count <= 0:
+        return 0
+    return min(account_count, max(1, max_workers))
+
+
 class SpoolEngine:
-    """EXTRACT_ONLY: run the country template against a source DB, one account
-    at a time. Output spool files land in SPOOLS_OUT_DIR/<Country>/.
+    """EXTRACT_ONLY: run the country template against a source DB.
+
+    Output spool files land in SPOOLS_OUT_DIR/<Country>/.
     """
 
     def __init__(self, runner: SqlclRunner):
@@ -189,8 +200,30 @@ class SpoolEngine:
         accounts: Iterable[str],
         connection: str,
         on_status: StatusCallback | None = None,
+        max_workers: int = MAX_PARALLEL_ACCOUNTS,
     ) -> list[AccountResult]:
-        results: list[AccountResult] = []
-        for acc in accounts:
-            results.append(self.extract_one(country, acc, connection, on_status))
-        return results
+        account_list = list(accounts)
+        workers = worker_count_for(len(account_list), max_workers)
+        if workers == 0:
+            return []
+        if workers == 1:
+            return [self.extract_one(country, acc, connection, on_status) for acc in account_list]
+
+        results: list[AccountResult | None] = [None] * len(account_list)
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_to_index = {
+                executor.submit(self.extract_one, country, acc, connection, on_status): idx
+                for idx, acc in enumerate(account_list)
+            }
+            for future in as_completed(future_to_index):
+                idx = future_to_index[future]
+                try:
+                    results[idx] = future.result()
+                except Exception as exc:
+                    log.exception("Unhandled spool extraction error for %s", account_list[idx])
+                    result = AccountResult(account_list[idx], SpoolStatus.ERROR, error=str(exc))
+                    results[idx] = result
+                    if on_status:
+                        on_status(result.account, result.status, result.error)
+
+        return [r for r in results if r is not None]

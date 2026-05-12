@@ -11,6 +11,13 @@ Convención:
 
 ## 2026-05-12
 
+### Fase 3 — validación real + paralelismo de descarga
+- ✅ Verificación usuario: descarga real de cuentas desde ambientes DB funcionando; probada con 3 cuentas y spools generados correctamente.
+- 🔧 Decisión: los batches de cuentas corren con máximo 3 ejecuciones paralelas. Si el usuario entrega 1 o 2 cuentas, se usan 1 o 2 workers; si entrega 10/100, se procesan de a 3 hasta terminar. El mismo patrón se reutilizará para upload en Fase 4.
+- ✅ `src/spools_accounts/spool_engine.py`: agregado `MAX_PARALLEL_ACCOUNTS = 3`, helper `worker_count_for()` y `extract_many(..., max_workers=3)` con `ThreadPoolExecutor`. Preserva el orden de resultados original y mantiene error por cuenta sin abortar el batch.
+- ✅ `src/ui/spools_view.py`: la pantalla Spools ahora ejecuta el batch vía `extract_many()` paralelo y cuenta progreso por cuentas realmente finalizadas, no por índice secuencial, para soportar resultados fuera de orden.
+- ✅ Verificación: `python -m compileall src` OK; smoke test con runner falso procesó 7 cuentas con `max_active=3`, resultados OK y orden preservado.
+
 ### Fase 2 — arranque: catálogo de DBs + México al MVP
 - ⚠️ Diff en `tnsnames.ora`: el usuario cargó credencial real para `MX_PROD_OCI` (formato `<USER>/<PASS>@MX_PROD_OCI`, valores omitidos a propósito) y eliminó el bloque duplicado de SCHEMA ID-PASS.
 - 🔧 Decisión: **México entra al MVP** (antes era post-MVP en Fase 7). Razón: el usuario ya tiene credencial real para MX prod y quiere soporte completo.
@@ -37,7 +44,7 @@ Convención:
 - ✅ Verificación: `python -m compileall src` OK; smoke import de `ui.settings_view` con `CountryCredentialsDialog`/`CredentialEditDialog`/`COUNTRIES` OK; lanzada manualmente, tiles muestran 6/5/5/2, popup abre + agrupa + edita + borra correctamente, popup centrado en pantalla.
 
 ### Próximos pasos restantes en Fase 2
-- Actualizar `install.bat` para detectar también `sqlcl\sqlcl\bin\` (instalación nested del usuario).
+- 🔧 Decisión: no depender de una ruta fija para SQLcl. `install.bat` debe priorizar PATH y luego tratar rutas comunes solo como best-effort; cualquier instalación en otra carpeta se cubre con ingreso manual/Browse. La ruta nested `sqlcl\sqlcl\bin\` puede agregarse como conveniencia, pero no es requisito bloqueante.
 
 ### Fase 3 — Spools view (EXTRACT_ONLY) 🚧
 - 🔧 Decisión: México queda fuera del dropdown de Spools por ahora (no hay `CL_ACCOUNT_SPOOL_MEXICO.sql`). Sigue apareciendo en Settings (tile + credenciales). `has_template(country)` filtra automáticamente.
@@ -171,4 +178,4 @@ Convención:
 - Crear `src/core/databases.py` con catálogo Chile/Peru/Colombia parseado desde `tnsnames.ora`
 - Crear `src/core/sqlcl.py` con `SqlclRunner` que use `sqlcl_locator.locate_sqlcl()`
 - Botón "Test connection" en Settings → General que corre `select 1 from dual` contra una DB elegida
-- Actualizar `install.bat` para que también busque en `sqlcl\sqlcl\bin\` (nested install)
+- Mantener detección de SQLcl flexible: PATH primero, rutas comunes como ayuda, y ruta manual para cualquier instalación no estándar.

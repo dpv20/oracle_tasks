@@ -32,8 +32,8 @@ from settings.config import decrypt_password
 from settings.credentials import to_sqlcl_arg
 from spools_accounts import databases as dbs
 from spools_accounts.spool_engine import (
-    AccountResult, SpoolEngine, SpoolStatus,
-    has_template, is_valid_account,
+    MAX_PARALLEL_ACCOUNTS, AccountResult, SpoolEngine, SpoolStatus,
+    has_template, is_valid_account, worker_count_for,
 )
 from spools_accounts.sqlcl import SqlclRunner
 
@@ -64,6 +64,7 @@ class SpoolsView(ctk.CTkFrame):
         self.app = app
         self._status_rows: dict[str, AccountStatusRow] = {}
         self._pending_accounts: list[str] = []
+        self._completed_accounts: set[str] = set()
         self._running = False
         self._db_lookup: dict[str, dict] = {}
 
@@ -280,6 +281,7 @@ class SpoolsView(ctk.CTkFrame):
             self._status_rows[acc] = row
 
         self._running = True
+        self._completed_accounts = set()
         self.run_btn.configure(state="disabled")
         self.summary_label.configure(text=t("spools.running", done=0, total=len(accounts)))
 
@@ -291,35 +293,41 @@ class SpoolsView(ctk.CTkFrame):
 
     def _do_run(self, country: str, accounts: list[str], connection: str, sqlcl_path: str) -> None:
         engine = SpoolEngine(SqlclRunner(sqlcl_path))
-        ok = err = 0
         total = len(accounts)
-        for i, acc in enumerate(accounts, 1):
-            def on_status(account: str, status: SpoolStatus, msg: str,
-                          done=i, total_=total) -> None:
-                self.app.root.after(
-                    0,
-                    lambda a=account, s=status, m=msg, d=done, T=total_:
-                        self._apply_status(a, s, m, d, T),
-                )
-            result: AccountResult = engine.extract_one(country, acc, connection, on_status)
-            if result.status == SpoolStatus.OK:
-                ok += 1
-            else:
-                err += 1
+        workers = worker_count_for(total, MAX_PARALLEL_ACCOUNTS)
+        log.info("Starting spool extraction batch: accounts=%s workers=%s", total, workers)
+
+        def on_status(account: str, status: SpoolStatus, msg: str) -> None:
+            self.app.root.after(
+                0,
+                lambda a=account, s=status, m=msg, T=total:
+                    self._apply_status(a, s, m, T),
+            )
+
+        results: list[AccountResult] = engine.extract_many(
+            country,
+            accounts,
+            connection,
+            on_status,
+            max_workers=MAX_PARALLEL_ACCOUNTS,
+        )
+        ok = sum(1 for result in results if result.status == SpoolStatus.OK)
+        err = sum(1 for result in results if result.status != SpoolStatus.OK)
+        for result in results:
             log.info(
                 "Spool result: %s status=%s out=%s err=%s",
-                acc, result.status.value, result.output_path, result.error,
+                result.account, result.status.value, result.output_path, result.error,
             )
         self.app.root.after(0, lambda: self._finish(ok, err, total))
 
     def _apply_status(self, account: str, status: SpoolStatus, message: str,
-                       done: int, total: int) -> None:
+                       total: int) -> None:
         row = self._status_rows.get(account)
         if row is not None:
             row.set_status(status.value, message)
-        # Update the progress counter only when an account finishes (OK/ERROR),
-        # not when it just moves to RUNNING.
         if status in (SpoolStatus.OK, SpoolStatus.ERROR):
+            self._completed_accounts.add(account)
+            done = len(self._completed_accounts)
             self.summary_label.configure(text=t("spools.running", done=done, total=total))
 
     def _finish(self, ok: int, err: int, total: int) -> None:
