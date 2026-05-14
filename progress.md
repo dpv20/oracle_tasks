@@ -16,6 +16,7 @@ Convención:
 - 🔧 Decision: la ruta `Desktop\sqlcl\sqlcl\bin\sql.exe` es una particularidad del equipo de Diego, no un requisito para los companeros. No se considera pendiente del `install.bat`; el instalador debe seguir priorizando PATH/rutas comunes/manual.
 
 ### Fase 5 — Apply Existing 🚧
+- ⚠️ Bug encontrado y corregido: callbacks UI tardios (`root.after(0, ...)`) podian ejecutarse despues de `_finish()` y volver a pintar el resumen como `Extracting...` / `Injecting...` aunque SQLcl ya habia terminado. Fix: cada run ahora tiene `run_id` y fase activa (`extract`/`inject`/`apply_existing`); callbacks viejos o de fases cerradas pueden actualizar la fila, pero no pisan el resumen final.
 - ✅ `src/ui/spools_view.py`: botón de carpeta actualizado de `Open spools folder` a texto dinámico por país (`Chile spools folder`, `Peru spools folder`, etc.) y refresca al cambiar país/modo.
 - ✅ Creada rama `feat/apply-existing-spool` desde `main` actualizado.
 - ✅ `src/ui/spools_view.py`: agregado modo `Apply existing` con selector de archivo `.SQL`, ocultando origen/lista de cuentas y usando solo DB destino.

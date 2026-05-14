@@ -76,6 +76,8 @@ class SpoolsView(ctk.CTkFrame):
         self._pending_accounts: list[str] = []
         self._inject_flags: dict[str, bool] = {}
         self._completed_steps = 0
+        self._run_id = 0
+        self._active_summary_phase: str | None = None
         self._running = False
         self._db_lookup: dict[str, dict] = {}
         self._dest_db_lookup: dict[str, dict] = {}
@@ -521,12 +523,15 @@ class SpoolsView(ctk.CTkFrame):
 
         self._running = True
         self._completed_steps = 0
+        self._run_id += 1
+        run_id = self._run_id
+        self._active_summary_phase = "extract"
         self.run_btn.configure(state="disabled")
         self.summary_label.configure(text=t("spools.extracting", done=0, total=len(accounts)))
 
         threading.Thread(
             target=self._do_run,
-            args=(country, accounts, inject_accounts, source_connection, dest_connection, sqlcl_path),
+            args=(run_id, country, accounts, inject_accounts, source_connection, dest_connection, sqlcl_path),
             daemon=True,
         ).start()
 
@@ -593,12 +598,15 @@ class SpoolsView(ctk.CTkFrame):
 
         self._running = True
         self._completed_steps = 0
+        self._run_id += 1
+        run_id = self._run_id
+        self._active_summary_phase = "apply_existing"
         self.run_btn.configure(state="disabled")
         self.summary_label.configure(text=t("spools.injecting", done=0, total=1))
 
         threading.Thread(
             target=self._do_apply_existing,
-            args=(account, spool_path, dest_connection, sqlcl_path),
+            args=(run_id, account, spool_path, dest_connection, sqlcl_path),
             daemon=True,
         ).start()
 
@@ -621,6 +629,7 @@ class SpoolsView(ctk.CTkFrame):
 
     def _do_run(
         self,
+        run_id: int,
         country: str,
         accounts: list[str],
         inject_accounts: list[str],
@@ -645,8 +654,8 @@ class SpoolsView(ctk.CTkFrame):
                 )
             self.app.root.after(
                 0,
-                lambda a=account, s=status, m=display, T=total:
-                    self._apply_status(a, s, m, T, "spools.extracting"),
+                lambda a=account, s=status, m=display, T=total, r=run_id:
+                    self._apply_status(a, s, m, T, "spools.extracting", r, "extract"),
             )
 
         results: list[AccountResult] = engine.extract_many(
@@ -673,10 +682,16 @@ class SpoolsView(ctk.CTkFrame):
             and by_account[acc].output_path is not None
         ]
         if not apply_items:
-            self.app.root.after(0, lambda: self._finish(extract_ok, extract_err, 0, 0, total, 0))
+            self.app.root.after(
+                0,
+                lambda r=run_id: self._finish(extract_ok, extract_err, 0, 0, total, 0, r),
+            )
             return
 
-        self.app.root.after(0, lambda total_=len(apply_items): self._start_inject_stage(total_))
+        self.app.root.after(
+            0,
+            lambda total_=len(apply_items), r=run_id: self._start_inject_stage(total_, r),
+        )
         apply_workers = worker_count_for(len(apply_items), MAX_PARALLEL_ACCOUNTS)
         log.info("Starting spool inject batch: accounts=%s workers=%s", len(apply_items), apply_workers)
 
@@ -688,8 +703,8 @@ class SpoolsView(ctk.CTkFrame):
                 display = t("spools.status_injected")
             self.app.root.after(
                 0,
-                lambda a=account, s=status, m=display, T=len(apply_items):
-                    self._apply_status(a, s, m, T, "spools.injecting"),
+                lambda a=account, s=status, m=display, T=len(apply_items), r=run_id:
+                    self._apply_status(a, s, m, T, "spools.injecting", r, "inject"),
             )
 
         apply_results = engine.apply_many(
@@ -707,11 +722,14 @@ class SpoolsView(ctk.CTkFrame):
             )
         self.app.root.after(
             0,
-            lambda: self._finish(extract_ok, extract_err, inject_ok, inject_err, total, len(apply_items)),
+            lambda r=run_id: self._finish(
+                extract_ok, extract_err, inject_ok, inject_err, total, len(apply_items), r,
+            ),
         )
 
     def _do_apply_existing(
         self,
+        run_id: int,
         account: str,
         spool_path: Path,
         dest_connection: str,
@@ -728,8 +746,8 @@ class SpoolsView(ctk.CTkFrame):
                 display = t("spools.status_injected")
             self.app.root.after(
                 0,
-                lambda a=account_, s=status, m=display:
-                    self._apply_status(a, s, m, 1, "spools.injecting"),
+                lambda a=account_, s=status, m=display, r=run_id:
+                    self._apply_status(a, s, m, 1, "spools.injecting", r, "apply_existing"),
             )
 
         result = engine.apply_one(account, dest_connection, spool_path, on_apply_status)
@@ -739,19 +757,32 @@ class SpoolsView(ctk.CTkFrame):
         )
         ok = 1 if result.status == SpoolStatus.OK else 0
         err = 0 if result.status == SpoolStatus.OK else 1
-        self.app.root.after(0, lambda: self._finish_apply_existing(ok, err))
+        self.app.root.after(0, lambda r=run_id: self._finish_apply_existing(ok, err, r))
 
-    def _apply_status(self, account: str, status: SpoolStatus, message: str,
-                       total: int, summary_key: str) -> None:
+    def _apply_status(
+        self,
+        account: str,
+        status: SpoolStatus,
+        message: str,
+        total: int,
+        summary_key: str,
+        run_id: int,
+        phase: str,
+    ) -> None:
+        if run_id != self._run_id:
+            return
         row = self._status_rows.get(account)
         if row is not None:
             row.set_status(status.value, message)
-        if status in (SpoolStatus.OK, SpoolStatus.ERROR):
+        if status in (SpoolStatus.OK, SpoolStatus.ERROR) and self._active_summary_phase == phase:
             self._completed_steps += 1
             self.summary_label.configure(text=t(summary_key, done=self._completed_steps, total=total))
 
-    def _start_inject_stage(self, total: int) -> None:
+    def _start_inject_stage(self, total: int, run_id: int) -> None:
+        if run_id != self._run_id or self._active_summary_phase is None:
+            return
         self._completed_steps = 0
+        self._active_summary_phase = "inject"
         self.summary_label.configure(text=t("spools.injecting", done=0, total=total))
 
     def _finish(
@@ -762,8 +793,12 @@ class SpoolsView(ctk.CTkFrame):
         inject_err: int,
         extract_total: int,
         inject_total: int,
+        run_id: int,
     ) -> None:
+        if run_id != self._run_id:
+            return
         self._running = False
+        self._active_summary_phase = None
         self.run_btn.configure(state="normal")
         if inject_total:
             self.summary_label.configure(
@@ -783,8 +818,11 @@ class SpoolsView(ctk.CTkFrame):
                 text=t("spools.summary_mixed", ok=extract_ok, err=extract_err, total=extract_total),
             )
 
-    def _finish_apply_existing(self, ok: int, err: int) -> None:
+    def _finish_apply_existing(self, ok: int, err: int, run_id: int) -> None:
+        if run_id != self._run_id:
+            return
         self._running = False
+        self._active_summary_phase = None
         self.run_btn.configure(state="normal")
         self.summary_label.configure(
             text=t("spools.summary_apply_existing", ok=ok, total=ok + err, err=err),
