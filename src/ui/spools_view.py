@@ -1,7 +1,7 @@
 """Spools view — extract/apply accounts and apply existing spool files.
 
 Layout:
-  [ Back ]  Spools / Accounts
+  [ Back ]  Spools / CL Accounts
   Country dropdown
   Source DB dropdown (any env of the selected country)
   Account number  [ entry ] [ + Add ]

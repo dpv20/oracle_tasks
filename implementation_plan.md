@@ -83,7 +83,7 @@ oracle_tasks/
 ├── .gitignore
 ├── version.json                   ← {"version": "1.0.0", "download_url": "..."}
 ├── assets/
-│   ├── icono.jpg                  ← original
+│   ├── new_icon.png               ← original actual
 │   ├── icono.ico                  ← convertido para shortcut/taskbar
 │   ├── icono_192.png
 │   └── flags/
@@ -498,7 +498,7 @@ Mismo patrón exacto que `vpn`.
 - **Estado al inicio:** ventana normal (no maximizada)
 - **Single-instance:** named mutex `OracleTasksChile_SingleInstance` + flag file (mismo patrón que `vpn`)
 - **Taskbar:** AppUserModelID `Oracle.OracleTasksChile.1` seteado por `tools/set_aumid.ps1` durante install + `ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID` en `main.py`
-- **Ícono:** `icono.jpg` → conversión a `icono.ico` (vía Pillow durante build, o pre-generado y commiteado)
+- **Ícono:** `new_icon.png` → conversión a `icono.ico` (vía Pillow durante build, o pre-generado y commiteado)
 
 ---
 
@@ -564,7 +564,7 @@ Cada fase es un commit/PR funcional y testeable.
 - `core/updater.py` chequeando `version.json` en repo
 - Banner en home view con click handler
 - AppUserModelID + single-instance guard
-- Conversión `icono.jpg` → `icono.ico`
+- Conversión `new_icon.png` → `icono.ico`
 - Acceso directo en escritorio con ícono correcto
 - README con instrucciones para usuarios
 - **Hito de verificación:** bump version, push, abrir app instalada y verificar que aparece banner; click hace update.

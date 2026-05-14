@@ -258,11 +258,11 @@ if defined SQLCL_PATH (
     )
 )
 
-:: ── 6. Generate .ico from .jpg if missing ────────────────────────────────────
+:: ── 6. Generate .ico from new_icon.png if missing ────────────────────────────
 if not exist "!REPO_DIR!\assets\icono.ico" (
-    if exist "!REPO_DIR!\assets\icono.jpg" (
-        echo Generating icono.ico from icono.jpg...
-        !PY! -c "from PIL import Image; img=Image.open(r'!REPO_DIR!\assets\icono.jpg').convert('RGBA'); img.save(r'!REPO_DIR!\assets\icono.ico', sizes=[(16,16),(32,32),(48,48),(64,64),(128,128),(256,256)])" >nul 2>&1
+    if exist "!REPO_DIR!\assets\new_icon.png" (
+        echo Generating icono.ico from new_icon.png...
+        !PY! -c "from PIL import Image; img=Image.open(r'!REPO_DIR!\assets\new_icon.png').convert('RGBA'); img.save(r'!REPO_DIR!\assets\icono.ico', sizes=[(16,16),(32,32),(48,48),(64,64),(128,128),(256,256)])" >nul 2>&1
         if errorlevel 1 echo [WARN] Could not generate .ico (Pillow may not be installed yet).
     )
 )
@@ -272,7 +272,7 @@ echo.
 echo [4/5] Creating shortcut...
 set "SCRIPT=!REPO_DIR!\src\main.py"
 set "ICON=!REPO_DIR!\assets\icono.ico"
-if not exist "!ICON!" set "ICON=!REPO_DIR!\assets\icono.jpg"
+if not exist "!ICON!" set "ICON=!REPO_DIR!\assets\new_icon.png"
 
 set "DESK_TMP=%TEMP%\otc_desktop.txt"
 powershell -NoProfile -Command "[Environment]::GetFolderPath('Desktop')" > "!DESK_TMP!" 2>nul

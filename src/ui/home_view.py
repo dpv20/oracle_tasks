@@ -1,7 +1,8 @@
-"""Home view — entry screen with task buttons (currently only Spools placeholder)."""
+"""Home view — entry screen with task buttons."""
 from __future__ import annotations
 
 import customtkinter as ctk
+from tkinter import messagebox
 
 from i18n import t
 from version import __version__
@@ -22,11 +23,25 @@ class HomeView(ctk.CTkFrame):
             toolbar,
             text=t("home.spools_button"),
             command=self._on_spools,
-            width=180,
+            width=190,
+        ).pack(side="left", padx=(0, 8))
+
+        IconButton(
+            toolbar,
+            text=t("home.savings_button"),
+            command=self._on_savings_accounts,
+            width=220,
+        ).pack(side="left", padx=(0, 8))
+
+        IconButton(
+            toolbar,
+            text=t("home.create_branch_button"),
+            command=self._on_create_branch,
+            width=150,
         ).pack(side="left", padx=(0, 8))
 
         # Reserved placeholders for future task tiles
-        for _ in range(3):
+        for _ in range(1):
             ph = ctk.CTkButton(
                 toolbar,
                 text="—",
@@ -67,6 +82,12 @@ class HomeView(ctk.CTkFrame):
 
     def _on_spools(self) -> None:
         self.app.show_view("spools")
+
+    def _on_savings_accounts(self) -> None:
+        messagebox.showinfo(t("common.info"), t("home.savings_coming_soon"), parent=self)
+
+    def _on_create_branch(self) -> None:
+        messagebox.showinfo(t("common.info"), t("home.create_branch_coming_soon"), parent=self)
 
     def _on_settings(self) -> None:
         self.app.show_view("settings")

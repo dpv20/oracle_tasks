@@ -1,11 +1,5 @@
 """Tiny i18n: dict lookup with format() interpolation.
 
-Usage:
-    from i18n import t, set_language
-    set_language("es")
-    t("home.spools_button")               -> "Spools / Cuentas"
-    t("spools.confirm_apply", n=3, db="X") -> "Vas a aplicar 3 cuentas a:\\n   X\\n..."
-
 If a key is missing in the active language, falls back to English.
 If missing in English too, returns the key itself (visible debugging signal).
 """
@@ -20,7 +14,11 @@ T: dict[str, dict[str, str]] = {
         "app.title": "Oracle Tasks Chile",
 
         # Home view
-        "home.spools_button": "Spools / Accounts",
+        "home.spools_button": "Spools / CL Accounts",
+        "home.savings_button": "Spools / Savings Accounts",
+        "home.savings_coming_soon": "Spools / Savings Accounts is not available yet.",
+        "home.create_branch_button": "Create Branch",
+        "home.create_branch_coming_soon": "Create Branch is not available yet.",
         "home.settings_button": "Settings",
         "home.placeholder": "Select a task above.",
         "home.created_by": "Created by: Diego Pavez Verdi",
@@ -32,7 +30,7 @@ T: dict[str, dict[str, str]] = {
         "update.installing": "Installing update...",
 
         # Spools view
-        "spools.title": "Spools / Accounts",
+        "spools.title": "Spools / CL Accounts",
         "spools.coming_soon": "Spools workflow — implemented in Phase 3.",
         "spools.mode": "Mode",
         "spools.mode.extract": "Extract / Apply",
@@ -177,7 +175,11 @@ T: dict[str, dict[str, str]] = {
         "app.title": "Oracle Tasks Chile",
 
         # Home view
-        "home.spools_button": "Spools / Cuentas",
+        "home.spools_button": "Spools / CL Accounts",
+        "home.savings_button": "Spools / Savings Accounts",
+        "home.savings_coming_soon": "Spools / Savings Accounts todavía no está disponible.",
+        "home.create_branch_button": "Create Branch",
+        "home.create_branch_coming_soon": "Create Branch todavía no está disponible.",
         "home.settings_button": "Configuración",
         "home.placeholder": "Selecciona una tarea arriba.",
         "home.created_by": "Creado por: Diego Pavez Verdi",
@@ -189,7 +191,7 @@ T: dict[str, dict[str, str]] = {
         "update.installing": "Instalando actualización...",
 
         # Spools view
-        "spools.title": "Spools / Cuentas",
+        "spools.title": "Spools / CL Accounts",
         "spools.coming_soon": "Flujo de spools — se implementa en la Fase 3.",
         "spools.mode": "Modo",
         "spools.mode.extract": "Extract / Apply",

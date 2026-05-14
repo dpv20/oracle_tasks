@@ -15,7 +15,12 @@ Convención:
 - ✅ Verificacion usuario: probado el funcionamiento de ambientes para el flujo extract/apply. Con esto Fase 4 queda lista para mergear a `main` y avanzar a Fase 5.
 - 🔧 Decision: la ruta `Desktop\sqlcl\sqlcl\bin\sql.exe` es una particularidad del equipo de Diego, no un requisito para los companeros. No se considera pendiente del `install.bat`; el instalador debe seguir priorizando PATH/rutas comunes/manual.
 
+### Home / navegación
+- ✅ Agregado botón `Create Branch` en Home, visible junto a `Spools / CL Accounts` y `Spools / Savings Accounts`. Queda como placeholder con aviso hasta definir el flujo.
+
 ### Fase 5 — Apply Existing 🚧
+- ✅ Home/task naming: `Spools / Accounts` renombrado a `Spools / CL Accounts` en Home y en la vista de spools. Agregado nuevo botón `Spools / Savings Accounts` en Home con aviso placeholder hasta definir ese flujo.
+- ✅ Ícono actualizado: `new_icon.png` movido a `assets/new_icon.png`; `assets/icono.ico` regenerado desde ese PNG multi-resolución. `install.bat` ahora genera/fallback-ea usando `new_icon.png` en vez de `icono.jpg`; `implementation_plan.md` actualizado.
 - ✅ Cancelación de runs: el botón principal pasa a `Cancel` / `Cancelar` en rojo mientras corre Extract/Apply/Apply Existing. Al cancelar, se setea un `threading.Event`, se evita lanzar cuentas nuevas y SQLcl activo se termina desde `SqlclRunner`.
 - ✅ Resumen por cuenta en pantalla: al terminar o cancelar se muestra qué cuentas quedaron `Extracted + injected`, cuáles `Only extracted` y cuáles `Nothing`. En Apply Existing se muestra `Injected` / `Nothing`.
 - ✅ `SpoolStatus.CANCELLED` agregado como estado terminal con glyph propio en `AccountStatusRow`; los callbacks tardíos siguen protegidos por `run_id`/fase.
