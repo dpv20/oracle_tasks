@@ -1,8 +1,7 @@
 """SpoolEngine — orchestrates account spool extraction.
 
-Phase 3 implements EXTRACT_ONLY: render `.sql.tmpl` → run on source DB →
-the spool `.SQL` file lands in `SPOOLS_OUT_DIR/<Country>/`. Future phases
-add EXTRACT_AND_APPLY (Phase 4) and APPLY_EXISTING (Phase 5).
+Supports extracting account spools from a source DB and applying generated or
+pre-existing `.SQL` spool files into a destination DB.
 
 Threading: the engine is blocking by design. The UI calls `extract_one` /
 `extract_many` from a worker thread and marshals status callbacks back via

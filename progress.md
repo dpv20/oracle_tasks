@@ -15,6 +15,15 @@ Convención:
 - ✅ Verificacion usuario: probado el funcionamiento de ambientes para el flujo extract/apply. Con esto Fase 4 queda lista para mergear a `main` y avanzar a Fase 5.
 - 🔧 Decision: la ruta `Desktop\sqlcl\sqlcl\bin\sql.exe` es una particularidad del equipo de Diego, no un requisito para los companeros. No se considera pendiente del `install.bat`; el instalador debe seguir priorizando PATH/rutas comunes/manual.
 
+### Fase 5 — Apply Existing 🚧
+- ✅ Creada rama `feat/apply-existing-spool` desde `main` actualizado.
+- ✅ `src/ui/spools_view.py`: agregado modo `Apply existing` con selector de archivo `.SQL`, ocultando origen/lista de cuentas y usando solo DB destino.
+- ✅ Validaciones para spool existente: archivo seleccionado, extension `.SQL`, existencia en disco, SQLcl configurado y credencial destino.
+- ✅ Confirmacion obligatoria antes de aplicar un spool existente contra destino.
+- ✅ Ejecucion conectada a `SpoolEngine.apply_one()`; se muestra una fila de resultado usando el nombre de cuenta inferido desde `CL_Acc_Spool_<cuenta>.SQL` o el stem del archivo.
+- ✅ i18n EN/ES actualizado para modo, selector, validaciones, confirmacion y resumen.
+- ✅ Verificacion: `python -m compileall src` OK; smoke import/UI del modo Apply Existing OK; smoke de `SpoolEngine.apply_one()` con runner falso OK.
+
 ## 2026-05-12
 
 ### Fase 4 — inject FROM/TO con selección por cuenta 🚧
