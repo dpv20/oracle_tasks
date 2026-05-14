@@ -9,6 +9,12 @@ Convención:
 
 ---
 
+## 2026-05-14
+
+### Fase 4 — validacion usuario + merge a main
+- ✅ Verificacion usuario: probado el funcionamiento de ambientes para el flujo extract/apply. Con esto Fase 4 queda lista para mergear a `main` y avanzar a Fase 5.
+- 🔧 Decision: la ruta `Desktop\sqlcl\sqlcl\bin\sql.exe` es una particularidad del equipo de Diego, no un requisito para los companeros. No se considera pendiente del `install.bat`; el instalador debe seguir priorizando PATH/rutas comunes/manual.
+
 ## 2026-05-12
 
 ### Fase 4 — inject FROM/TO con selección por cuenta 🚧
