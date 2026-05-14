@@ -205,10 +205,11 @@ class SpoolsView(ctk.CTkFrame):
             command=self._on_run,
         )
         self.run_btn.pack(side="left")
-        ctk.CTkButton(
+        self.open_folder_btn = ctk.CTkButton(
             self.actions_frame, text=t("spools.open_folder"), width=180,
             command=self._on_open_folder,
-        ).pack(side="left", padx=(10, 0))
+        )
+        self.open_folder_btn.pack(side="left", padx=(10, 0))
         self.summary_label = ctk.CTkLabel(
             self.actions_frame, text="", anchor="e",
             text_color=("gray35", "gray70"),
@@ -277,6 +278,7 @@ class SpoolsView(ctk.CTkFrame):
 
     def _refresh_db_options(self) -> None:
         country = self._selected_country_id()
+        self._refresh_open_folder_button()
         labels: list[str] = []
         dest_labels: list[str] = []
         self._db_lookup = {}
@@ -314,6 +316,14 @@ class SpoolsView(ctk.CTkFrame):
 
     def _selected_dest_db(self) -> dict | None:
         return self._dest_db_lookup.get(self.dest_db_var.get())
+
+    def _refresh_open_folder_button(self) -> None:
+        if not hasattr(self, "open_folder_btn"):
+            return
+        country_label = self.country_var.get()
+        if not country_label or country_label == "—":
+            country_label = t("spools.country")
+        self.open_folder_btn.configure(text=t("spools.open_country_folder", country=country_label))
 
     def _on_browse_existing_spool(self) -> None:
         country = self._selected_country_id()

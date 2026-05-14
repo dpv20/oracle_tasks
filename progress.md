@@ -16,6 +16,7 @@ Convención:
 - 🔧 Decision: la ruta `Desktop\sqlcl\sqlcl\bin\sql.exe` es una particularidad del equipo de Diego, no un requisito para los companeros. No se considera pendiente del `install.bat`; el instalador debe seguir priorizando PATH/rutas comunes/manual.
 
 ### Fase 5 — Apply Existing 🚧
+- ✅ `src/ui/spools_view.py`: botón de carpeta actualizado de `Open spools folder` a texto dinámico por país (`Chile spools folder`, `Peru spools folder`, etc.) y refresca al cambiar país/modo.
 - ✅ Creada rama `feat/apply-existing-spool` desde `main` actualizado.
 - ✅ `src/ui/spools_view.py`: agregado modo `Apply existing` con selector de archivo `.SQL`, ocultando origen/lista de cuentas y usando solo DB destino.
 - ✅ Validaciones para spool existente: archivo seleccionado, extension `.SQL`, existencia en disco, SQLcl configurado y credencial destino.
