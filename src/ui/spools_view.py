@@ -67,6 +67,12 @@ _ENV_TAG = {
     "dev":      "DEV",
 }
 
+_PRIMARY_BUTTON_FG = ("#1F6FEB", "#1A5BBF")
+_PRIMARY_BUTTON_HOVER = ("#1A5BBF", "#154A9F")
+_CANCEL_BUTTON_FG = ("#D9534F", "#A8322C")
+_CANCEL_BUTTON_HOVER = ("#C9302C", "#8B1F1A")
+_TERMINAL_STATUSES = {SpoolStatus.OK, SpoolStatus.ERROR, SpoolStatus.CANCELLED}
+
 
 class SpoolsView(ctk.CTkFrame):
     def __init__(self, master, app):
@@ -78,6 +84,7 @@ class SpoolsView(ctk.CTkFrame):
         self._completed_steps = 0
         self._run_id = 0
         self._active_summary_phase: str | None = None
+        self._cancel_event: threading.Event | None = None
         self._running = False
         self._db_lookup: dict[str, dict] = {}
         self._dest_db_lookup: dict[str, dict] = {}
@@ -217,6 +224,16 @@ class SpoolsView(ctk.CTkFrame):
             text_color=("gray35", "gray70"),
         )
         self.summary_label.pack(side="right", padx=8, fill="x", expand=True)
+
+        self.result_detail_label = ctk.CTkLabel(
+            self,
+            text="",
+            anchor="w",
+            justify="left",
+            wraplength=840,
+            text_color=("gray35", "gray70"),
+        )
+        self.result_detail_label.pack(fill="x", padx=24, pady=(0, 4))
 
         # ── results area ──
         self.results_frame = ctk.CTkScrollableFrame(self, height=140)
@@ -433,11 +450,42 @@ class SpoolsView(ctk.CTkFrame):
     def _refresh_run_button(self) -> None:
         if not hasattr(self, "run_btn"):
             return
+        if self._running:
+            return
         if self._is_apply_existing_mode():
             key = "spools.run_apply_existing"
         else:
             key = "spools.run_extract_apply" if self._selected_inject_accounts() else "spools.run_extract_only"
         self.run_btn.configure(text=t(key))
+
+    def _set_run_button_running(self, running: bool) -> None:
+        if running:
+            self.run_btn.configure(
+                text=t("spools.cancel"),
+                command=self._on_cancel,
+                state="normal",
+                fg_color=_CANCEL_BUTTON_FG,
+                hover_color=_CANCEL_BUTTON_HOVER,
+                text_color="white",
+            )
+            return
+
+        self.run_btn.configure(
+            command=self._on_run,
+            state="normal",
+            fg_color=_PRIMARY_BUTTON_FG,
+            hover_color=_PRIMARY_BUTTON_HOVER,
+            text_color="white",
+        )
+        self._refresh_run_button()
+
+    def _on_cancel(self) -> None:
+        if not self._running:
+            return
+        if self._cancel_event is not None:
+            self._cancel_event.set()
+        self.run_btn.configure(text=t("spools.cancelling"), state="disabled")
+        self.summary_label.configure(text=t("spools.cancel_requested"))
 
     # ── run ──
     def _on_run(self) -> None:
@@ -526,12 +574,18 @@ class SpoolsView(ctk.CTkFrame):
         self._run_id += 1
         run_id = self._run_id
         self._active_summary_phase = "extract"
-        self.run_btn.configure(state="disabled")
+        self._cancel_event = threading.Event()
+        cancel_event = self._cancel_event
+        self.result_detail_label.configure(text="")
+        self._set_run_button_running(True)
         self.summary_label.configure(text=t("spools.extracting", done=0, total=len(accounts)))
 
         threading.Thread(
             target=self._do_run,
-            args=(run_id, country, accounts, inject_accounts, source_connection, dest_connection, sqlcl_path),
+            args=(
+                run_id, country, accounts, inject_accounts, source_connection,
+                dest_connection, sqlcl_path, cancel_event,
+            ),
             daemon=True,
         ).start()
 
@@ -601,12 +655,15 @@ class SpoolsView(ctk.CTkFrame):
         self._run_id += 1
         run_id = self._run_id
         self._active_summary_phase = "apply_existing"
-        self.run_btn.configure(state="disabled")
+        self._cancel_event = threading.Event()
+        cancel_event = self._cancel_event
+        self.result_detail_label.configure(text="")
+        self._set_run_button_running(True)
         self.summary_label.configure(text=t("spools.injecting", done=0, total=1))
 
         threading.Thread(
             target=self._do_apply_existing,
-            args=(run_id, account, spool_path, dest_connection, sqlcl_path),
+            args=(run_id, account, spool_path, dest_connection, sqlcl_path, cancel_event),
             daemon=True,
         ).start()
 
@@ -636,6 +693,7 @@ class SpoolsView(ctk.CTkFrame):
         source_connection: str,
         dest_connection: str,
         sqlcl_path: str,
+        cancel_event: threading.Event,
     ) -> None:
         engine = SpoolEngine(SqlclRunner(sqlcl_path))
         total = len(accounts)
@@ -652,6 +710,8 @@ class SpoolsView(ctk.CTkFrame):
                     t("spools.status_ready_to_inject")
                     if account in inject_set else t("spools.status_spool_saved")
                 )
+            elif status == SpoolStatus.CANCELLED:
+                display = t("spools.status_cancelled")
             self.app.root.after(
                 0,
                 lambda a=account, s=status, m=display, T=total, r=run_id:
@@ -664,9 +724,10 @@ class SpoolsView(ctk.CTkFrame):
             source_connection,
             on_extract_status,
             max_workers=MAX_PARALLEL_ACCOUNTS,
+            cancel_event=cancel_event,
         )
         extract_ok = sum(1 for result in results if result.status == SpoolStatus.OK)
-        extract_err = sum(1 for result in results if result.status != SpoolStatus.OK)
+        extract_err = total - extract_ok
         for result in results:
             log.info(
                 "Spool extract result: %s status=%s out=%s err=%s",
@@ -681,16 +742,19 @@ class SpoolsView(ctk.CTkFrame):
             and by_account[acc].status == SpoolStatus.OK
             and by_account[acc].output_path is not None
         ]
-        if not apply_items:
+        if cancel_event.is_set() or not apply_items:
+            details = self._classify_extract_apply(accounts, results, [])
             self.app.root.after(
                 0,
-                lambda r=run_id: self._finish(extract_ok, extract_err, 0, 0, total, 0, r),
+                lambda r=run_id, d=details, c=cancel_event.is_set(): self._finish(
+                    extract_ok, extract_err, 0, 0, total, 0, r, d, c,
+                ),
             )
             return
 
         self.app.root.after(
             0,
-            lambda total_=len(apply_items), r=run_id: self._start_inject_stage(total_, r),
+            lambda total_=len(apply_items), r=run_id, e=cancel_event: self._start_inject_stage(total_, r, e),
         )
         apply_workers = worker_count_for(len(apply_items), MAX_PARALLEL_ACCOUNTS)
         log.info("Starting spool inject batch: accounts=%s workers=%s", len(apply_items), apply_workers)
@@ -712,18 +776,20 @@ class SpoolsView(ctk.CTkFrame):
             dest_connection,
             on_apply_status,
             max_workers=MAX_PARALLEL_ACCOUNTS,
+            cancel_event=cancel_event,
         )
         inject_ok = sum(1 for result in apply_results if result.status == SpoolStatus.OK)
-        inject_err = sum(1 for result in apply_results if result.status != SpoolStatus.OK)
+        inject_err = len(apply_items) - inject_ok
         for result in apply_results:
             log.info(
                 "Spool inject result: %s status=%s out=%s err=%s",
                 result.account, result.status.value, result.output_path, result.error,
             )
+        details = self._classify_extract_apply(accounts, results, apply_results)
         self.app.root.after(
             0,
-            lambda r=run_id: self._finish(
-                extract_ok, extract_err, inject_ok, inject_err, total, len(apply_items), r,
+            lambda r=run_id, d=details, c=cancel_event.is_set(): self._finish(
+                extract_ok, extract_err, inject_ok, inject_err, total, len(apply_items), r, d, c,
             ),
         )
 
@@ -734,6 +800,7 @@ class SpoolsView(ctk.CTkFrame):
         spool_path: Path,
         dest_connection: str,
         sqlcl_path: str,
+        cancel_event: threading.Event,
     ) -> None:
         engine = SpoolEngine(SqlclRunner(sqlcl_path))
         log.info("Starting existing spool apply: account=%s spool=%s", account, spool_path)
@@ -744,20 +811,75 @@ class SpoolsView(ctk.CTkFrame):
                 display = t("spools.status_injecting")
             elif status == SpoolStatus.OK:
                 display = t("spools.status_injected")
+            elif status == SpoolStatus.CANCELLED:
+                display = t("spools.status_cancelled")
+            elif status == SpoolStatus.CANCELLED:
+                display = t("spools.status_cancelled")
             self.app.root.after(
                 0,
                 lambda a=account_, s=status, m=display, r=run_id:
                     self._apply_status(a, s, m, 1, "spools.injecting", r, "apply_existing"),
             )
 
-        result = engine.apply_one(account, dest_connection, spool_path, on_apply_status)
+        result = engine.apply_one(account, dest_connection, spool_path, on_apply_status, cancel_event)
         log.info(
             "Existing spool apply result: %s status=%s out=%s err=%s",
             result.account, result.status.value, result.output_path, result.error,
         )
         ok = 1 if result.status == SpoolStatus.OK else 0
         err = 0 if result.status == SpoolStatus.OK else 1
-        self.app.root.after(0, lambda r=run_id: self._finish_apply_existing(ok, err, r))
+        self.app.root.after(
+            0,
+            lambda r=run_id, c=cancel_event.is_set(): self._finish_apply_existing(ok, err, r, result, c),
+        )
+
+    @staticmethod
+    def _classify_extract_apply(
+        accounts: list[str],
+        extract_results: list[AccountResult],
+        apply_results: list[AccountResult],
+    ) -> dict[str, list[str]]:
+        extracted_ok = {
+            result.account
+            for result in extract_results
+            if result.status == SpoolStatus.OK
+        }
+        injected_ok = {
+            result.account
+            for result in apply_results
+            if result.status == SpoolStatus.OK
+        }
+        return {
+            "injected": [acc for acc in accounts if acc in injected_ok],
+            "only_extracted": [
+                acc for acc in accounts
+                if acc in extracted_ok and acc not in injected_ok
+            ],
+            "nothing": [acc for acc in accounts if acc not in extracted_ok],
+        }
+
+    @staticmethod
+    def _format_accounts(accounts: list[str]) -> str:
+        return ", ".join(accounts) if accounts else "-"
+
+    def _show_extract_apply_details(self, details: dict[str, list[str]]) -> None:
+        self.result_detail_label.configure(
+            text=t(
+                "spools.detail_extract_apply",
+                injected=self._format_accounts(details.get("injected", [])),
+                only_extracted=self._format_accounts(details.get("only_extracted", [])),
+                nothing=self._format_accounts(details.get("nothing", [])),
+            ),
+        )
+
+    def _show_apply_existing_details(self, account: str, ok: bool) -> None:
+        self.result_detail_label.configure(
+            text=t(
+                "spools.detail_apply_existing",
+                injected=account if ok else "-",
+                nothing="-" if ok else account,
+            ),
+        )
 
     def _apply_status(
         self,
@@ -774,12 +896,19 @@ class SpoolsView(ctk.CTkFrame):
         row = self._status_rows.get(account)
         if row is not None:
             row.set_status(status.value, message)
-        if status in (SpoolStatus.OK, SpoolStatus.ERROR) and self._active_summary_phase == phase:
+        if status in _TERMINAL_STATUSES and self._active_summary_phase == phase:
             self._completed_steps += 1
             self.summary_label.configure(text=t(summary_key, done=self._completed_steps, total=total))
 
-    def _start_inject_stage(self, total: int, run_id: int) -> None:
-        if run_id != self._run_id or self._active_summary_phase is None:
+    def _start_inject_stage(
+        self,
+        total: int,
+        run_id: int,
+        cancel_event: threading.Event | None = None,
+    ) -> None:
+        if run_id != self._run_id or self._active_summary_phase is None or (
+            cancel_event is not None and cancel_event.is_set()
+        ):
             return
         self._completed_steps = 0
         self._active_summary_phase = "inject"
@@ -794,13 +923,27 @@ class SpoolsView(ctk.CTkFrame):
         extract_total: int,
         inject_total: int,
         run_id: int,
+        details: dict[str, list[str]],
+        cancelled: bool,
     ) -> None:
         if run_id != self._run_id:
             return
         self._running = False
         self._active_summary_phase = None
-        self.run_btn.configure(state="normal")
-        if inject_total:
+        self._cancel_event = None
+        self._set_run_button_running(False)
+        self._show_extract_apply_details(details)
+        if cancelled:
+            self.summary_label.configure(
+                text=t(
+                    "spools.summary_cancelled",
+                    extract_ok=extract_ok,
+                    extract_total=extract_total,
+                    inject_ok=inject_ok,
+                    inject_total=inject_total,
+                ),
+            )
+        elif inject_total:
             self.summary_label.configure(
                 text=t(
                     "spools.summary_extract_inject",
@@ -818,12 +961,24 @@ class SpoolsView(ctk.CTkFrame):
                 text=t("spools.summary_mixed", ok=extract_ok, err=extract_err, total=extract_total),
             )
 
-    def _finish_apply_existing(self, ok: int, err: int, run_id: int) -> None:
+    def _finish_apply_existing(
+        self,
+        ok: int,
+        err: int,
+        run_id: int,
+        result: AccountResult,
+        cancelled: bool,
+    ) -> None:
         if run_id != self._run_id:
             return
         self._running = False
         self._active_summary_phase = None
-        self.run_btn.configure(state="normal")
+        self._cancel_event = None
+        self._set_run_button_running(False)
+        self._show_apply_existing_details(result.account, result.status == SpoolStatus.OK)
+        if cancelled:
+            self.summary_label.configure(text=t("spools.summary_apply_existing_cancelled"))
+            return
         self.summary_label.configure(
             text=t("spools.summary_apply_existing", ok=ok, total=ok + err, err=err),
         )

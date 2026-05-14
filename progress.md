@@ -16,6 +16,10 @@ Convención:
 - 🔧 Decision: la ruta `Desktop\sqlcl\sqlcl\bin\sql.exe` es una particularidad del equipo de Diego, no un requisito para los companeros. No se considera pendiente del `install.bat`; el instalador debe seguir priorizando PATH/rutas comunes/manual.
 
 ### Fase 5 — Apply Existing 🚧
+- ✅ Cancelación de runs: el botón principal pasa a `Cancel` / `Cancelar` en rojo mientras corre Extract/Apply/Apply Existing. Al cancelar, se setea un `threading.Event`, se evita lanzar cuentas nuevas y SQLcl activo se termina desde `SqlclRunner`.
+- ✅ Resumen por cuenta en pantalla: al terminar o cancelar se muestra qué cuentas quedaron `Extracted + injected`, cuáles `Only extracted` y cuáles `Nothing`. En Apply Existing se muestra `Injected` / `Nothing`.
+- ✅ `SpoolStatus.CANCELLED` agregado como estado terminal con glyph propio en `AccountStatusRow`; los callbacks tardíos siguen protegidos por `run_id`/fase.
+- ✅ Verificación: `python -m compileall src` OK; smoke de `SqlclRunner` con cancel pre-set retorna exit 130 `Cancelled`; smoke de clasificación devuelve injected/only_extracted/nothing correcto; smoke UI confirma botón rojo `Cancel` y resumen final.
 - 🔧 Decision: se elimina `spools_sql/` y la app pasa a usar directamente los scripts no interactivos `spools/CL_ACCOUNT_SPOOL_<PAIS>2.sql`. Los `sin 2` usan `Accept ACC_NO` / `&ACC_NO` y quedan fuera del flujo automatico.
 - ✅ `src/spools_accounts/spool_engine.py`: `template_path()` ahora apunta a `spools/CL_ACCOUNT_SPOOL_<PAIS>2.sql`; `_render_template()` crea una copia temporal reemplazando la raiz legacy `...\spools_files\Accounts` por `paths.SPOOLS_OUT_DIR` y sigue agregando `exit;` si falta. Los `.sql` versionados no se editan en runtime.
 - ✅ `agent.md` e `implementation_plan.md`: actualizados para reflejar que ya no existen templates `.sql.tmpl` ni carpeta `spools_sql/`.

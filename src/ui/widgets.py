@@ -55,7 +55,7 @@ class SectionLabel(ctk.CTkLabel):
 class AccountStatusRow(ctk.CTkFrame):
     """One row per account in the Spools view: status glyph + account + message.
 
-    States: pending (…), running (⟳), ok (✓), error (✗).
+    States: pending (…), running (⟳), ok (✓), error (✗), cancelled (-).
     """
 
     _GLYPH = {
@@ -63,12 +63,14 @@ class AccountStatusRow(ctk.CTkFrame):
         "running": "⟳",
         "ok":      "✓",
         "error":   "✗",
+        "cancelled": "-",
     }
     _COLOR = {
         "pending": ("gray50", "gray60"),
         "running": ("#1F6FEB", "#3FB950"),
         "ok":      ("#1A7F37", "#3FB950"),
         "error":   ("#CF222E", "#FF6B6B"),
+        "cancelled": ("gray45", "gray60"),
     }
 
     def __init__(self, master, account: str, **kw):

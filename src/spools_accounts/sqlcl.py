@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import logging
 import subprocess
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -30,7 +32,13 @@ class SqlclRunner:
     def __init__(self, sqlcl_exe: str | Path):
         self.exe = str(sqlcl_exe)
 
-    def run_query(self, connection: str, sql: str, timeout: float = 30.0) -> RunResult:
+    def run_query(
+        self,
+        connection: str,
+        sql: str,
+        timeout: float = 30.0,
+        cancel_event: threading.Event | None = None,
+    ) -> RunResult:
         """Run a one-off SQL statement and capture its output.
 
         `connection` is what SQLcl expects after `-S`: `user[schema]/pass@DB`.
@@ -43,7 +51,12 @@ class SqlclRunner:
             f"{sql.rstrip().rstrip(';')};\n"
             "exit\n"
         )
-        return self._invoke([self.exe, "-S", "-L", connection], stdin=script, timeout=timeout)
+        return self._invoke(
+            [self.exe, "-S", "-L", connection],
+            stdin=script,
+            timeout=timeout,
+            cancel_event=cancel_event,
+        )
 
     def run_script(
         self,
@@ -51,29 +64,83 @@ class SqlclRunner:
         script_path: str | Path,
         args: list[str] | None = None,
         timeout: float = 180.0,
+        cancel_event: threading.Event | None = None,
     ) -> RunResult:
         """Run a SQL script file with optional positional args (`&1`, `&2`, ...)."""
         cmd: list[str] = [self.exe, "-S", "-L", connection, f"@{script_path}"]
         if args:
             cmd.extend(args)
-        return self._invoke(cmd, stdin=None, timeout=timeout)
+        return self._invoke(cmd, stdin=None, timeout=timeout, cancel_event=cancel_event)
 
-    def _invoke(self, cmd: list[str], stdin: str | None, timeout: float) -> RunResult:
+    def _invoke(
+        self,
+        cmd: list[str],
+        stdin: str | None,
+        timeout: float,
+        cancel_event: threading.Event | None = None,
+    ) -> RunResult:
+        if cancel_event is not None and cancel_event.is_set():
+            return RunResult(130, "", "Cancelled")
+        if cancel_event is None:
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    input=stdin,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=timeout,
+                    creationflags=_CREATE_NO_WINDOW,
+                )
+            except FileNotFoundError as e:
+                log.error("SQLcl binary not found at %s: %s", self.exe, e)
+                return RunResult(127, "", f"SQLcl not found: {self.exe}")
+            except subprocess.TimeoutExpired as e:
+                log.error("SQLcl timed out after %ss", timeout)
+                return RunResult(124, e.stdout or "", f"Timed out after {timeout}s")
+            return RunResult(proc.returncode, proc.stdout or "", proc.stderr or "")
+
         try:
-            proc = subprocess.run(
+            proc = subprocess.Popen(
                 cmd,
-                input=stdin,
-                capture_output=True,
+                stdin=subprocess.PIPE if stdin is not None else None,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=timeout,
                 creationflags=_CREATE_NO_WINDOW,
             )
         except FileNotFoundError as e:
             log.error("SQLcl binary not found at %s: %s", self.exe, e)
             return RunResult(127, "", f"SQLcl not found: {self.exe}")
-        except subprocess.TimeoutExpired as e:
-            log.error("SQLcl timed out after %ss", timeout)
-            return RunResult(124, e.stdout or "", f"Timed out after {timeout}s")
-        return RunResult(proc.returncode, proc.stdout or "", proc.stderr or "")
+
+        deadline = time.monotonic() + timeout
+        input_data = stdin
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                return self._stop_process(proc, "Cancelled", 130)
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                log.error("SQLcl timed out after %ss", timeout)
+                return self._stop_process(proc, f"Timed out after {timeout}s", 124)
+
+            try:
+                stdout, stderr = proc.communicate(input=input_data, timeout=min(0.2, remaining))
+                return RunResult(proc.returncode, stdout or "", stderr or "")
+            except subprocess.TimeoutExpired:
+                input_data = None
+
+    @staticmethod
+    def _stop_process(proc: subprocess.Popen, message: str, code: int) -> RunResult:
+        try:
+            proc.terminate()
+            stdout, stderr = proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            stdout, stderr = proc.communicate()
+        except OSError:
+            stdout, stderr = proc.communicate()
+        return RunResult(code, stdout or "", (stderr or message))

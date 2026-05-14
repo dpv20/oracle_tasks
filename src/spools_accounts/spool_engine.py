@@ -13,8 +13,9 @@ from __future__ import annotations
 import logging
 import re
 import tempfile
+import threading
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -31,6 +32,7 @@ class SpoolStatus(str, Enum):
     RUNNING = "running"
     OK = "ok"
     ERROR = "error"
+    CANCELLED = "cancelled"
 
 
 @dataclass
@@ -112,6 +114,14 @@ def _with_exit(sql_text: str) -> str:
     return sql_text.rstrip() + "\nexit;\n"
 
 
+def _is_cancelled(cancel_event: threading.Event | None) -> bool:
+    return cancel_event is not None and cancel_event.is_set()
+
+
+def _cancelled_result(account: str, output_path: Path | None = None) -> AccountResult:
+    return AccountResult(account, SpoolStatus.CANCELLED, output_path=output_path, error="Cancelled")
+
+
 class SpoolEngine:
     """EXTRACT_ONLY: run the country template against a source DB.
 
@@ -151,7 +161,14 @@ class SpoolEngine:
         account: str,
         connection: str,
         on_status: StatusCallback | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> AccountResult:
+        if _is_cancelled(cancel_event):
+            r = _cancelled_result(account)
+            if on_status:
+                on_status(account, r.status, r.error)
+            return r
+
         if not _ACCOUNT_RE.match(account):
             r = AccountResult(account, SpoolStatus.ERROR, error="Invalid account format")
             if on_status:
@@ -182,12 +199,24 @@ class SpoolEngine:
             # Wallclock cap per account. Most spools finish in under 90 s but
             # some legit cases (slow network, heavy account) can take 5-10 min;
             # 30 min is generous enough to never kill a working extraction.
-            result: RunResult = self.runner.run_script(connection, rendered, [account], timeout=1800)
+            result: RunResult = self.runner.run_script(
+                connection,
+                rendered,
+                [account],
+                timeout=1800,
+                cancel_event=cancel_event,
+            )
         finally:
             try:
                 rendered.unlink()
             except OSError:
                 pass
+
+        if result.exit_code == 130 or _is_cancelled(cancel_event):
+            r = _cancelled_result(account, out_path if out_path.exists() else None)
+            if on_status:
+                on_status(account, r.status, r.error)
+            return r
 
         if not result.ok:
             tail = (result.stderr or result.stdout or "").strip().splitlines()
@@ -216,27 +245,65 @@ class SpoolEngine:
         connection: str,
         on_status: StatusCallback | None = None,
         max_workers: int = MAX_PARALLEL_ACCOUNTS,
+        cancel_event: threading.Event | None = None,
     ) -> list[AccountResult]:
         account_list = list(accounts)
         workers = worker_count_for(len(account_list), max_workers)
         if workers == 0:
             return []
         if workers == 1:
-            return [self.extract_one(country, acc, connection, on_status) for acc in account_list]
+            results: list[AccountResult] = []
+            for acc in account_list:
+                result = self.extract_one(country, acc, connection, on_status, cancel_event)
+                results.append(result)
+            return results
 
         results: list[AccountResult | None] = [None] * len(account_list)
+        next_index = 0
+        pending: set[Future] = set()
+        future_to_index: dict[Future, int] = {}
+
+        def submit_available(executor: ThreadPoolExecutor) -> None:
+            nonlocal next_index
+            while (
+                next_index < len(account_list)
+                and len(pending) < workers
+                and not _is_cancelled(cancel_event)
+            ):
+                idx = next_index
+                future = executor.submit(
+                    self.extract_one,
+                    country,
+                    account_list[idx],
+                    connection,
+                    on_status,
+                    cancel_event,
+                )
+                pending.add(future)
+                future_to_index[future] = idx
+                next_index += 1
+
         with ThreadPoolExecutor(max_workers=workers) as executor:
-            future_to_index = {
-                executor.submit(self.extract_one, country, acc, connection, on_status): idx
-                for idx, acc in enumerate(account_list)
-            }
-            for future in as_completed(future_to_index):
-                idx = future_to_index[future]
-                try:
-                    results[idx] = future.result()
-                except Exception as exc:
-                    log.exception("Unhandled spool extraction error for %s", account_list[idx])
-                    result = AccountResult(account_list[idx], SpoolStatus.ERROR, error=str(exc))
+            submit_available(executor)
+            while pending:
+                done, pending = wait(pending, timeout=0.2, return_when=FIRST_COMPLETED)
+                if not done:
+                    continue
+                for future in done:
+                    idx = future_to_index.pop(future)
+                    try:
+                        results[idx] = future.result()
+                    except Exception as exc:
+                        log.exception("Unhandled spool extraction error for %s", account_list[idx])
+                        result = AccountResult(account_list[idx], SpoolStatus.ERROR, error=str(exc))
+                        results[idx] = result
+                        if on_status:
+                            on_status(result.account, result.status, result.error)
+                submit_available(executor)
+
+            if _is_cancelled(cancel_event):
+                for idx in range(next_index, len(account_list)):
+                    result = _cancelled_result(account_list[idx])
                     results[idx] = result
                     if on_status:
                         on_status(result.account, result.status, result.error)
@@ -249,7 +316,14 @@ class SpoolEngine:
         connection: str,
         spool_path: Path,
         on_status: StatusCallback | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> AccountResult:
+        if _is_cancelled(cancel_event):
+            r = _cancelled_result(account, spool_path)
+            if on_status:
+                on_status(account, r.status, r.error)
+            return r
+
         if not spool_path.exists():
             r = AccountResult(account, SpoolStatus.ERROR, error=f"Spool not found: {spool_path.name}")
             if on_status:
@@ -261,12 +335,24 @@ class SpoolEngine:
 
         rendered = self._render_existing_spool(spool_path)
         try:
-            result: RunResult = self.runner.run_script(connection, rendered, [], timeout=1800)
+            result: RunResult = self.runner.run_script(
+                connection,
+                rendered,
+                [],
+                timeout=1800,
+                cancel_event=cancel_event,
+            )
         finally:
             try:
                 rendered.unlink()
             except OSError:
                 pass
+
+        if result.exit_code == 130 or _is_cancelled(cancel_event):
+            r = _cancelled_result(account, spool_path)
+            if on_status:
+                on_status(account, r.status, r.error)
+            return r
 
         if not result.ok:
             tail = (result.stderr or result.stdout or "").strip().splitlines()
@@ -287,6 +373,7 @@ class SpoolEngine:
         connection: str,
         on_status: StatusCallback | None = None,
         max_workers: int = MAX_PARALLEL_ACCOUNTS,
+        cancel_event: threading.Event | None = None,
     ) -> list[AccountResult]:
         item_list = list(items)
         workers = worker_count_for(len(item_list), max_workers)
@@ -294,24 +381,59 @@ class SpoolEngine:
             return []
         if workers == 1:
             return [
-                self.apply_one(account, connection, spool_path, on_status)
+                self.apply_one(account, connection, spool_path, on_status, cancel_event)
                 for account, spool_path in item_list
             ]
 
         results: list[AccountResult | None] = [None] * len(item_list)
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            future_to_index = {
-                executor.submit(self.apply_one, account, connection, spool_path, on_status): idx
-                for idx, (account, spool_path) in enumerate(item_list)
-            }
-            for future in as_completed(future_to_index):
-                idx = future_to_index[future]
+        next_index = 0
+        pending: set[Future] = set()
+        future_to_index: dict[Future, int] = {}
+
+        def submit_available(executor: ThreadPoolExecutor) -> None:
+            nonlocal next_index
+            while (
+                next_index < len(item_list)
+                and len(pending) < workers
+                and not _is_cancelled(cancel_event)
+            ):
+                idx = next_index
                 account, spool_path = item_list[idx]
-                try:
-                    results[idx] = future.result()
-                except Exception as exc:
-                    log.exception("Unhandled spool inject error for %s", account)
-                    result = AccountResult(account, SpoolStatus.ERROR, output_path=spool_path, error=str(exc))
+                future = executor.submit(
+                    self.apply_one,
+                    account,
+                    connection,
+                    spool_path,
+                    on_status,
+                    cancel_event,
+                )
+                pending.add(future)
+                future_to_index[future] = idx
+                next_index += 1
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            submit_available(executor)
+            while pending:
+                done, pending = wait(pending, timeout=0.2, return_when=FIRST_COMPLETED)
+                if not done:
+                    continue
+                for future in done:
+                    idx = future_to_index.pop(future)
+                    account, spool_path = item_list[idx]
+                    try:
+                        results[idx] = future.result()
+                    except Exception as exc:
+                        log.exception("Unhandled spool inject error for %s", account)
+                        result = AccountResult(account, SpoolStatus.ERROR, output_path=spool_path, error=str(exc))
+                        results[idx] = result
+                        if on_status:
+                            on_status(result.account, result.status, result.error)
+                submit_available(executor)
+
+            if _is_cancelled(cancel_event):
+                for idx in range(next_index, len(item_list)):
+                    account, spool_path = item_list[idx]
+                    result = _cancelled_result(account, spool_path)
                     results[idx] = result
                     if on_status:
                         on_status(result.account, result.status, result.error)
