@@ -42,7 +42,7 @@ from .widgets import AccountStatusRow, IconButton, SectionLabel
 
 log = logging.getLogger(__name__)
 
-# Countries supported in extract mode (need a .sql.tmpl). Mexico is hidden here
+# Countries supported in extract mode (need a non-interactive *2.sql script). Mexico is hidden here
 # until its template lands; apply-existing can still target countries with a
 # destination DB because it does not render a country template.
 _EXTRACT_COUNTRIES = [

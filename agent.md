@@ -18,7 +18,7 @@ You are a agent working on **Oracle Tasks Chile**, a Windows desktop app in Pyth
 
 - **Languages:** UI is bilingual EN/ES (default EN, switch in Settings). SQLcl/Oracle error messages are left raw in English. The user writes to you in Spanish; reply in Spanish.
 
-- **Do not rewrite the user's original `.sql` scripts.** They are versioned as `.sql.tmpl` with a `{{SPOOL_OUT_DIR}}` placeholder that the app fills in on the fly to a temp copy. Reason: respect code that already works, and let the output dir be configurable.
+- **Do not rewrite the user's active `.sql` scripts in place.** The app uses the non-interactive `spools/CL_ACCOUNT_SPOOL_<COUNTRY>2.sql` files (the ones that take the account as SQLcl positional arg `&1`). At runtime it renders a temp copy, rewrites the legacy hardcoded spool root to `paths.SPOOLS_OUT_DIR`, appends `exit;` if needed, executes the temp copy, then deletes it. Reason: respect code that already works, and let the output dir be configurable.
 
 - **Install pattern = exact copy of the user's `vpn` app**, located at `c:\Users\Diego Pavez\Desktop\Oracle\varios\vpn\`. If you have any doubt about `install.bat`, `update.bat`, single-instance guard, AppUserModelID, DPAPI, etc., **read those files first before inventing**. The `vpn` app is the proven reference.
 

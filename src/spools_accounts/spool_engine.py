@@ -20,7 +20,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable, Iterable
 
-from paths import SPOOLS_OUT_DIR, SPOOLS_SQL_DIR
+from paths import SPOOLS_DIR, SPOOLS_OUT_DIR
 from spools_accounts.sqlcl import RunResult, SqlclRunner
 
 log = logging.getLogger(__name__)
@@ -57,9 +57,11 @@ StatusCallback = Callable[[str, SpoolStatus, str], None]
 
 MAX_PARALLEL_ACCOUNTS = 3
 
+_LEGACY_SPOOL_ROOT = r"C:\Users\Diego Pavez\Desktop\sqlcl\spools\spools_files\Accounts"
+
 
 def template_path(country: str) -> Path:
-    return SPOOLS_SQL_DIR / f"CL_ACCOUNT_SPOOL_{country.upper()}.sql.tmpl"
+    return SPOOLS_DIR / f"CL_ACCOUNT_SPOOL_{country.upper()}2.sql"
 
 
 def has_template(country: str) -> bool:
@@ -120,15 +122,18 @@ class SpoolEngine:
         self.runner = runner
 
     def _render_template(self, country: str) -> Path:
-        """Materialize a temp .sql with {{SPOOL_OUT_DIR}} substituted.
+        """Materialize a temp .sql with the output folder rewritten.
 
-        Appends `exit;` if the template doesn't already end with one — without
+        The versioned `spools/*2.sql` scripts are the non-interactive originals
+        that use SQLcl positional arg `&1`. We do not edit them in place; this
+        temp copy points the `spool` command to the app output directory and
+        appends `exit;` if the script doesn't already end with one — without
         it SQLcl runs the script and then sits at the prompt waiting for input,
         so the subprocess only returns when our timeout fires.
         """
         tmpl = template_path(country)
         text = tmpl.read_text(encoding="utf-8")
-        rendered = _with_exit(text.replace("{{SPOOL_OUT_DIR}}", str(SPOOLS_OUT_DIR)))
+        rendered = _with_exit(text.replace(_LEGACY_SPOOL_ROOT, str(SPOOLS_OUT_DIR)))
         out = Path(tempfile.gettempdir()) / f"oracle_tasks_{country.lower()}_{uuid.uuid4().hex[:8]}.sql"
         out.write_text(rendered, encoding="utf-8")
         return out

@@ -14,7 +14,7 @@ APP_NAME = "OracleTasksChile"
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 ASSETS_DIR = REPO_ROOT / "assets"
-SPOOLS_SQL_DIR = REPO_ROOT / "spools_sql"
+SPOOLS_DIR = REPO_ROOT / "spools"
 TOOLS_DIR = REPO_ROOT / "tools"
 
 CONFIG_DIR = Path(os.environ.get("APPDATA", str(Path.home()))) / APP_NAME

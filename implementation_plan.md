@@ -88,13 +88,10 @@ oracle_tasks/
 │   ├── icono_192.png
 │   └── flags/
 │       ├── chile.png  peru.png  colombia.png
-├── spools_sql/                    ← scripts SQL versionados (templates)
-│   ├── CL_ACCOUNT_SPOOL_CHILE.sql.tmpl
-│   ├── CL_ACCOUNT_SPOOL_CHILE2.sql.tmpl
-│   ├── CL_ACCOUNT_SPOOL_PERU.sql.tmpl
-│   ├── CL_ACCOUNT_SPOOL_PERU2.sql.tmpl
-│   ├── CL_ACCOUNT_SPOOL_COLOMBIA.sql.tmpl
-│   └── CL_ACCOUNT_SPOOL_COLOMBIA2.sql.tmpl
+├── spools/                        ← scripts SQL versionados usados por la app
+│   ├── CL_ACCOUNT_SPOOL_CHILE2.sql
+│   ├── CL_ACCOUNT_SPOOL_PERU2.sql
+│   └── CL_ACCOUNT_SPOOL_COLOMBIA2.sql
 ├── tools/
 │   ├── set_aumid.ps1              ← copiado de vpn (taskbar icon)
 │   └── download_sqlcl.ps1         ← descarga + extracción SQLcl
@@ -278,26 +275,31 @@ def to_sqlcl_arg(c: Credential) -> str:
 
 ## 6. Templates de scripts SQL
 
-Los `.sql` actuales tienen ruta hardcoded:
+Los `.sql` usados por la app son los `*2.sql`, porque reciben la cuenta como
+argumento posicional SQLcl (`&1`) y no hacen prompt interactivo. Tienen ruta
+hardcoded:
 ```
-spool "C:\Users\Diego Pavez\Desktop\sqlcl\spools\spools_files\Accounts\Chile\CL_Acc_Spool_&ACC_NO..SQL"
+spool "C:\Users\Diego Pavez\Desktop\sqlcl\spools\spools_files\Accounts\Chile\CL_Acc_Spool_&1..SQL"
 ```
 
-**Solución:** los `.sql` originales se versionan con un placeholder, y la app renderea una copia temporal antes de ejecutar.
+**Solución:** la app no modifica el `.sql` versionado. Lee
+`spools/CL_ACCOUNT_SPOOL_<PAIS>2.sql`, renderea una copia temporal antes de
+ejecutar, y en esa copia reemplaza la raíz legacy:
 
-`spools_sql/CL_ACCOUNT_SPOOL_CHILE2.sql.tmpl`:
-```sql
-spool "{{SPOOL_OUT_DIR}}\Chile\CL_Acc_Spool_&1..SQL"
+```text
+C:\Users\Diego Pavez\Desktop\sqlcl\spools\spools_files\Accounts
+→ paths.SPOOLS_OUT_DIR
 ```
 
 `SqlclRunner.run_script()`:
-1. Lee `.sql.tmpl`
-2. Reemplaza `{{SPOOL_OUT_DIR}}` por `paths.SPOOLS_OUT_DIR` (resuelto a `%LOCALAPPDATA%\OracleTasksChile\spools_out`)
+1. Lee `spools/CL_ACCOUNT_SPOOL_<PAIS>2.sql`
+2. Reemplaza la raíz legacy por `paths.SPOOLS_OUT_DIR` (resuelto a `%LOCALAPPDATA%\OracleTasksChile\spools_out`)
 3. Escribe a `%TEMP%\oracle_tasks_<uuid>.sql`
 4. Ejecuta `sql.exe <cred> @<tempfile> <account>`
 5. Borra el temp al finalizar
 
-Esto preserva los scripts originales **sin modificarlos** y permite que `spools_output_dir` sea configurable en Settings.
+Esto preserva el script versionado **sin modificarlo** y permite que la carpeta
+de salida la controle la app.
 
 ---
 
@@ -539,7 +541,7 @@ Cada fase es un commit/PR funcional y testeable.
 
 ### Fase 3 — Spools view + modo Extract Only
 - `spools_view.py` con dropdowns país/source y textarea de cuentas
-- Templates `.sql.tmpl` (los originales con `{{SPOOL_OUT_DIR}}`)
+- Scripts `spools/CL_ACCOUNT_SPOOL_<PAIS>2.sql` (no interactivos, usan `&1`)
 - `core/spool_engine.py` modo `EXTRACT_ONLY`
 - `widgets.py` con `AccountStatusRow` (spinner + status text)
 - Threading: ejecución en thread, UI updates vía `app.after(0, ...)`
@@ -607,6 +609,6 @@ Cada fase es un commit/PR funcional y testeable.
 
 ## 17. Resumen ejecutivo
 
-App Python con UI customtkinter, instalada vía `install.bat` que se ocupa de Python+Git+SQLcl. Repo público en GitHub (`dpv20/oracle_tasks`) con auto-update por `git pull`. Pantalla home minimalista; pantalla principal de spools con tres modos (extract, extract+apply, apply-existing), batch multilínea, confirmación obligatoria antes de tocar QA/DEV. Credenciales en JSON local con passwords DPAPI; soporta proxy auth `user[schema]/pass`. SQLcl ejecuta los scripts existentes sin modificarlos vía templates con `{{SPOOL_OUT_DIR}}`. i18n EN/ES, light/dark mode. Mismo patrón de instalación/update probado en `vpn`.
+App Python con UI customtkinter, instalada vía `install.bat` que se ocupa de Python+Git+SQLcl. Repo público en GitHub (`dpv20/oracle_tasks`) con auto-update por `git pull`. Pantalla home minimalista; pantalla principal de spools con tres modos (extract, extract+apply, apply-existing), batch multilínea, confirmación obligatoria antes de tocar QA/DEV. Credenciales en JSON local con passwords DPAPI; soporta proxy auth `user[schema]/pass`. SQLcl ejecuta los scripts `spools/CL_ACCOUNT_SPOOL_<PAIS>2.sql` sin modificarlos, usando una copia temporal con la ruta de salida reescrita. i18n EN/ES, light/dark mode. Mismo patrón de instalación/update probado en `vpn`.
 
 **Próximo paso:** crear el repo `dpv20/oracle_tasks` en GitHub, confirmar URL, y arrancamos con Fase 1.

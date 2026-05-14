@@ -16,6 +16,11 @@ Convención:
 - 🔧 Decision: la ruta `Desktop\sqlcl\sqlcl\bin\sql.exe` es una particularidad del equipo de Diego, no un requisito para los companeros. No se considera pendiente del `install.bat`; el instalador debe seguir priorizando PATH/rutas comunes/manual.
 
 ### Fase 5 — Apply Existing 🚧
+- 🔧 Decision: se elimina `spools_sql/` y la app pasa a usar directamente los scripts no interactivos `spools/CL_ACCOUNT_SPOOL_<PAIS>2.sql`. Los `sin 2` usan `Accept ACC_NO` / `&ACC_NO` y quedan fuera del flujo automatico.
+- ✅ `src/spools_accounts/spool_engine.py`: `template_path()` ahora apunta a `spools/CL_ACCOUNT_SPOOL_<PAIS>2.sql`; `_render_template()` crea una copia temporal reemplazando la raiz legacy `...\spools_files\Accounts` por `paths.SPOOLS_OUT_DIR` y sigue agregando `exit;` si falta. Los `.sql` versionados no se editan en runtime.
+- ✅ `agent.md` e `implementation_plan.md`: actualizados para reflejar que ya no existen templates `.sql.tmpl` ni carpeta `spools_sql/`.
+- ✅ Limpieza repo/local: eliminados los scripts interactivos `spools/CL_ACCOUNT_SPOOL_CHILE.sql`, `...PERU.sql`, `...COLOMBIA.sql`; queda solo la familia `*2.sql`. Eliminada carpeta local ignorada `spools/spools_files/` con spools generados antiguos, porque la app escribe en `%LOCALAPPDATA%\OracleTasksChile\spools_out`.
+- ✅ Verificacion: `python -m compileall src` OK; `has_template()` True para Chile/Peru/Colombia y False para Mexico; render temporal de Chile usa `SPOOLS_OUT_DIR`, no deja la ruta legacy activa, y termina con `exit;`.
 - ⚠️ Bug encontrado y corregido: callbacks UI tardios (`root.after(0, ...)`) podian ejecutarse despues de `_finish()` y volver a pintar el resumen como `Extracting...` / `Injecting...` aunque SQLcl ya habia terminado. Fix: cada run ahora tiene `run_id` y fase activa (`extract`/`inject`/`apply_existing`); callbacks viejos o de fases cerradas pueden actualizar la fila, pero no pisan el resumen final.
 - ✅ `src/ui/spools_view.py`: botón de carpeta actualizado de `Open spools folder` a texto dinámico por país (`Chile spools folder`, `Peru spools folder`, etc.) y refresca al cambiar país/modo.
 - ✅ Creada rama `feat/apply-existing-spool` desde `main` actualizado.
