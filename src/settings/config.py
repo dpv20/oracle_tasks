@@ -10,7 +10,7 @@ Config schema (v3):
   "language": "en" | "es",
   "theme": "light" | "dark",
   "sqlcl_path": "<absolute path to sql.exe>",
-  "spools_output_dir": "<override; empty = use default in DATA_DIR>",
+  "spools_cl_output_dir": "<override; empty = use default in DATA_DIR>",
   "credentials": {
       "chile": {
           "CHILE_QA_19C": {
@@ -39,7 +39,7 @@ DEFAULTS: dict[str, Any] = {
     "language": "en",
     "theme": "light",
     "sqlcl_path": "",
-    "spools_output_dir": "",
+    "spools_cl_output_dir": "",
     "credentials": {
         "chile": {},
         "peru": {},

@@ -28,7 +28,9 @@ config.json
 *.log
 app.log
 
-# Generated spools (live in %LOCALAPPDATA%\OracleTasksChile\spools_out at runtime)
+# Generated spools (live in %LOCALAPPDATA%\OracleTasksChile at runtime)
+spools_CL_out/
+spools_savings_out/
 spools_out/
 
 # Local SQLcl install (downloaded to %LOCALAPPDATA% at runtime)
@@ -37,11 +39,12 @@ sqlcl-latest.zip
 
 # Local temp folders
 tmp*/
+temp_savings/
 
 
 
 # Local reference material (kept locally for context, not part of the app)
-spools/spools_files/
+spools_CL/spools_files/
 cuenta_prod_a_QA.txt
 pantalla_*.png
 tnsnames.ora

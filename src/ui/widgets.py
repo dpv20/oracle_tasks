@@ -53,7 +53,7 @@ class SectionLabel(ctk.CTkLabel):
 
 
 class AccountStatusRow(ctk.CTkFrame):
-    """One row per account in the Spools view: status glyph + account + message.
+    """One row per account in the Spools CL view: status glyph + account + message.
 
     States: pending (…), running (⟳), ok (✓), error (✗), cancelled (-).
     """

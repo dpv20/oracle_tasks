@@ -9,7 +9,48 @@ Convención:
 
 ---
 
+## 2026-05-19
+
+### Spools / Savings Accounts — primer flujo funcional
+- ✅ Creado dominio Python `src/spools_savings_accounts/` con `SpoolSavingsEngine`: resuelve branch por cuenta desde la DB origen (`STTM_CUST_ACCOUNT` / `ICTB_ACC_PR` / `STTB_ACCOUNT`), renderiza una copia temporal no interactiva de `spools_savings/IC_account_data_falabella_v2.sql`, escribe `IC_account_data_<cuenta>.INC` en `%LOCALAPPDATA%\OracleTasksChile\spools_savings_out\<Pais>` y puede aplicar `.INC`/`.SQL` existentes contra destino.
+- ✅ El render temporal Savings elimina los `ACCEPT Branch/Account`, define `Branch`/`Account`, reemplaza el spool legacy `D:\IC_account_data_&Account..INC` por la ruta runtime, agrega `dbms_output.enable(null)` si falta y asegura `exit;` sin modificar el script versionado.
+- ✅ Creada vista `src/ui/spools_savings_view.py` con interfaz espejo de CL Accounts: pais, DB origen, DB destino, Extract/Inject por cuenta, carga individual, carga masiva desde Excel/texto, cancelacion, carpeta de spools, Extract/Apply y Apply existing.
+- ✅ Home/App routing: `Spools / Savings Accounts` deja de ser placeholder y abre `spools_savings`; `paths.ensure_dirs()` ahora crea carpetas Savings por pais.
+- ✅ i18n EN/ES agregado para Savings.
+- ✅ Verificacion: `python -m compileall src` OK; smoke render confirma sin `ACCEPT`, sin `D:\`, con output runtime, `dbms_output.enable(null)` y `exit;`; smoke engine con runner falso resuelve branch 001 y genera `.INC`; smoke i18n sin keys faltantes; smoke UI construye `spools_savings`.
+- ⚠️ Nota verificacion local: crear las carpetas runtime en `%LOCALAPPDATA%` requirio ejecutar el smoke fuera del sandbox del workspace; creadas `Chile/Peru/Colombia/Mexico` bajo `spools_savings_out`.
+
+### CL Accounts — carga masiva de cuentas
+- ✅ `src/ui/spools_cl_view.py`: agregado modo separado `Add many...` / `Agregar varias...` junto al input individual. Abre un dialog con textarea para pegar muchas cuentas desde Excel o texto plano, manteniendo intacto el flujo actual `Account number` + `+ Add`.
+- ✅ La carga masiva reutiliza `parse_accounts()`: acepta cuentas separadas por saltos de linea, tabs, espacios, comas o punto y coma; deduplica contra la lista actual, agrega las nuevas a Extract e Inject por defecto, y muestra aviso si hay valores invalidos.
+- ✅ i18n EN/ES actualizado para el boton, dialog y mensajes de resultado.
+- ✅ Verificacion: `python -m compileall src` OK; smoke parser con columna Excel OK; smoke `_add_bulk_accounts()` agrega nuevas, salta duplicadas y reporta invalidas.
+
+### CL Accounts — Mexico template
+- ✅ Creado `spools_CL/CL_ACCOUNT_SPOOL_MEXICO2.sql` copiando el spool no interactivo de Peru y ajustando la ruta hardcoded del `spool` a `Accounts\Mexico`, para que el render temporal escriba en `%LOCALAPPDATA%\OracleTasksChile\spools_CL_out\Mexico`.
+- ✅ `src/ui/spools_cl_view.py`: el selector de paises para Extract/Apply ahora se arma desde `spools_cl_accounts.databases.countries()` y `has_cl_template()`, por lo que Mexico aparece automaticamente al existir `CL_ACCOUNT_SPOOL_MEXICO2.sql`.
+- ✅ `implementation_plan.md`: actualizado el layout versionado y runtime para incluir Mexico, y cerrada la nota antigua de template faltante.
+- ✅ Verificacion: `python -m compileall src` OK; smoke import confirma Mexico en `_EXTRACT_COUNTRIES`; render temporal de Mexico apunta a `spools_CL_out\Mexico`, no deja la ruta legacy activa ni apunta a Peru, y termina con `exit;`.
+
 ## 2026-05-14
+
+### Separacion spools CL / Savings
+- ✅ Renombrado el dominio generico de spools de cuentas CL a nombres explicitos: carpeta SQL `spools_CL/`, package Python `src/spools_cl_accounts/`, vista `src/ui/spools_cl_view.py`, engine `src/spools_cl_accounts/spool_cl_engine.py`, clase `SpoolCLEngine` y estado `SpoolCLStatus`.
+- ✅ Separado el output runtime: CL usa `%LOCALAPPDATA%\OracleTasksChile\spools_CL_out`; Savings queda reservado como `%LOCALAPPDATA%\OracleTasksChile\spools_savings_out`.
+- ✅ Creado `spools_savings/` para scripts base Savings / IC y movido ahi `IC_account_data_falabella_v2.sql`. Los artefactos de prueba descartables siguen en `temp_savings/`.
+- ✅ Ajustados `agent.md`, `implementation_plan.md`, `.gitignore`, rutas, imports, labels i18n y navegacion Home para reflejar `spools_CL` / `spools_savings` y evitar que `spools` quede como nombre de dominio generico.
+- ✅ Verificacion: `python -m compileall src` OK; smoke import confirma `SPOOLS_CL_DIR=spools_CL`, `SPOOLS_SAVINGS_DIR=spools_savings`, outputs `spools_CL_out`/`spools_savings_out`, templates CL para Chile/Peru/Colombia y clase `SpoolCLEngine`.
+
+### Query manual Savings / IC
+- ✅ Creado `query_savings_tablas_importantes.sql` como query de revisión manual para cuentas Savings/IC en PL/SQL Developer. Está basada en las tablas y filtros usados por `IC_account_data_falabella_v2.sql`, usando `&acc` como única variable y separando datos base, IC/intereses, cargos, facilities/bloqueos, setup de producto/rules e índices UF/UFR.
+- ✅ Ajustado `query_savings_tablas_importantes.sql` para no pedir `&brn`: ahora solo solicita `&acc` y deriva el branch desde `STTM_CUST_ACCOUNT`, con fallback a `ICTB_ACC_PR` y `STTB_ACCOUNT`.
+- ✅ Simplificado `query_savings_tablas_importantes.sql` a una revisión rápida tipo `query_tablas_importantes.sql` de CL: solo tablas clave de cuenta/balance/IC entries/accrual/UDE/turnover/bloqueos usando `&acc`.
+- ⚠️ `STTM_ACCOUNT_BALANCE` dio ORA-00942 en PL/SQL Developer y el `.INC` generado también la marca como `source object is not visible`; quedó comentada en la query rápida para no cortar la ejecución.
+- ✅ Para prueba manual de Savings/IC, ajustado `IC_account_data_falabella_v2_RUN.sql` para spolear en la carpeta actual (`IC_account_data_&Account..INC`) en vez de `D:\` y habilitar `dbms_output.enable(null)` dentro del bloque.
+- ⚠️ Hallazgo runtime: durante la ejecución manual, el `.INC` puede quedarse en 0 bytes mientras SQLcl sigue corriendo porque el generador emite todo vía `DBMS_OUTPUT`; SQLcl recién vuelca el contenido al spool cuando termina el bloque PL/SQL.
+- ✅ Prueba real: generado `IC_account_data_8000109678685.INC` desde `CHILE_QA_19C` para branch `001`. Archivo quedó en la carpeta del proyecto (~9.5 MB), termina con `COMMIT;`; única advertencia detectada es `STTM_ACCOUNT_BALANCE - source object is not visible`.
+- ⚠️ Al aplicar el `.INC` en DEV aparecieron `ORA-00001` en tablas maestras compartidas (`STTM_TRN_CODE`, `ICTM_RATES`). No se considera deal breaker por sí solo: son datos de setup ya existentes y el script corre con `WHENEVER SQLERROR CONTINUE`; validar al final que llegue a `COMMIT` y que las tablas propias de la cuenta existan en DEV.
+- ✅ Organización temporal: creado `temp_savings/` y movidos ahí los artefactos de trabajo Savings generados en esta sesión (`query_savings_tablas_importantes.sql`, `IC_account_data_falabella_v2_RUN.sql`, `IC_account_data_8000109678685.INC`). El generador base `IC_account_data_falabella_v2.sql` queda separado en `spools_savings/`.
 
 ### Fase 4 — validacion usuario + merge a main
 - ✅ Verificacion usuario: probado el funcionamiento de ambientes para el flujo extract/apply. Con esto Fase 4 queda lista para mergear a `main` y avanzar a Fase 5.
@@ -18,7 +59,8 @@ Convención:
 ### Home / navegación
 - ✅ Agregado botón `Create Branch` en Home, visible junto a `Spools / CL Accounts` y `Spools / Savings Accounts`. Queda como placeholder con aviso hasta definir el flujo.
 
-### Fase 5 — Apply Existing 🚧
+### Fase 5 — Apply Existing ✅ COMPLETADA
+- ✅ Verificación usuario: prueba real del modo `Apply Existing` ejecutada con un spool `.SQL` existente contra ambiente destino. La aplicación tomó el archivo, pidió confirmación, ejecutó la inyección y el resultado quedó OK en pantalla. Con esto el hito real de Fase 5 queda validado.
 - ✅ Home/task naming: `Spools / Accounts` renombrado a `Spools / CL Accounts` en Home y en la vista de spools. Agregado nuevo botón `Spools / Savings Accounts` en Home con aviso placeholder hasta definir ese flujo.
 - ✅ Ícono actualizado: `new_icon.png` movido a `assets/new_icon.png`; `assets/icono.ico` regenerado desde ese PNG multi-resolución. `install.bat` ahora genera/fallback-ea usando `new_icon.png` en vez de `icono.jpg`; `implementation_plan.md` actualizado.
 - ✅ Cancelación de runs: el botón principal pasa a `Cancel` / `Cancelar` en rojo mientras corre Extract/Apply/Apply Existing. Al cancelar, se setea un `threading.Event`, se evita lanzar cuentas nuevas y SQLcl activo se termina desde `SqlclRunner`.

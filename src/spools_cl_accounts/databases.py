@@ -1,6 +1,6 @@
 """Static catalog of Oracle databases per country and environment.
 
-Mirrors `tnsnames.ora` (kept at repo root for reference). Drives the Spools view
+Mirrors `tnsnames.ora` (kept at repo root for reference). Drives the Spools CL view
 dropdowns and any other UI that needs a DB picker.
 
 Each entry is `{"id": <TNS name>, "label": <human label>}`:

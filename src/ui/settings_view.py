@@ -329,7 +329,7 @@ class SettingsView(ctk.CTkFrame):
         ).start()
 
     def _do_test_connection(self, sqlcl_path: str, cred: dict, db_name: str):
-        from spools_accounts.sqlcl import SqlclRunner
+        from spools_cl_accounts.sqlcl import SqlclRunner
         from settings.credentials import to_sqlcl_arg
 
         password = decrypt_password(cred.get("password_enc", ""))
@@ -376,7 +376,7 @@ class SettingsView(ctk.CTkFrame):
             self.sqlcl_entry.insert(0, f)
 
     def _on_detect_sqlcl(self):
-        from spools_accounts.sqlcl_locator import locate_sqlcl
+        from spools_cl_accounts.sqlcl_locator import locate_sqlcl
         found = locate_sqlcl()
         if found:
             self.sqlcl_entry.delete(0, "end")

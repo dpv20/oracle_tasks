@@ -2,8 +2,6 @@
 from __future__ import annotations
 
 import customtkinter as ctk
-from tkinter import messagebox
-
 from i18n import t
 from version import __version__
 
@@ -15,14 +13,14 @@ class HomeView(ctk.CTkFrame):
         super().__init__(master, fg_color="transparent")
         self.app = app
 
-        # Top toolbar — task buttons (only spools active for now)
+        # Top toolbar — task buttons
         toolbar = ctk.CTkFrame(self, fg_color="transparent")
         toolbar.pack(side="top", fill="x", padx=20, pady=(20, 10))
 
         IconButton(
             toolbar,
-            text=t("home.spools_button"),
-            command=self._on_spools,
+            text=t("home.spools_cl_button"),
+            command=self._on_spools_cl,
             width=190,
         ).pack(side="left", padx=(0, 8))
 
@@ -80,13 +78,14 @@ class HomeView(ctk.CTkFrame):
             font=ctk.CTkFont(size=11),
         ).pack(side="right")
 
-    def _on_spools(self) -> None:
-        self.app.show_view("spools")
+    def _on_spools_cl(self) -> None:
+        self.app.show_view("spools_cl")
 
     def _on_savings_accounts(self) -> None:
-        messagebox.showinfo(t("common.info"), t("home.savings_coming_soon"), parent=self)
+        self.app.show_view("spools_savings")
 
     def _on_create_branch(self) -> None:
+        from tkinter import messagebox
         messagebox.showinfo(t("common.info"), t("home.create_branch_coming_soon"), parent=self)
 
     def _on_settings(self) -> None:

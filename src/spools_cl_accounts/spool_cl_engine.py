@@ -1,6 +1,6 @@
-"""SpoolEngine — orchestrates account spool extraction.
+"""SpoolCLEngine — orchestrates CL account spool extraction.
 
-Supports extracting account spools from a source DB and applying generated or
+Supports extracting CL account spools from a source DB and applying generated or
 pre-existing `.SQL` spool files into a destination DB.
 
 Threading: the engine is blocking by design. The UI calls `extract_one` /
@@ -21,13 +21,13 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable, Iterable
 
-from paths import SPOOLS_DIR, SPOOLS_OUT_DIR
-from spools_accounts.sqlcl import RunResult, SqlclRunner
+from paths import SPOOLS_CL_DIR, SPOOLS_CL_OUT_DIR
+from spools_cl_accounts.sqlcl import RunResult, SqlclRunner
 
 log = logging.getLogger(__name__)
 
 
-class SpoolStatus(str, Enum):
+class SpoolCLStatus(str, Enum):
     PENDING = "pending"
     RUNNING = "running"
     OK = "ok"
@@ -36,14 +36,14 @@ class SpoolStatus(str, Enum):
 
 
 @dataclass
-class AccountResult:
+class CLAccountResult:
     account: str
-    status: SpoolStatus
+    status: SpoolCLStatus
     output_path: Path | None = None
     error: str = ""
 
 
-# Lowercase country id → folder name under SPOOLS_OUT_DIR (matches paths.ensure_dirs).
+# Lowercase country id → folder name under SPOOLS_CL_OUT_DIR (matches paths.ensure_dirs).
 _COUNTRY_FOLDER = {
     "chile":    "Chile",
     "peru":     "Peru",
@@ -55,19 +55,19 @@ _COUNTRY_FOLDER = {
 # Same chars used by the original SQL substitution & by the generated filename.
 _ACCOUNT_RE = re.compile(r"^[A-Za-z0-9_-]{3,40}$")
 
-StatusCallback = Callable[[str, SpoolStatus, str], None]
+CLStatusCallback = Callable[[str, SpoolCLStatus, str], None]
 
 MAX_PARALLEL_ACCOUNTS = 3
 
 _LEGACY_SPOOL_ROOT = r"C:\Users\Diego Pavez\Desktop\sqlcl\spools\spools_files\Accounts"
 
 
-def template_path(country: str) -> Path:
-    return SPOOLS_DIR / f"CL_ACCOUNT_SPOOL_{country.upper()}2.sql"
+def cl_template_path(country: str) -> Path:
+    return SPOOLS_CL_DIR / f"CL_ACCOUNT_SPOOL_{country.upper()}2.sql"
 
 
-def has_template(country: str) -> bool:
-    return template_path(country).is_file()
+def has_cl_template(country: str) -> bool:
+    return cl_template_path(country).is_file()
 
 
 def is_valid_account(s: str) -> bool:
@@ -97,9 +97,9 @@ def parse_accounts(text: str) -> tuple[list[str], list[str]]:
     return valid, invalid
 
 
-def output_path_for(country: str, account: str) -> Path:
+def cl_output_path_for(country: str, account: str) -> Path:
     folder = _COUNTRY_FOLDER.get(country.lower(), country.title())
-    return SPOOLS_OUT_DIR / folder / f"CL_Acc_Spool_{account}.SQL"
+    return SPOOLS_CL_OUT_DIR / folder / f"CL_Acc_Spool_{account}.SQL"
 
 
 def worker_count_for(account_count: int, max_workers: int = MAX_PARALLEL_ACCOUNTS) -> int:
@@ -118,14 +118,14 @@ def _is_cancelled(cancel_event: threading.Event | None) -> bool:
     return cancel_event is not None and cancel_event.is_set()
 
 
-def _cancelled_result(account: str, output_path: Path | None = None) -> AccountResult:
-    return AccountResult(account, SpoolStatus.CANCELLED, output_path=output_path, error="Cancelled")
+def _cancelled_result(account: str, output_path: Path | None = None) -> CLAccountResult:
+    return CLAccountResult(account, SpoolCLStatus.CANCELLED, output_path=output_path, error="Cancelled")
 
 
-class SpoolEngine:
+class SpoolCLEngine:
     """EXTRACT_ONLY: run the country template against a source DB.
 
-    Output spool files land in SPOOLS_OUT_DIR/<Country>/.
+    Output spool files land in SPOOLS_CL_OUT_DIR/<Country>/.
     """
 
     def __init__(self, runner: SqlclRunner):
@@ -134,16 +134,16 @@ class SpoolEngine:
     def _render_template(self, country: str) -> Path:
         """Materialize a temp .sql with the output folder rewritten.
 
-        The versioned `spools/*2.sql` scripts are the non-interactive originals
+        The versioned `spools_CL/*2.sql` scripts are the non-interactive originals
         that use SQLcl positional arg `&1`. We do not edit them in place; this
         temp copy points the `spool` command to the app output directory and
         appends `exit;` if the script doesn't already end with one — without
         it SQLcl runs the script and then sits at the prompt waiting for input,
         so the subprocess only returns when our timeout fires.
         """
-        tmpl = template_path(country)
+        tmpl = cl_template_path(country)
         text = tmpl.read_text(encoding="utf-8")
-        rendered = _with_exit(text.replace(_LEGACY_SPOOL_ROOT, str(SPOOLS_OUT_DIR)))
+        rendered = _with_exit(text.replace(_LEGACY_SPOOL_ROOT, str(SPOOLS_CL_OUT_DIR)))
         out = Path(tempfile.gettempdir()) / f"oracle_tasks_{country.lower()}_{uuid.uuid4().hex[:8]}.sql"
         out.write_text(rendered, encoding="utf-8")
         return out
@@ -160,9 +160,9 @@ class SpoolEngine:
         country: str,
         account: str,
         connection: str,
-        on_status: StatusCallback | None = None,
+        on_status: CLStatusCallback | None = None,
         cancel_event: threading.Event | None = None,
-    ) -> AccountResult:
+    ) -> CLAccountResult:
         if _is_cancelled(cancel_event):
             r = _cancelled_result(account)
             if on_status:
@@ -170,22 +170,22 @@ class SpoolEngine:
             return r
 
         if not _ACCOUNT_RE.match(account):
-            r = AccountResult(account, SpoolStatus.ERROR, error="Invalid account format")
+            r = CLAccountResult(account, SpoolCLStatus.ERROR, error="Invalid account format")
             if on_status:
                 on_status(account, r.status, r.error)
             return r
 
-        if not has_template(country):
-            r = AccountResult(account, SpoolStatus.ERROR,
+        if not has_cl_template(country):
+            r = CLAccountResult(account, SpoolCLStatus.ERROR,
                               error=f"No spool template for country '{country}'")
             if on_status:
                 on_status(account, r.status, r.error)
             return r
 
         if on_status:
-            on_status(account, SpoolStatus.RUNNING, "")
+            on_status(account, SpoolCLStatus.RUNNING, "")
 
-        out_path = output_path_for(country, account)
+        out_path = cl_output_path_for(country, account)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         # Pre-clean stale file so existence on success means a fresh write.
         if out_path.exists():
@@ -221,19 +221,19 @@ class SpoolEngine:
         if not result.ok:
             tail = (result.stderr or result.stdout or "").strip().splitlines()
             err = tail[-1][:240] if tail else f"exit {result.exit_code}"
-            r = AccountResult(account, SpoolStatus.ERROR, error=err)
+            r = CLAccountResult(account, SpoolCLStatus.ERROR, error=err)
             if on_status:
                 on_status(account, r.status, r.error)
             return r
 
         if not out_path.exists():
-            r = AccountResult(account, SpoolStatus.ERROR,
+            r = CLAccountResult(account, SpoolCLStatus.ERROR,
                               error=f"SQLcl exited 0 but spool file is missing: {out_path.name}")
             if on_status:
                 on_status(account, r.status, r.error)
             return r
 
-        r = AccountResult(account, SpoolStatus.OK, output_path=out_path)
+        r = CLAccountResult(account, SpoolCLStatus.OK, output_path=out_path)
         if on_status:
             on_status(account, r.status, "")
         return r
@@ -243,22 +243,22 @@ class SpoolEngine:
         country: str,
         accounts: Iterable[str],
         connection: str,
-        on_status: StatusCallback | None = None,
+        on_status: CLStatusCallback | None = None,
         max_workers: int = MAX_PARALLEL_ACCOUNTS,
         cancel_event: threading.Event | None = None,
-    ) -> list[AccountResult]:
+    ) -> list[CLAccountResult]:
         account_list = list(accounts)
         workers = worker_count_for(len(account_list), max_workers)
         if workers == 0:
             return []
         if workers == 1:
-            results: list[AccountResult] = []
+            results: list[CLAccountResult] = []
             for acc in account_list:
                 result = self.extract_one(country, acc, connection, on_status, cancel_event)
                 results.append(result)
             return results
 
-        results: list[AccountResult | None] = [None] * len(account_list)
+        results: list[CLAccountResult | None] = [None] * len(account_list)
         next_index = 0
         pending: set[Future] = set()
         future_to_index: dict[Future, int] = {}
@@ -295,7 +295,7 @@ class SpoolEngine:
                         results[idx] = future.result()
                     except Exception as exc:
                         log.exception("Unhandled spool extraction error for %s", account_list[idx])
-                        result = AccountResult(account_list[idx], SpoolStatus.ERROR, error=str(exc))
+                        result = CLAccountResult(account_list[idx], SpoolCLStatus.ERROR, error=str(exc))
                         results[idx] = result
                         if on_status:
                             on_status(result.account, result.status, result.error)
@@ -315,9 +315,9 @@ class SpoolEngine:
         account: str,
         connection: str,
         spool_path: Path,
-        on_status: StatusCallback | None = None,
+        on_status: CLStatusCallback | None = None,
         cancel_event: threading.Event | None = None,
-    ) -> AccountResult:
+    ) -> CLAccountResult:
         if _is_cancelled(cancel_event):
             r = _cancelled_result(account, spool_path)
             if on_status:
@@ -325,13 +325,13 @@ class SpoolEngine:
             return r
 
         if not spool_path.exists():
-            r = AccountResult(account, SpoolStatus.ERROR, error=f"Spool not found: {spool_path.name}")
+            r = CLAccountResult(account, SpoolCLStatus.ERROR, error=f"Spool not found: {spool_path.name}")
             if on_status:
                 on_status(account, r.status, r.error)
             return r
 
         if on_status:
-            on_status(account, SpoolStatus.RUNNING, "")
+            on_status(account, SpoolCLStatus.RUNNING, "")
 
         rendered = self._render_existing_spool(spool_path)
         try:
@@ -357,12 +357,12 @@ class SpoolEngine:
         if not result.ok:
             tail = (result.stderr or result.stdout or "").strip().splitlines()
             err = tail[-1][:240] if tail else f"exit {result.exit_code}"
-            r = AccountResult(account, SpoolStatus.ERROR, output_path=spool_path, error=err)
+            r = CLAccountResult(account, SpoolCLStatus.ERROR, output_path=spool_path, error=err)
             if on_status:
                 on_status(account, r.status, r.error)
             return r
 
-        r = AccountResult(account, SpoolStatus.OK, output_path=spool_path)
+        r = CLAccountResult(account, SpoolCLStatus.OK, output_path=spool_path)
         if on_status:
             on_status(account, r.status, "")
         return r
@@ -371,10 +371,10 @@ class SpoolEngine:
         self,
         items: Iterable[tuple[str, Path]],
         connection: str,
-        on_status: StatusCallback | None = None,
+        on_status: CLStatusCallback | None = None,
         max_workers: int = MAX_PARALLEL_ACCOUNTS,
         cancel_event: threading.Event | None = None,
-    ) -> list[AccountResult]:
+    ) -> list[CLAccountResult]:
         item_list = list(items)
         workers = worker_count_for(len(item_list), max_workers)
         if workers == 0:
@@ -385,7 +385,7 @@ class SpoolEngine:
                 for account, spool_path in item_list
             ]
 
-        results: list[AccountResult | None] = [None] * len(item_list)
+        results: list[CLAccountResult | None] = [None] * len(item_list)
         next_index = 0
         pending: set[Future] = set()
         future_to_index: dict[Future, int] = {}
@@ -424,7 +424,7 @@ class SpoolEngine:
                         results[idx] = future.result()
                     except Exception as exc:
                         log.exception("Unhandled spool inject error for %s", account)
-                        result = AccountResult(account, SpoolStatus.ERROR, output_path=spool_path, error=str(exc))
+                        result = CLAccountResult(account, SpoolCLStatus.ERROR, output_path=spool_path, error=str(exc))
                         results[idx] = result
                         if on_status:
                             on_status(result.account, result.status, result.error)

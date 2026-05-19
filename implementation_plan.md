@@ -1,6 +1,6 @@
 # Oracle Tasks Chile — Implementation Plan
 
-App de escritorio Windows en Python para automatizar tareas Oracle del equipo. Primera tarea: generar spools de cuentas desde DBs de producción y aplicarlos en QA/DEV.
+App de escritorio Windows en Python para automatizar tareas Oracle del equipo. Primera tarea: generar spools de cuentas CL desde DBs de producción y aplicarlos en QA/DEV; Savings / IC queda separado en su propio dominio.
 
 ---
 
@@ -88,10 +88,13 @@ oracle_tasks/
 │   ├── icono_192.png
 │   └── flags/
 │       ├── chile.png  peru.png  colombia.png
-├── spools/                        ← scripts SQL versionados usados por la app
+├── spools_CL/                     ← scripts SQL versionados para CL Accounts
 │   ├── CL_ACCOUNT_SPOOL_CHILE2.sql
 │   ├── CL_ACCOUNT_SPOOL_PERU2.sql
-│   └── CL_ACCOUNT_SPOOL_COLOMBIA2.sql
+│   ├── CL_ACCOUNT_SPOOL_COLOMBIA2.sql
+│   └── CL_ACCOUNT_SPOOL_MEXICO2.sql
+├── spools_savings/                ← scripts SQL versionados para Savings / IC
+│   └── IC_account_data_falabella_v2.sql
 ├── tools/
 │   ├── set_aumid.ps1              ← copiado de vpn (taskbar icon)
 │   └── download_sqlcl.ps1         ← descarga + extracción SQLcl
@@ -102,20 +105,20 @@ oracle_tasks/
     │   ├── __init__.py
     │   ├── app.py                 ← OracleTasksApp (CTk window + nav)
     │   ├── home_view.py           ← pantalla inicial: botón "Spools cuentas" + Settings
-    │   ├── spools_view.py         ← pantalla principal de spools
+    │   ├── spools_cl_view.py         ← pantalla principal de spools CL
     │   ├── settings_view.py       ← credenciales, idioma, tema, paths
     │   └── widgets.py             ← AccountStatusRow (cuenta + spinner + ✓/✗), banner update
     ├── core/
     │   ├── __init__.py
     │   ├── config.py              ← ConfigManager (lee/escribe %APPDATA%\OracleTasksChile\config.json)
     │   ├── credentials.py         ← parser de strings tipo `user[schema]/pass@db`, encrypt/decrypt
-    │   ├── databases.py           ← catálogo estático Chile/Peru/Colombia → {prod: [...], qa: [...], dev: [...]}
+    │   ├── databases.py           ← catálogo estático Chile/Peru/Colombia/Mexico → {prod: [...], qa: [...], dev: [...]}
     │   ├── sqlcl.py               ← SqlclRunner: localiza sql.exe, ejecuta scripts, captura stdout/stderr
-    │   ├── spool_engine.py        ← orquestador: render template → ejecuta source → ejecuta destination
+    │   ├── spool_cl_engine.py        ← orquestador CL: render template → ejecuta source → ejecuta destination
     │   ├── updater.py             ← chequeo de version.json en GitHub, banner trigger
     │   └── logger.py
     ├── i18n.py                    ← T = {"en": {...}, "es": {...}}; t(key) según config["language"]
-    └── paths.py                   ← INSTALL_DIR, CONFIG_DIR, SPOOLS_OUT_DIR, SQLCL_DIR (helpers)
+    └── paths.py                   ← INSTALL_DIR, CONFIG_DIR, SPOOLS_CL_OUT_DIR, SQLCL_DIR (helpers)
 ```
 
 ### Layout post-instalación (en máquina del usuario)
@@ -126,10 +129,11 @@ oracle_tasks/
 ├── sqlcl\                         ← descargado por install.bat (~95MB, no en git)
 │   ├── bin\sql.exe
 │   └── ...
-├── spools_out\                    ← spools generados, estructura: spools_out\<Pais>\CL_Acc_Spool_<n>.SQL
+├── spools_CL_out\                    ← spools generados, estructura: spools_CL_out\<Pais>\CL_Acc_Spool_<n>.SQL
 │   ├── Chile\
 │   ├── Peru\
-│   └── Colombia\
+│   ├── Colombia\
+│   └── Mexico\
 └── app.log
 
 %APPDATA%\OracleTasksChile\
@@ -172,7 +176,7 @@ Mirror del `install.bat` de `vpn`, con paso extra de SQLcl:
 
 ---
 
-## 4. Catálogo de databases (`core/databases.py`)
+## 4. Catálogo de databases (`src/spools_cl_accounts/databases.py`)
 
 Estático, parseado desde `tnsnames.ora` y volcado a Python como dict. Cada DB tiene `country`, `env` (`prod` | `qa` | `dev` | `bup_qa` | `bup_prod`), `tns_name` y `description`.
 
@@ -191,7 +195,7 @@ DATABASES = {
 }
 ```
 
-`bup_qa`/`bup_prod` se separan de `qa`/`prod` porque corresponden a DBs distintas (BUP) con su propia credencial; el spool engine las trata como buckets separados.
+`bup_qa`/`bup_prod` se separan de `qa`/`prod` porque corresponden a DBs distintas (BUP) con su propia credencial; el spool CL engine las trata como buckets separados.
 
 UI:
 - Dropdown **País** filtra los demás dropdowns
@@ -209,7 +213,7 @@ UI:
   "language": "en",
   "theme": "light",
   "sqlcl_path": "",
-  "spools_output_dir": "",
+  "spools_cl_output_dir": "",
   "credentials": {
     "chile": {
       "CHILE_QA_19C": {
@@ -283,17 +287,17 @@ spool "C:\Users\Diego Pavez\Desktop\sqlcl\spools\spools_files\Accounts\Chile\CL_
 ```
 
 **Solución:** la app no modifica el `.sql` versionado. Lee
-`spools/CL_ACCOUNT_SPOOL_<PAIS>2.sql`, renderea una copia temporal antes de
+`spools_CL/CL_ACCOUNT_SPOOL_<PAIS>2.sql`, renderea una copia temporal antes de
 ejecutar, y en esa copia reemplaza la raíz legacy:
 
 ```text
 C:\Users\Diego Pavez\Desktop\sqlcl\spools\spools_files\Accounts
-→ paths.SPOOLS_OUT_DIR
+→ paths.SPOOLS_CL_OUT_DIR
 ```
 
 `SqlclRunner.run_script()`:
-1. Lee `spools/CL_ACCOUNT_SPOOL_<PAIS>2.sql`
-2. Reemplaza la raíz legacy por `paths.SPOOLS_OUT_DIR` (resuelto a `%LOCALAPPDATA%\OracleTasksChile\spools_out`)
+1. Lee `spools_CL/CL_ACCOUNT_SPOOL_<PAIS>2.sql`
+2. Reemplaza la raíz legacy por `paths.SPOOLS_CL_OUT_DIR` (resuelto a `%LOCALAPPDATA%\OracleTasksChile\spools_CL_out`)
 3. Escribe a `%TEMP%\oracle_tasks_<uuid>.sql`
 4. Ejecuta `sql.exe <cred> @<tempfile> <account>`
 5. Borra el temp al finalizar
@@ -303,7 +307,7 @@ de salida la controle la app.
 
 ---
 
-## 7. Motor de ejecución (`core/sqlcl.py` + `core/spool_engine.py`)
+## 7. Motor de ejecución (`src/spools_cl_accounts/sqlcl.py` + `src/spools_cl_accounts/spool_cl_engine.py`)
 
 ### `SqlclRunner`
 ```python
@@ -332,7 +336,7 @@ class SqlclRunner:
 
 `-S` = silent (sin banner). Streaming de stdout permite mostrar progreso en vivo.
 
-### `SpoolEngine`
+### `SpoolCLEngine`
 Orquesta los 3 modos:
 
 ```python
@@ -382,8 +386,8 @@ Mockup matching:
 - Bottom-right: "Created by: Diego Pavez Verdi · Contact: …" (texto pequeño)
 - **Banner superior** (si hay update disponible): `🔔 Update available → click to install` → click llama `update.bat`
 
-### Spools view
-- **País** dropdown (Chile/Peru/Colombia)
+### Spools CL view
+- **País** dropdown (Chile/Peru/Colombia/Mexico)
 - **Mode** radio buttons:
   - `( ) Extract from production only (save spool)`
   - `(•) Extract & apply to QA/DEV`
@@ -393,7 +397,7 @@ Mockup matching:
 - **Si mode=APPLY_EXISTING:** botón "Browse spool file…" en lugar de Source
 - **Accounts** textarea multilínea (placeholder: `One account number per line`)
 - **Save spool checkbox** (default ON; si OFF y mode=EXTRACT_ONLY, prompt al usuario por carpeta destino al final)
-- **[Open spools folder]** button → `os.startfile(SPOOLS_OUT_DIR / country)`
+- **[Open CL spools folder]** button → `os.startfile(SPOOLS_CL_OUT_DIR / country)`
 - **[Run]** button (grande, primary)
 - **Progress area** (debajo): un `AccountStatusRow` por cuenta:
   ```
@@ -435,21 +439,18 @@ Tabs:
 T = {
     "en": {
         "home.title": "Oracle Tasks Chile",
-        "home.spools_button": "Spools / Accounts",
+        "home.spools_cl_button": "Spools / CL Accounts",
         "home.settings_button": "Settings",
-        "spools.country": "Country",
-        "spools.source": "Source DB",
-        "spools.destination": "Destination",
-        "spools.mode.extract": "Extract from production only",
-        "spools.mode.extract_apply": "Extract & apply to QA/DEV",
-        "spools.mode.apply_existing": "Apply existing spool file",
-        "spools.accounts_placeholder": "One account number per line",
-        "spools.run": "Run",
-        "spools.confirm_apply": "You are about to apply {n} accounts to:\n   {db}\n\nThis will modify data. Continue?",
-        "spools.status.running_source": "running on source...",
-        "spools.status.running_dest": "applying to destination...",
-        "spools.status.ok": "done",
-        "spools.status.error": "error: {msg}",
+        "spools_cl.country": "Country",
+        "spools_cl.source_db": "Source DB",
+        "spools_cl.destination_db": "Destination DB",
+        "spools_cl.mode.extract": "Extract / Apply",
+        "spools_cl.mode.apply_existing": "Apply existing",
+        "spools_cl.run": "Extract CL spools",
+        "spools_cl.confirm_inject": "You are about to inject {n} accounts into:\n   {db}\n\nThis will modify data. Continue?",
+        "spools_cl.status_extracting": "extracting...",
+        "spools_cl.status_injecting": "injecting...",
+        "spools_cl.status_injected": "injected",
         "settings.language": "Language",
         "settings.theme": "Theme",
         "settings.theme.light": "Light",
@@ -459,7 +460,7 @@ T = {
     },
     "es": {
         "home.title": "Oracle Tasks Chile",
-        "home.spools_button": "Spools / Cuentas",
+        "home.spools_cl_button": "Spools / CL Accounts",
         ...
     },
 }
@@ -522,15 +523,15 @@ Cada fase es un commit/PR funcional y testeable.
 ### Fase 1 — Esqueleto + Settings + Home (sin spools)
 - `install.bat`, `update.bat`, `requirements.txt`, `version.json`
 - Estructura `src/` con `main.py`, `paths.py`, `i18n.py`, `core/config.py`, `core/credentials.py`, `core/logger.py`
-- UI: Home view con botón Spools (placeholder) y botón Settings
+- UI: Home view con botón Spools / CL Accounts, botón Spools / Savings Accounts placeholder y botón Settings
 - Settings view completa: tabs Credentials (paste + form), General, About
 - Toggle light/dark, switch en/es, persistencia en `config.json`
 - DPAPI encrypt/decrypt de passwords
 - **Hito de verificación:** instalar limpio en máquina, abrir app, pegar credenciales, cambiar idioma/tema, reiniciar y verificar persistencia.
 
 ### Fase 2 — Catálogo de DBs + integración SQLcl
-- `core/databases.py` con catálogo Chile/Peru/Colombia poblado del `tnsnames.ora`
-- `core/sqlcl.py` con `SqlclRunner` y `locate_sqlcl()`:
+- `src/spools_cl_accounts/databases.py` con catálogo Chile/Peru/Colombia/Mexico poblado del `tnsnames.ora`
+- `src/spools_cl_accounts/sqlcl.py` con `SqlclRunner` y `locate_sqlcl()`:
   1. Si `config.json["sqlcl_path"]` apunta a un `sql.exe` existente → úsalo
   2. `where sql.exe` (PATH del sistema)
   3. Rutas comunes (`Desktop\sqlcl\bin\`, `C:\sqlcl\bin\`, `%LOCALAPPDATA%\OracleTasksChile\sqlcl\bin\`)
@@ -540,17 +541,17 @@ Cada fase es un commit/PR funcional y testeable.
 - **Hito de verificación:** botón "Test connection" en Settings que conecta a una DB y corre `select 1 from dual`. Probar con Chile QA y verificar que el output aparece en log. Probar también: borrar `sqlcl_path` del config, reabrir, debe detectar SQLcl del PATH automáticamente.
 
 ### Fase 3 — Spools view + modo Extract Only
-- `spools_view.py` con dropdowns país/source y textarea de cuentas
-- Scripts `spools/CL_ACCOUNT_SPOOL_<PAIS>2.sql` (no interactivos, usan `&1`)
-- `core/spool_engine.py` modo `EXTRACT_ONLY`
+- `spools_cl_view.py` con dropdowns país/source y textarea de cuentas
+- Scripts `spools_CL/CL_ACCOUNT_SPOOL_<PAIS>2.sql` (no interactivos, usan `&1`)
+- `src/spools_cl_accounts/spool_cl_engine.py` modo `EXTRACT_ONLY`
 - `widgets.py` con `AccountStatusRow` (spinner + status text)
 - Threading: ejecución en thread, UI updates vía `app.after(0, ...)`
-- Botón "Open spools folder"
+- Botón "Open CL spools folder"
 - **Hito de verificación:** sacar 3 cuentas de Chile PROD a la carpeta local, verificar que los `.SQL` quedan idénticos a los que generas hoy manualmente.
 
 ### Fase 4 — Modo Extract & Apply + confirmación
 - Dropdown destination
-- Modo `EXTRACT_AND_APPLY` en `SpoolEngine`: ejecuta source, luego destination con el spool generado
+- Modo `EXTRACT_AND_APPLY` en `SpoolCLEngine`: ejecuta source, luego destination con el spool generado
 - Diálogo de confirmación obligatorio antes de ejecutar destination
 - Manejo de errores per-cuenta (continúa el batch)
 - **Hito de verificación:** ciclo completo PROD → QA Chile, una cuenta. Luego batch de 3 cuentas con una inválida, verificar que las 2 buenas pasan y la mala muestra error.
@@ -574,7 +575,7 @@ Cada fase es un commit/PR funcional y testeable.
 - Histórico de runs en Settings → "Recent activity"
 - Validación: detectar si una cuenta ya existe en QA antes de aplicar
 
-> Nota: México entró al MVP el 2026-05-12 (ya está en credentials/databases/UI). Falta el template `CL_ACCOUNT_SPOOL_MEXICO.sql` para que el flujo sea utilizable end-to-end en Fase 3.
+> Nota: México entró al MVP el 2026-05-12 y el template `CL_ACCOUNT_SPOOL_MEXICO2.sql` quedó creado el 2026-05-19 a partir del spool de Perú, ajustando la carpeta de salida a Mexico.
 
 ---
 
@@ -609,6 +610,6 @@ Cada fase es un commit/PR funcional y testeable.
 
 ## 17. Resumen ejecutivo
 
-App Python con UI customtkinter, instalada vía `install.bat` que se ocupa de Python+Git+SQLcl. Repo público en GitHub (`dpv20/oracle_tasks`) con auto-update por `git pull`. Pantalla home minimalista; pantalla principal de spools con tres modos (extract, extract+apply, apply-existing), batch multilínea, confirmación obligatoria antes de tocar QA/DEV. Credenciales en JSON local con passwords DPAPI; soporta proxy auth `user[schema]/pass`. SQLcl ejecuta los scripts `spools/CL_ACCOUNT_SPOOL_<PAIS>2.sql` sin modificarlos, usando una copia temporal con la ruta de salida reescrita. i18n EN/ES, light/dark mode. Mismo patrón de instalación/update probado en `vpn`.
+App Python con UI customtkinter, instalada vía `install.bat` que se ocupa de Python+Git+SQLcl. Repo público en GitHub (`dpv20/oracle_tasks`) con auto-update por `git pull`. Pantalla home minimalista; pantalla principal de spools con tres modos (extract, extract+apply, apply-existing), batch multilínea, confirmación obligatoria antes de tocar QA/DEV. Credenciales en JSON local con passwords DPAPI; soporta proxy auth `user[schema]/pass`. SQLcl ejecuta los scripts `spools_CL/CL_ACCOUNT_SPOOL_<PAIS>2.sql` sin modificarlos, usando una copia temporal con la ruta de salida reescrita. i18n EN/ES, light/dark mode. Mismo patrón de instalación/update probado en `vpn`.
 
 **Próximo paso:** crear el repo `dpv20/oracle_tasks` en GitHub, confirmar URL, y arrancamos con Fase 1.

@@ -17,7 +17,8 @@ from version import __version__
 
 from .home_view import HomeView
 from .settings_view import SettingsView
-from .spools_view import SpoolsView
+from .spools_cl_view import SpoolsCLView
+from .spools_savings_view import SpoolsSavingsView
 from .widgets import UpdateBanner
 
 log = logging.getLogger(__name__)
@@ -59,8 +60,10 @@ class OracleTasksApp:
             return HomeView(self.container, app=self)
         if name == "settings":
             return SettingsView(self.container, app=self)
-        if name == "spools":
-            return SpoolsView(self.container, app=self)
+        if name == "spools_cl":
+            return SpoolsCLView(self.container, app=self)
+        if name == "spools_savings":
+            return SpoolsSavingsView(self.container, app=self)
         raise ValueError(f"Unknown view: {name}")
 
     def rebuild_views(self) -> None:

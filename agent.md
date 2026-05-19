@@ -8,7 +8,7 @@ You are a agent working on **Oracle Tasks Chile**, a Windows desktop app in Pyth
 
 2. **`progress.md`** — chronological log (most recent entries on top) of what has been done, what problems came up, and what decisions were made along the way. It tells you **where things stand right now**. Start working from the first task in §14 of the plan that does **not** appear as ✅ in `progress.md`.
 
-3. (Optional, only if you lack context on the original manual flow) `cuenta_prod_a_QA.txt` and the `spools/CL_ACCOUNT_SPOOL_*.sql` files — reference material describing the manual workflow we are automating.
+3. (Optional, only if you lack context on the original manual flow) `cuenta_prod_a_QA.txt` and the `spools_CL/CL_ACCOUNT_SPOOL_*.sql` files — reference material describing the CL Accounts workflow we are automating.
 
 ## Non-negotiable rules
 
@@ -18,7 +18,9 @@ You are a agent working on **Oracle Tasks Chile**, a Windows desktop app in Pyth
 
 - **Languages:** UI is bilingual EN/ES (default EN, switch in Settings). SQLcl/Oracle error messages are left raw in English. The user writes to you in Spanish; reply in Spanish.
 
-- **Do not rewrite the user's active `.sql` scripts in place.** The app uses the non-interactive `spools/CL_ACCOUNT_SPOOL_<COUNTRY>2.sql` files (the ones that take the account as SQLcl positional arg `&1`). At runtime it renders a temp copy, rewrites the legacy hardcoded spool root to `paths.SPOOLS_OUT_DIR`, appends `exit;` if needed, executes the temp copy, then deletes it. Reason: respect code that already works, and let the output dir be configurable.
+- **Do not rewrite the user's active `.sql` scripts in place.** The CL Accounts app flow uses the non-interactive `spools_CL/CL_ACCOUNT_SPOOL_<COUNTRY>2.sql` files (the ones that take the account as SQLcl positional arg `&1`). At runtime it renders a temp copy, rewrites the legacy hardcoded spool root to `paths.SPOOLS_CL_OUT_DIR`, appends `exit;` if needed, executes the temp copy, then deletes it. Reason: respect code that already works, and let the output dir be configurable.
+
+- **Naming convention for spool domains:** CL Accounts code/files use `spools_CL` for repo SQL files, `spools_CL_out` for generated runtime SQL, Python package `spools_cl_accounts`, view `spools_cl_view.py`, and engine `spool_cl_engine.py` / `SpoolCLEngine`. Savings SQL work lives separately under `spools_savings/` (base scripts) and `temp_savings/` (throwaway test artifacts).
 
 - **Install pattern = exact copy of the user's `vpn` app**, located at `c:\Users\Diego Pavez\Desktop\Oracle\varios\vpn\`. If you have any doubt about `install.bat`, `update.bat`, single-instance guard, AppUserModelID, DPAPI, etc., **read those files first before inventing**. The `vpn` app is the proven reference.
 
