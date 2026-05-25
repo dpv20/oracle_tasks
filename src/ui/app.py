@@ -35,8 +35,11 @@ class OracleTasksApp:
 
         self.root = ctk.CTk()
         self.root.title(t("app.title"))
+        # Fallback size if maximizing fails; on Windows we maximize via Tk's
+        # "zoomed" state, deferred so it fires after the window is realized.
         self.root.geometry("900x650")
         self.root.minsize(700, 550)
+        self.root.after(0, self._maximize)
         self._set_window_icon()
 
         self.banner = UpdateBanner(self.root, on_click=self._on_update_click)
@@ -122,6 +125,15 @@ class OracleTasksApp:
             return
         self.config.set("theme", theme)
         ctk.set_appearance_mode(theme)
+
+    # ── window state ──
+    def _maximize(self) -> None:
+        """Maximize the window post-realize. `state('zoomed')` on Windows is
+        the proper maximize (with title bar), not fullscreen."""
+        try:
+            self.root.state("zoomed")
+        except Exception as e:
+            log.warning("Could not maximize window: %s", e)
 
     # ── window icon ──
     def _set_window_icon(self) -> None:
