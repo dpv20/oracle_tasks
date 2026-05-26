@@ -232,40 +232,22 @@ set "SQLCL_PATH="
 :: ── 5. Install pip dependencies ──────────────────────────────────────────────
 echo.
 echo [3/5] Installing dependencies (this may take a minute)...
-set "PIP_LOG=%TEMP%\oracletaskschile_pip_install.log"
-!PY! -m pip install -r "!REPO_DIR!\requirements.txt" > "!PIP_LOG!" 2>&1
+echo.
+!PY! -m pip install -r "!REPO_DIR!\requirements.txt"
 if errorlevel 1 (
     echo.
-    echo [ERROR] Failed to install dependencies. Details:
-    echo ------------------------------------------------------------
-    type "!PIP_LOG!"
-    echo ------------------------------------------------------------
-    echo Full log: !PIP_LOG!
+    echo [ERROR] Failed to install dependencies. See pip output above.
     pause & exit /b 1
 )
-del /f /q "!PIP_LOG!" >nul 2>&1
+echo.
 echo [OK] Dependencies installed.
 
 :: ── 5.5. Persist SQLcl path into config.json ─────────────────────────────────
-if defined SQLCL_PATH (
-    set "CONFIG_DIR=%APPDATA%\OracleTasksChile"
-    if not exist "!CONFIG_DIR!" mkdir "!CONFIG_DIR!"
-    !PY! -c "import json,os,sys; cfg_path=os.path.join(os.environ['APPDATA'],'OracleTasksChile','config.json'); cfg={}; cfg=json.load(open(cfg_path,encoding='utf-8')) if os.path.exists(cfg_path) else {}; cfg['sqlcl_path']=sys.argv[1]; json.dump(cfg, open(cfg_path,'w',encoding='utf-8'), indent=2)" "!SQLCL_PATH!"
-    if errorlevel 1 (
-        echo [WARN] Could not write SQLcl path to config.json. Set it manually in Settings.
-    ) else (
-        echo [OK] SQLcl path saved to config.
-    )
-)
+:: Helper script avoids cmd.exe quoting traps with python -c inside if blocks.
+if defined SQLCL_PATH call :SAVE_SQLCL_PATH
 
 :: ── 6. Generate .ico from new_icon.png if missing ────────────────────────────
-if not exist "!REPO_DIR!\assets\icono.ico" (
-    if exist "!REPO_DIR!\assets\new_icon.png" (
-        echo Generating icono.ico from new_icon.png...
-        !PY! -c "from PIL import Image; img=Image.open(r'!REPO_DIR!\assets\new_icon.png').convert('RGBA'); img.save(r'!REPO_DIR!\assets\icono.ico', sizes=[(16,16),(32,32),(48,48),(64,64),(128,128),(256,256)])" >nul 2>&1
-        if errorlevel 1 echo [WARN] Could not generate .ico (Pillow may not be installed yet).
-    )
-)
+call :MAKE_ICO
 
 :: ── 7. Create shortcut ───────────────────────────────────────────────────────
 echo.
@@ -282,14 +264,9 @@ if not defined DESKTOP set "DESKTOP=%USERPROFILE%\Desktop"
 if not exist "!DESKTOP!" set "DESKTOP=%USERPROFILE%\Desktop"
 
 set "PYPATH_TMP=%TEMP%\otc_pypath.txt"
-!PY! -c "import sys,os; print(os.path.join(sys.prefix,'pythonw.exe'))" > "!PYPATH_TMP!" 2>nul
+!PY! "!REPO_DIR!\tools\find_pythonw.py" > "!PYPATH_TMP!" 2>nul
 set /p PYTHONW=<"!PYPATH_TMP!"
 del /f /q "!PYPATH_TMP!" >nul 2>&1
-if not exist "!PYTHONW!" (
-    !PY! -c "import sys,os; print(os.path.join(sys.prefix,'python.exe'))" > "!PYPATH_TMP!" 2>nul
-    set /p PYTHONW=<"!PYPATH_TMP!"
-    del /f /q "!PYPATH_TMP!" >nul 2>&1
-)
 if not exist "!PYTHONW!" (
     echo [ERROR] Could not locate pythonw.exe or python.exe in Python install.
     pause & exit /b 1
@@ -330,3 +307,23 @@ echo Launching Oracle Tasks Chile...
 start "" "!PYTHONW!" "!SCRIPT!"
 echo.
 pause
+exit /b 0
+
+:: ── Subroutines ──────────────────────────────────────────────────────────────
+
+:SAVE_SQLCL_PATH
+!PY! "!REPO_DIR!\tools\save_sqlcl_path.py" "!SQLCL_PATH!"
+if errorlevel 1 (
+    echo [WARN] Could not write SQLcl path to config.json. Set it manually in Settings.
+) else (
+    echo [OK] SQLcl path saved to config.
+)
+exit /b 0
+
+:MAKE_ICO
+if exist "!REPO_DIR!\assets\icono.ico" exit /b 0
+if not exist "!REPO_DIR!\assets\new_icon.png" exit /b 0
+echo Generating icono.ico from new_icon.png...
+!PY! "!REPO_DIR!\tools\make_ico.py" "!REPO_DIR!\assets\new_icon.png" "!REPO_DIR!\assets\icono.ico" >nul 2>&1
+if errorlevel 1 echo [WARN] Could not generate .ico (Pillow may not be installed yet).
+exit /b 0
