@@ -27,7 +27,7 @@ from spools_savings_accounts.spool_savings_engine import (
     worker_count_for,
 )
 
-from .widgets import AccountStatusRow, IconButton, SectionLabel
+from .widgets import AccountStatusRow, CardFrame, IconButton, SectionLabel
 
 log = logging.getLogger(__name__)
 
@@ -74,19 +74,22 @@ class SpoolsSavingsView(ctk.CTkFrame):
         self._country_lookup: dict[str, str] = {}
         self._existing_spool_path: Path | None = None
 
+        # ── header ──
         header = ctk.CTkFrame(self, fg_color="transparent")
-        header.pack(side="top", fill="x", padx=20, pady=(20, 10))
-        IconButton(
-            header, text=f"← {t('common.back')}", width=100,
-            command=lambda: app.show_view("home"),
-        ).pack(side="left")
+        header.pack(side="top", fill="x", padx=25, pady=(25, 15))
         ctk.CTkLabel(
             header, text=t("spools_savings.title"),
-            font=ctk.CTkFont(size=18, weight="bold"),
-        ).pack(side="left", padx=15)
+            font=ctk.CTkFont(size=24, weight="bold"),
+            text_color=("#0f172a", "#ffffff"),
+        ).pack(side="left")
 
-        form = ctk.CTkFrame(self, fg_color="transparent")
-        form.pack(side="top", fill="x", padx=20, pady=(0, 8))
+        # ── config card ──
+        self.config_card = CardFrame(self)
+        self.config_card.pack(side="top", fill="x", padx=25, pady=(0, 15))
+
+        # Grid inside config card with inner padding
+        form = ctk.CTkFrame(self.config_card, fg_color="transparent")
+        form.pack(fill="x", padx=20, pady=20)
         form.grid_columnconfigure(1, weight=1)
 
         ctk.CTkLabel(form, text=t("spools_savings.mode"), anchor="w", width=160).grid(
@@ -145,10 +148,19 @@ class SpoolsSavingsView(ctk.CTkFrame):
         self.existing_spool_label.grid(row=4, column=0, padx=4, pady=4, sticky="w")
         self.existing_spool_frame.grid(row=4, column=1, padx=4, pady=4, sticky="ew")
 
-        self.account_row = ctk.CTkFrame(self, fg_color="transparent")
-        self.account_row.pack(fill="x", padx=20, pady=(8, 2))
+        # ── accounts card ──
+        self.accounts_card = CardFrame(self)
+        self.accounts_card.pack(side="top", fill="both", expand=True, padx=25, pady=(0, 15))
+
+        # Inner padding for accounts panel
+        accounts_inner = ctk.CTkFrame(self.accounts_card, fg_color="transparent")
+        accounts_inner.pack(fill="both", expand=True, padx=20, pady=20)
+
+        # ── account input row ──
+        self.account_row = ctk.CTkFrame(accounts_inner, fg_color="transparent")
+        self.account_row.pack(fill="x", padx=4, pady=(0, 4))
         ctk.CTkLabel(
-            self.account_row, text=t("spools_savings.account_number"), anchor="w", width=160,
+            self.account_row, text=t("spools_savings.account_number"), anchor="w", width=140,
         ).pack(side="left", padx=4)
         self.account_entry = ctk.CTkEntry(
             self.account_row,
@@ -166,11 +178,11 @@ class SpoolsSavingsView(ctk.CTkFrame):
             command=self._open_bulk_accounts_dialog,
         ).pack(side="left", padx=4)
 
-        self.pending_header = SectionLabel(self, text=t("spools_savings.accounts_summary", n=0))
-        self.pending_header.pack(anchor="w", padx=24, pady=(8, 2))
+        self.pending_header = SectionLabel(accounts_inner, text=t("spools_savings.accounts_summary", n=0))
+        self.pending_header.pack(anchor="w", padx=6, pady=(10, 4))
 
-        self.account_split = ctk.CTkFrame(self, fg_color="transparent")
-        self.account_split.pack(fill="both", expand=True, padx=20, pady=(0, 6))
+        self.account_split = ctk.CTkFrame(accounts_inner, fg_color="transparent")
+        self.account_split.pack(fill="both", expand=True, padx=4, pady=(0, 4))
         self.account_split.grid_columnconfigure(0, weight=1, uniform="savings_account_lists")
         self.account_split.grid_columnconfigure(1, weight=1, uniform="savings_account_lists")
         self.account_split.grid_rowconfigure(1, weight=1)
@@ -188,8 +200,9 @@ class SpoolsSavingsView(ctk.CTkFrame):
         self.inject_frame.grid(row=1, column=1, sticky="nsew", padx=(6, 0))
         self._render_pending_accounts()
 
+        # ── actions ──
         self.actions_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.actions_frame.pack(fill="x", padx=20, pady=(0, 4))
+        self.actions_frame.pack(fill="x", padx=25, pady=(0, 4))
         self.run_btn = IconButton(
             self.actions_frame, text=t("spools_savings.run_extract_only"), width=220,
             command=self._on_run,
@@ -208,18 +221,46 @@ class SpoolsSavingsView(ctk.CTkFrame):
         )
         self.summary_label.pack(side="right", padx=8, fill="x", expand=True)
 
+        # ── results card ──
+        self.results_card = CardFrame(self)
+        # NOT packed by default, shown dynamically during extraction/apply
+
+        results_inner = ctk.CTkFrame(self.results_card, fg_color="transparent")
+        results_inner.pack(fill="both", expand=True, padx=20, pady=20)
+
+        results_header_row = ctk.CTkFrame(results_inner, fg_color="transparent")
+        results_header_row.pack(fill="x", pady=(0, 10))
+
+        self.results_title_label = SectionLabel(results_header_row, text="Execution Progress")
+        self.results_title_label.pack(side="left")
+
+        self.back_to_accounts_btn = IconButton(
+            results_header_row,
+            text="← " + ("Volver" if self.app.config.get("language") == "es" else "Back"),
+            width=100,
+            height=28,
+            command=self._show_accounts_card
+        )
+        self.back_to_accounts_btn.pack(side="right")
+
         self.result_detail_label = ctk.CTkLabel(
-            self,
+            results_inner,
             text="",
             anchor="w",
             justify="left",
-            wraplength=840,
+            wraplength=760,
             text_color=("gray35", "gray70"),
         )
-        self.result_detail_label.pack(fill="x", padx=24, pady=(0, 4))
+        self.result_detail_label.pack(fill="x", pady=(0, 10))
 
-        self.results_frame = ctk.CTkScrollableFrame(self, height=140)
-        self.results_frame.pack(fill="both", expand=True, padx=20, pady=(4, 8))
+        self.results_frame = ctk.CTkScrollableFrame(
+            results_inner,
+            fg_color=("#f8fafc", "#0f172a"),
+            border_color=("#e2e8f0", "#1e293b"),
+            border_width=1,
+            corner_radius=10
+        )
+        self.results_frame.pack(fill="both", expand=True)
 
         self._apply_mode_visibility()
         self._refresh_db_options()
@@ -256,21 +297,26 @@ class SpoolsSavingsView(ctk.CTkFrame):
             self.db_menu.grid_remove()
             self.existing_spool_label.grid()
             self.existing_spool_frame.grid()
-            self.account_row.pack_forget()
-            self.pending_header.pack_forget()
-            self.account_split.pack_forget()
+            self.accounts_card.pack_forget()
+            self.results_card.pack_forget()
             return
 
         self.source_label.grid()
         self.db_menu.grid()
         self.existing_spool_label.grid_remove()
+        self.existing_spool_label.grid_remove()
         self.existing_spool_frame.grid_remove()
-        if not self.account_row.winfo_manager():
-            self.account_row.pack(fill="x", padx=20, pady=(8, 2), before=self.actions_frame)
-        if not self.pending_header.winfo_manager():
-            self.pending_header.pack(anchor="w", padx=24, pady=(8, 2), before=self.actions_frame)
-        if not self.account_split.winfo_manager():
-            self.account_split.pack(fill="both", expand=True, padx=20, pady=(0, 6), before=self.actions_frame)
+        self.results_card.pack_forget()
+        if not self.accounts_card.winfo_manager():
+            self.accounts_card.pack(side="top", fill="both", expand=True, padx=25, pady=(0, 15), before=self.actions_frame)
+
+    def _show_accounts_card(self) -> None:
+        self.results_card.pack_forget()
+        self.accounts_card.pack(side="top", fill="both", expand=True, padx=25, pady=(0, 15), before=self.actions_frame)
+
+    def _show_results_card(self) -> None:
+        self.accounts_card.pack_forget()
+        self.results_card.pack(side="top", fill="both", expand=True, padx=25, pady=(0, 15), before=self.actions_frame)
 
     def _selected_country_id(self) -> str | None:
         return self._country_lookup.get(self.country_var.get())
@@ -639,6 +685,7 @@ class SpoolsSavingsView(ctk.CTkFrame):
                 return
 
         source_connection = self._connection_for_credential(source_cred, db["id"])
+        self._show_results_card()
         self._prepare_results(accounts)
 
         self._running = True
@@ -715,6 +762,7 @@ class SpoolsSavingsView(ctk.CTkFrame):
         if not ok:
             return
 
+        self._show_results_card()
         self._prepare_results([account])
         self._running = True
         self._completed_steps = 0
@@ -950,7 +998,12 @@ class SpoolsSavingsView(ctk.CTkFrame):
             return
         row = self._status_rows.get(account)
         if row is not None:
-            row.set_status(status.value, message)
+            status_val = status.value
+            if status_val == "running":
+                status_val = "injecting" if "inject" in phase or "apply" in phase else "extracting"
+            elif status_val == "ok" and phase == "extract" and account in self._selected_inject_accounts():
+                status_val = "ready_to_inject"
+            row.set_status(status_val, message)
         if status in _TERMINAL_STATUSES and self._active_summary_phase == phase:
             self._completed_steps += 1
             self.summary_label.configure(text=t(summary_key, done=self._completed_steps, total=total))

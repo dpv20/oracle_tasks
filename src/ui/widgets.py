@@ -10,7 +10,7 @@ class UpdateBanner(ctk.CTkFrame):
     """Top banner that becomes visible when an update is available."""
 
     def __init__(self, master, on_click: Callable[[], None], **kw):
-        super().__init__(master, fg_color="#2563eb", corner_radius=0, **kw)
+        super().__init__(master, fg_color="#4f46e5", corner_radius=0, **kw)
         self._on_click = on_click
         self._label = ctk.CTkLabel(
             self,
@@ -34,12 +34,26 @@ class UpdateBanner(ctk.CTkFrame):
         self.pack_forget()
 
 
+class CardFrame(ctk.CTkFrame):
+    """A premium, modern card frame with custom light/dark colors and nice borders."""
+
+    def __init__(self, master, **kw):
+        kw.setdefault("fg_color", ("#ffffff", "#1e293b"))
+        kw.setdefault("border_color", ("#e2e8f0", "#334155"))
+        kw.setdefault("border_width", 1)
+        kw.setdefault("corner_radius", 12)
+        super().__init__(master, **kw)
+
+
 class IconButton(ctk.CTkButton):
     """Wrapper for ctk.CTkButton with our preferred sizing/styling."""
 
     def __init__(self, master, **kw):
         kw.setdefault("corner_radius", 8)
         kw.setdefault("height", 36)
+        kw.setdefault("fg_color", ("#4f46e5", "#6366f1"))
+        kw.setdefault("hover_color", ("#4338ca", "#4f46e5"))
+        kw.setdefault("text_color", "white")
         super().__init__(master, **kw)
 
 
@@ -49,6 +63,7 @@ class SectionLabel(ctk.CTkLabel):
     def __init__(self, master, text: str, **kw):
         kw.setdefault("font", ctk.CTkFont(size=14, weight="bold"))
         kw.setdefault("anchor", "w")
+        kw.setdefault("text_color", ("#1e293b", "#f8fafc"))
         super().__init__(master, text=text, **kw)
 
 
@@ -59,22 +74,32 @@ class AccountStatusRow(ctk.CTkFrame):
     """
 
     _GLYPH = {
-        "pending": "…",
-        "running": "⟳",
-        "ok":      "✓",
-        "error":   "✗",
-        "cancelled": "-",
+        "pending": "⏳",
+        "running": "🔄",
+        "extracting": "🔄",
+        "ready_to_inject": "⏳",
+        "injecting": "📤",
+        "ok":      "✅",
+        "error":   "❌",
+        "cancelled": "➖",
     }
     _COLOR = {
         "pending": ("gray50", "gray60"),
         "running": ("#1F6FEB", "#3FB950"),
+        "extracting": ("#1F6FEB", "#3FB950"),
+        "ready_to_inject": ("#1F6FEB", "#3FB950"),
+        "injecting": ("#9333ea", "#c084fc"),
         "ok":      ("#1A7F37", "#3FB950"),
         "error":   ("#CF222E", "#FF6B6B"),
         "cancelled": ("gray45", "gray60"),
     }
 
     def __init__(self, master, account: str, **kw):
-        super().__init__(master, fg_color="transparent", **kw)
+        kw.setdefault("fg_color", ("#f8fafc", "#0f172a"))
+        kw.setdefault("border_color", ("#e2e8f0", "#1e293b"))
+        kw.setdefault("border_width", 1)
+        kw.setdefault("corner_radius", 8)
+        super().__init__(master, **kw)
         self.account = account
         self._status = "pending"
 
@@ -83,19 +108,20 @@ class AccountStatusRow(ctk.CTkFrame):
             font=ctk.CTkFont(size=14, weight="bold"),
             text_color=self._COLOR["pending"],
         )
-        self._status_label.pack(side="left", padx=(8, 6))
+        self._status_label.pack(side="left", padx=(10, 6), pady=8)
 
         ctk.CTkLabel(
             self, text=account, anchor="w",
-            font=ctk.CTkFont(family="Consolas", size=12),
-        ).pack(side="left", padx=(0, 8))
+            font=ctk.CTkFont(family="Consolas", size=12, weight="bold"),
+            text_color=("#0f172a", "#ffffff"),
+        ).pack(side="left", padx=(0, 8), pady=8)
 
         self._msg_label = ctk.CTkLabel(
             self, text="", anchor="e",
-            font=ctk.CTkFont(size=10),
+            font=ctk.CTkFont(size=11),
             text_color=("gray45", "gray60"),
         )
-        self._msg_label.pack(side="right", padx=8, fill="x", expand=True)
+        self._msg_label.pack(side="right", padx=12, fill="x", expand=True, pady=8)
 
     def set_status(self, status: str, message: str = "") -> None:
         self._status = status
