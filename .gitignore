@@ -49,6 +49,11 @@ cuenta_prod_a_QA.txt
 pantalla_*.png
 tnsnames.ora
 
+# Internal project docs (kept local, not for end users)
+agent.md
+implementation_plan.md
+progress.md
+
 # OS
 Thumbs.db
 Desktop.ini
