@@ -9,6 +9,7 @@ import webbrowser
 
 import customtkinter as ctk
 
+from app_identity import APP_DISPLAY_NAME, APP_USER_MODEL_ID
 from settings.config import ConfigManager
 from i18n import set_language, t
 from infra.updater import check_for_update
@@ -266,6 +267,17 @@ class OracleTasksApp:
             self.root.iconbitmap(default=str(ico))
         except Exception as e:
             log.warning("iconbitmap failed: %s", e)
+        try:
+            from PIL import Image, ImageTk
+            png = ASSETS_DIR / "new_icon.png"
+            source = png if png.exists() else ico
+            icon_img = Image.open(source).convert("RGBA").resize(
+                (256, 256), Image.Resampling.LANCZOS
+            )
+            self._tk_icon = ImageTk.PhotoImage(icon_img)
+            self.root.iconphoto(True, self._tk_icon)
+        except Exception as e:
+            log.warning("iconphoto failed: %s", e)
         # Defer the Win32 WM_SETICON until the window has an HWND (after Tk
         # has actually mapped it). Without after(), winfo_id() returns 0.
         self.root.after(0, self._apply_win32_icons)
@@ -277,7 +289,8 @@ class OracleTasksApp:
             return
         ico = ASSETS_DIR / "icono.ico"
         try:
-            hwnd = int(self.root.wm_frame(), 16)  # top-level HWND
+            frame = str(self.root.wm_frame())
+            hwnd = int(frame, 0) if frame.lower().startswith("0x") else int(frame)
         except Exception:
             try:
                 hwnd = self.root.winfo_id()
@@ -300,7 +313,7 @@ class OracleTasksApp:
         ]
         # Big icon (taskbar / Alt-Tab) — 32x32 is the canonical "big".
         h_big = user32.LoadImageW(
-            None, str(ico), IMAGE_ICON, 32, 32, LR_LOADFROMFILE,
+            None, str(ico), IMAGE_ICON, 256, 256, LR_LOADFROMFILE,
         )
         # Small icon (title bar) — 16x16.
         h_small = user32.LoadImageW(
@@ -311,8 +324,132 @@ class OracleTasksApp:
         if h_small:
             user32.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, h_small)
             user32.SendMessageW(hwnd, WM_SETICON, ICON_SMALL2, h_small)
+        self._apply_taskbar_identity(hwnd, ico)
 
     # ── main loop ──
+    def _apply_taskbar_identity(self, hwnd: int, ico: os.PathLike[str]) -> None:
+        """Set per-window AppUserModel properties for taskbar pinning.
+
+        The process is still pythonw.exe, so Windows otherwise offers to pin
+        "Python". These properties tell Explorer what command, name, icon, and
+        AppUserModelID belong to this window.
+        """
+        try:
+            import ctypes
+            import uuid
+            from ctypes import wintypes
+        except Exception:
+            return
+
+        class GUID(ctypes.Structure):
+            _fields_ = [
+                ("Data1", wintypes.DWORD),
+                ("Data2", wintypes.WORD),
+                ("Data3", wintypes.WORD),
+                ("Data4", ctypes.c_ubyte * 8),
+            ]
+
+            @classmethod
+            def from_string(cls, value: str) -> "GUID":
+                return cls.from_buffer_copy(uuid.UUID(value).bytes_le)
+
+        class PROPERTYKEY(ctypes.Structure):
+            _fields_ = [("fmtid", GUID), ("pid", wintypes.DWORD)]
+
+        class PROPVARIANT(ctypes.Structure):
+            _fields_ = [
+                ("vt", wintypes.USHORT),
+                ("wReserved1", wintypes.USHORT),
+                ("wReserved2", wintypes.USHORT),
+                ("wReserved3", wintypes.USHORT),
+                ("p", ctypes.c_void_p),
+            ]
+
+        method = ctypes.WINFUNCTYPE
+
+        class IPropertyStoreVtbl(ctypes.Structure):
+            _fields_ = [
+                ("QueryInterface", method(ctypes.c_long, ctypes.c_void_p, ctypes.POINTER(GUID), ctypes.POINTER(ctypes.c_void_p))),
+                ("AddRef", method(wintypes.ULONG, ctypes.c_void_p)),
+                ("Release", method(wintypes.ULONG, ctypes.c_void_p)),
+                ("GetCount", method(ctypes.c_long, ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD))),
+                ("GetAt", method(ctypes.c_long, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(PROPERTYKEY))),
+                ("GetValue", method(ctypes.c_long, ctypes.c_void_p, ctypes.POINTER(PROPERTYKEY), ctypes.POINTER(PROPVARIANT))),
+                ("SetValue", method(ctypes.c_long, ctypes.c_void_p, ctypes.POINTER(PROPERTYKEY), ctypes.POINTER(PROPVARIANT))),
+                ("Commit", method(ctypes.c_long, ctypes.c_void_p)),
+            ]
+
+        class IPropertyStore(ctypes.Structure):
+            _fields_ = [("lpVtbl", ctypes.POINTER(IPropertyStoreVtbl))]
+
+        def failed(hr: int) -> bool:
+            return ctypes.c_long(hr).value < 0
+
+        app_model_fmtid = GUID.from_string("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3")
+        keys = {
+            "id": PROPERTYKEY(app_model_fmtid, 5),
+            "relaunch_command": PROPERTYKEY(app_model_fmtid, 2),
+            "relaunch_icon": PROPERTYKEY(app_model_fmtid, 3),
+            "relaunch_name": PROPERTYKEY(app_model_fmtid, 4),
+        }
+
+        iid_property_store = GUID.from_string("886d8eeb-8cf2-4446-8d02-cdba1dbdcf99")
+        store_ptr = ctypes.c_void_p()
+        shell32 = ctypes.windll.shell32
+        shell32.SHGetPropertyStoreForWindow.argtypes = [
+            wintypes.HWND, ctypes.POINTER(GUID), ctypes.POINTER(ctypes.c_void_p),
+        ]
+        shell32.SHGetPropertyStoreForWindow.restype = ctypes.c_long
+        hr = shell32.SHGetPropertyStoreForWindow(
+            wintypes.HWND(hwnd), ctypes.byref(iid_property_store), ctypes.byref(store_ptr)
+        )
+        if failed(hr) or not store_ptr:
+            log.warning("SHGetPropertyStoreForWindow failed: 0x%08x", hr & 0xFFFFFFFF)
+            return
+
+        ole32 = ctypes.windll.ole32
+        ole32.CoTaskMemAlloc.argtypes = [ctypes.c_size_t]
+        ole32.CoTaskMemAlloc.restype = ctypes.c_void_p
+        ole32.PropVariantClear.argtypes = [ctypes.POINTER(PROPVARIANT)]
+        ole32.PropVariantClear.restype = ctypes.c_long
+
+        store = ctypes.cast(store_ptr, ctypes.POINTER(IPropertyStore))
+        vtbl = store.contents.lpVtbl.contents
+
+        def set_string(key: PROPERTYKEY, value: str) -> None:
+            buf = ctypes.create_unicode_buffer(value)
+            ptr = ole32.CoTaskMemAlloc(ctypes.sizeof(buf))
+            if not ptr:
+                return
+            ctypes.memmove(ptr, buf, ctypes.sizeof(buf))
+            pv = PROPVARIANT()
+            pv.vt = 31  # VT_LPWSTR
+            pv.p = ptr
+            try:
+                set_hr = vtbl.SetValue(store_ptr, ctypes.byref(key), ctypes.byref(pv))
+                if failed(set_hr):
+                    log.warning("SetValue failed: 0x%08x", set_hr & 0xFFFFFFFF)
+            finally:
+                ole32.PropVariantClear(ctypes.byref(pv))
+
+        try:
+            set_string(keys["id"], APP_USER_MODEL_ID)
+            set_string(keys["relaunch_command"], self._taskbar_relaunch_command())
+            set_string(keys["relaunch_icon"], str(ico))
+            set_string(keys["relaunch_name"], APP_DISPLAY_NAME)
+            commit_hr = vtbl.Commit(store_ptr)
+            if failed(commit_hr):
+                log.warning("IPropertyStore.Commit failed: 0x%08x", commit_hr & 0xFFFFFFFF)
+        finally:
+            vtbl.Release(store_ptr)
+
+    def _taskbar_relaunch_command(self) -> str:
+        pythonw = os.path.join(sys.prefix, "pythonw.exe")
+        if not os.path.isfile(pythonw):
+            pythonw = sys.executable
+        script = REPO_ROOT / "src" / "main.py"
+        return f'"{pythonw}" "{script}"'
+
     def run(self) -> None:
         log.info("Oracle Tasks Chile v%s starting (lang=%s, theme=%s)",
                  __version__, self.config.get("language"), self.config.get("theme"))

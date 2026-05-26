@@ -273,14 +273,29 @@ if not exist "!PYTHONW!" (
 )
 
 set "LNK_PATH=!DESKTOP!\Oracle Tasks Chile.lnk"
-powershell -NoProfile -Command "$ws=New-Object -ComObject WScript.Shell; $s=$ws.CreateShortcut('!LNK_PATH!'); $s.TargetPath='!PYTHONW!'; $s.Arguments='\"!SCRIPT!\"'; $s.WorkingDirectory='!REPO_DIR!'; $s.IconLocation='!ICON!'; $s.Description='Oracle Tasks Chile'; $s.Save()"
+
+set "START_TMP=%TEMP%\otc_start_menu.txt"
+powershell -NoProfile -Command "[Environment]::GetFolderPath('Programs')" > "!START_TMP!" 2>nul
+set /p START_MENU=<"!START_TMP!"
+del /f /q "!START_TMP!" >nul 2>&1
+if not defined START_MENU set "START_MENU=%APPDATA%\Microsoft\Windows\Start Menu\Programs"
+set "START_DIR=!START_MENU!\Oracle Tasks Chile"
+if not exist "!START_DIR!" mkdir "!START_DIR!" >nul 2>&1
+set "START_LNK_PATH=!START_DIR!\Oracle Tasks Chile.lnk"
+
+powershell -NoProfile -Command "$ws=New-Object -ComObject WScript.Shell; foreach($path in @('!LNK_PATH!','!START_LNK_PATH!')) { $s=$ws.CreateShortcut($path); $s.TargetPath='!PYTHONW!'; $s.Arguments='\"!SCRIPT!\"'; $s.WorkingDirectory='!REPO_DIR!'; $s.IconLocation='!ICON!'; $s.Description='Oracle Tasks Chile'; $s.Save() }"
 if errorlevel 1 (
-    echo [WARN] Could not create desktop shortcut. App is still installed at !REPO_DIR!.
+    echo [WARN] Could not create shortcuts. App is still installed at !REPO_DIR!.
 ) else (
     echo [OK] Desktop shortcut created: !LNK_PATH!
+    echo [OK] Start Menu shortcut created: !START_LNK_PATH!
     if exist "!REPO_DIR!\tools\set_aumid.ps1" (
+        set "AUMID_WARN="
         powershell -NoProfile -ExecutionPolicy Bypass -File "!REPO_DIR!\tools\set_aumid.ps1" -LnkPath "!LNK_PATH!" -AUMID "Oracle.OracleTasksChile.1" >nul 2>&1
-        if errorlevel 1 (
+        if errorlevel 1 set "AUMID_WARN=1"
+        powershell -NoProfile -ExecutionPolicy Bypass -File "!REPO_DIR!\tools\set_aumid.ps1" -LnkPath "!START_LNK_PATH!" -AUMID "Oracle.OracleTasksChile.1" >nul 2>&1
+        if errorlevel 1 set "AUMID_WARN=1"
+        if defined AUMID_WARN (
             echo [WARN] Could not set AppUserModelID on shortcut; taskbar pin may show Python icon.
         ) else (
             echo [OK] Shortcut AppUserModelID set.
@@ -304,7 +319,11 @@ echo ============================================================
 echo.
 
 echo Launching Oracle Tasks Chile...
-start "" "!PYTHONW!" "!SCRIPT!"
+if exist "!LNK_PATH!" (
+    start "" "!LNK_PATH!"
+) else (
+    start "" "!PYTHONW!" "!SCRIPT!"
+)
 echo.
 pause
 exit /b 0

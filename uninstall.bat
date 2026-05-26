@@ -47,6 +47,19 @@ if exist "!DESKTOP!\Oracle Tasks Chile.lnk" (
     echo [OK] Removed desktop shortcut.
 )
 
+set "START_TMP=%TEMP%\otc_uninst_start_menu.txt"
+powershell -NoProfile -Command "[Environment]::GetFolderPath('Programs')" > "!START_TMP!" 2>nul
+set /p START_MENU=<"!START_TMP!"
+del /f /q "!START_TMP!" >nul 2>&1
+if not defined START_MENU set "START_MENU=%APPDATA%\Microsoft\Windows\Start Menu\Programs"
+
+set "START_DIR=!START_MENU!\Oracle Tasks Chile"
+if exist "!START_DIR!\Oracle Tasks Chile.lnk" (
+    del /f /q "!START_DIR!\Oracle Tasks Chile.lnk"
+    echo [OK] Removed Start Menu shortcut.
+)
+if exist "!START_DIR!" rmdir "!START_DIR!" >nul 2>&1
+
 echo.
 echo Done.
 pause

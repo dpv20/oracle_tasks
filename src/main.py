@@ -11,6 +11,8 @@ import sys
 
 sys.path.insert(0, os.path.dirname(__file__))
 
+from app_identity import APP_USER_MODEL_ID
+
 
 def _set_dpi_aware() -> None:
     try:
@@ -23,9 +25,10 @@ def _set_dpi_aware() -> None:
 def _set_app_user_model_id() -> None:
     try:
         import ctypes
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-            "Oracle.OracleTasksChile.1"
-        )
+        set_app_id = ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID
+        set_app_id.argtypes = [ctypes.c_wchar_p]
+        set_app_id.restype = ctypes.c_long
+        set_app_id(APP_USER_MODEL_ID)
     except Exception:
         pass
 

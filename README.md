@@ -14,8 +14,9 @@ account spool extraction (PROD → QA/DEV) for Chile, Peru, Colombia and Mexico.
    - Clone the app to `%LOCALAPPDATA%\OracleTasksChile\app`.
    - Detect **SQLcl** (PATH → common locations → menu prompt if not found).
    - Install Python dependencies.
-   - Create a desktop shortcut **"Oracle Tasks Chile"**.
+   - Create desktop and Start Menu shortcuts **"Oracle Tasks Chile"**.
 3. Launch the app from that shortcut.
+4. To pin it, pin **Oracle Tasks Chile** from the Start Menu shortcut.
 
 > The app updates itself: when a new version lands on `main`, a banner appears
 > at the top of the home screen — click it and the app installs the update.
@@ -72,7 +73,8 @@ Accounts** (Savings).
 6. Click **Open spools folder** to open the destination folder in Explorer.
 
 The resulting `.SQL` files land in:
-`%LOCALAPPDATA%\OracleTasksChile\spools_out\<Country>\CL_Acc_Spool_<account>.SQL`
+`%LOCALAPPDATA%\OracleTasksChile\spools_CL_out\<Country>\CL_Acc_Spool_<account>.SQL`
+(or `spools_savings_out\` for the savings flow).
 
 ---
 
@@ -84,9 +86,9 @@ Run `uninstall.bat` from `%LOCALAPPDATA%\OracleTasksChile\app\`.
 
 ## For developers
 
-```
+```bat
 git clone https://github.com/dpv20/oracle_tasks.git
 cd oracle_tasks
 pip install -r requirements.txt
-python src/main.py
+python src\main.py
 ```
