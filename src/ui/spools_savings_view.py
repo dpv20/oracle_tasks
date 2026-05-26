@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
+import tkinter as tk
 import threading
 from pathlib import Path
 
@@ -807,6 +808,15 @@ class SpoolsSavingsView(ctk.CTkFrame):
             tns,
         )
 
+    def _post_ui(self, callback) -> bool:
+        try:
+            if not self.winfo_exists():
+                return False
+            self.app.root.after(0, callback)
+            return True
+        except (RuntimeError, tk.TclError):
+            return False
+
     def _do_run(
         self,
         run_id: int,
@@ -835,10 +845,9 @@ class SpoolsSavingsView(ctk.CTkFrame):
                 )
             elif status == SpoolSavingsStatus.CANCELLED:
                 display = t("spools_savings.status_cancelled")
-            self.app.root.after(
-                0,
+            self._post_ui(
                 lambda a=account, s=status, m=display, T=total, r=run_id:
-                    self._apply_status(a, s, m, T, "spools_savings.extracting", r, "extract"),
+                    self._apply_status(a, s, m, T, "spools_savings.extracting", r, "extract")
             )
 
         results = engine.extract_many(
@@ -867,17 +876,15 @@ class SpoolsSavingsView(ctk.CTkFrame):
         ]
         if cancel_event.is_set() or not apply_items:
             details = self._classify_extract_apply(accounts, results, [])
-            self.app.root.after(
-                0,
+            self._post_ui(
                 lambda r=run_id, d=details, c=cancel_event.is_set(): self._finish(
                     extract_ok, extract_err, 0, 0, total, 0, r, d, c,
-                ),
+                )
             )
             return
 
-        self.app.root.after(
-            0,
-            lambda total_=len(apply_items), r=run_id, e=cancel_event: self._start_inject_stage(total_, r, e),
+        self._post_ui(
+            lambda total_=len(apply_items), r=run_id, e=cancel_event: self._start_inject_stage(total_, r, e)
         )
         apply_workers = worker_count_for(len(apply_items), MAX_PARALLEL_SAVINGS_ACCOUNTS)
         log.info("Starting Savings inject batch: accounts=%s workers=%s", len(apply_items), apply_workers)
@@ -890,10 +897,9 @@ class SpoolsSavingsView(ctk.CTkFrame):
                 display = t("spools_savings.status_injected")
             elif status == SpoolSavingsStatus.CANCELLED:
                 display = t("spools_savings.status_cancelled")
-            self.app.root.after(
-                0,
+            self._post_ui(
                 lambda a=account, s=status, m=display, T=len(apply_items), r=run_id:
-                    self._apply_status(a, s, m, T, "spools_savings.injecting", r, "inject"),
+                    self._apply_status(a, s, m, T, "spools_savings.injecting", r, "inject")
             )
 
         apply_results = engine.apply_many(
@@ -906,11 +912,10 @@ class SpoolsSavingsView(ctk.CTkFrame):
         inject_ok = sum(1 for result in apply_results if result.status == SpoolSavingsStatus.OK)
         inject_err = len(apply_items) - inject_ok
         details = self._classify_extract_apply(accounts, results, apply_results)
-        self.app.root.after(
-            0,
+        self._post_ui(
             lambda r=run_id, d=details, c=cancel_event.is_set(): self._finish(
                 extract_ok, extract_err, inject_ok, inject_err, total, len(apply_items), r, d, c,
-            ),
+            )
         )
 
     def _do_apply_existing(
@@ -933,18 +938,16 @@ class SpoolsSavingsView(ctk.CTkFrame):
                 display = t("spools_savings.status_injected")
             elif status == SpoolSavingsStatus.CANCELLED:
                 display = t("spools_savings.status_cancelled")
-            self.app.root.after(
-                0,
+            self._post_ui(
                 lambda a=account_, s=status, m=display, r=run_id:
-                    self._apply_status(a, s, m, 1, "spools_savings.injecting", r, "apply_existing"),
+                    self._apply_status(a, s, m, 1, "spools_savings.injecting", r, "apply_existing")
             )
 
         result = engine.apply_one(account, dest_connection, spool_path, on_apply_status, cancel_event)
         ok = 1 if result.status == SpoolSavingsStatus.OK else 0
         err = 0 if result.status == SpoolSavingsStatus.OK else 1
-        self.app.root.after(
-            0,
-            lambda r=run_id, c=cancel_event.is_set(): self._finish_apply_existing(ok, err, r, result, c),
+        self._post_ui(
+            lambda r=run_id, c=cancel_event.is_set(): self._finish_apply_existing(ok, err, r, result, c)
         )
 
     @staticmethod

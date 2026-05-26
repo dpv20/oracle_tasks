@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import webbrowser
+from tkinter import messagebox
 
 import customtkinter as ctk
 
@@ -143,10 +144,25 @@ class OracleTasksApp:
         self.credits_label.configure(text=credits_text)
 
     def _toggle_theme(self) -> None:
+        if self._has_running_work():
+            self._warn_running_work()
+            return
         current = self.config.get("theme", "light")
         new_theme = "dark" if current == "light" else "light"
         self.apply_theme(new_theme)
         self.rebuild_views()
+
+    def _has_running_work(self) -> bool:
+        return any(bool(getattr(view, "_running", False)) for view in self._views.values())
+
+    def _warn_running_work(self) -> None:
+        lang = self.config.get("language", "en")
+        msg = (
+            "Wait for the current extraction/injection to finish, or cancel it, before changing the interface."
+            if lang == "en"
+            else "Espera a que termine la extracción/inyección actual, o cancélala, antes de cambiar la interfaz."
+        )
+        messagebox.showwarning(t("app.title"), msg, parent=self.root)
 
     # ── view router ──
     def show_view(self, name: str) -> None:
@@ -231,6 +247,9 @@ class OracleTasksApp:
     # ── theme/language switching ──
     def apply_language(self, lang: str) -> None:
         if lang == self.config.get("language"):
+            return
+        if self._has_running_work():
+            self._warn_running_work()
             return
         self.config.set("language", lang)
         set_language(lang)
