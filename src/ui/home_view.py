@@ -24,27 +24,27 @@ class HomeView(ctk.CTkFrame):
         lang = self.app.config.get("language", "en")
         if lang == "es":
             welcome_title = "Panel de Automatización Oracle"
-            welcome_subtitle = "Flujos de trabajo ágiles para spools y automatización de ramas Git."
+            welcome_subtitle = "Flujos de trabajo ágiles para spools y gestión de sucursales Falabella."
             cl_title = "🇨🇱  Spools CL (Línea de Crédito)"
             cl_desc = "Extrae y aplica scripts de spools de cuentas de Línea de Crédito directamente desde ambientes origen a ambientes destino de prueba de forma concurrente."
             cl_btn = "Iniciar Spools CL"
             sav_title = "💵  Spools de Ahorros e Inversión"
             sav_desc = "Genera, gestiona e inyecta archivos INC de spools de cuentas de Ahorro y Fondos de Inversión entre ambientes de base de datos."
             sav_btn = "Iniciar Spools Ahorros"
-            branch_title = "🌿  Crear Rama Git"
-            branch_desc = "Automatiza la creación de ramas de tareas y la inicialización de configuraciones Git bajo estándares predefinidos de nomenclatura."
+            branch_title = "🌿  Crear Sucursal Falabella"
+            branch_desc = "Crea y mantiene datos de sucursales Falabella usando campos de negocio estandarizados."
             branch_btn = "Próximamente"
         else:
             welcome_title = "Oracle Automation Dashboard"
-            welcome_subtitle = "Sleek database spool and Git branch automation workflows in a unified panel."
+            welcome_subtitle = "Sleek database spool and Falabella branch management workflows in a unified panel."
             cl_title = "🇨🇱  CL Accounts (Credit Line)"
             cl_desc = "Extract and apply Credit Line (CL) account spool scripts directly from source database environments to test environments concurrently."
             cl_btn = "Launch CL Spools"
             sav_title = "💵  Savings & Investment Accounts"
             sav_desc = "Generate, manage, and inject spool INC scripts for Savings and Mutual Fund structures across configured environments."
             sav_btn = "Launch Savings Spools"
-            branch_title = "🌿  Create Git Branch"
-            branch_desc = "Automate task branch generation and Git workflow initialization with standardized naming conventions and templates."
+            branch_title = "🌿  Create Falabella Branch"
+            branch_desc = "Create and maintain Falabella branch records using standardized business fields."
             branch_btn = "Coming Soon"
 
         self.welcome_lbl = ctk.CTkLabel(
@@ -92,7 +92,7 @@ class HomeView(ctk.CTkFrame):
             command=self._on_savings_accounts
         )
 
-        # ── Card 3: Create Branch ──
+        # ── Card 3: Create Falabella Branch ──
         self.branch_card = CardFrame(self.cards_frame)
         self.branch_card.grid(row=0, column=2, padx=10, pady=10, sticky="nsew")
         self._build_card_content(
