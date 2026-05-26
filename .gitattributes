@@ -1,0 +1,8 @@
+# Windows tools must keep CRLF in the repo so cmd.exe doesn't silently
+# exit when users download these files raw from GitHub. `binary` is the
+# only attribute that fully disables Git's line-ending normalization —
+# `text eol=crlf` still stores LF in the repo, only restoring CRLF at
+# checkout time, which doesn't help raw HTTPS downloads.
+*.bat binary
+*.cmd binary
+*.ps1 binary
