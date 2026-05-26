@@ -252,12 +252,65 @@ class OracleTasksApp:
 
     # ── window icon ──
     def _set_window_icon(self) -> None:
+        """Set both the Tk icon and the Win32 window-level icons.
+
+        `iconbitmap(default=...)` covers the window's title bar but on
+        Windows 10/11 it often serves a low-res frame to the taskbar; we
+        additionally send WM_SETICON with explicitly-sized HICONs loaded
+        from the .ico, which is what taskbar and Alt-Tab actually read.
+        """
         ico = ASSETS_DIR / "icono.ico"
-        if ico.exists():
+        if not ico.exists():
+            return
+        try:
+            self.root.iconbitmap(default=str(ico))
+        except Exception as e:
+            log.warning("iconbitmap failed: %s", e)
+        # Defer the Win32 WM_SETICON until the window has an HWND (after Tk
+        # has actually mapped it). Without after(), winfo_id() returns 0.
+        self.root.after(0, self._apply_win32_icons)
+
+    def _apply_win32_icons(self) -> None:
+        try:
+            import ctypes
+        except Exception:
+            return
+        ico = ASSETS_DIR / "icono.ico"
+        try:
+            hwnd = int(self.root.wm_frame(), 16)  # top-level HWND
+        except Exception:
             try:
-                self.root.iconbitmap(default=str(ico))
-            except Exception as e:
-                log.warning("Could not set window icon: %s", e)
+                hwnd = self.root.winfo_id()
+            except Exception:
+                return
+        if not hwnd:
+            return
+        # Constants
+        IMAGE_ICON = 1
+        LR_LOADFROMFILE = 0x00000010
+        LR_DEFAULTSIZE = 0x00000040
+        WM_SETICON = 0x0080
+        ICON_SMALL = 0
+        ICON_BIG = 1
+        ICON_SMALL2 = 2
+        user32 = ctypes.windll.user32
+        user32.LoadImageW.restype = ctypes.c_void_p
+        user32.SendMessageW.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p, ctypes.c_void_p,
+        ]
+        # Big icon (taskbar / Alt-Tab) — 32x32 is the canonical "big".
+        h_big = user32.LoadImageW(
+            None, str(ico), IMAGE_ICON, 32, 32, LR_LOADFROMFILE,
+        )
+        # Small icon (title bar) — 16x16.
+        h_small = user32.LoadImageW(
+            None, str(ico), IMAGE_ICON, 16, 16, LR_LOADFROMFILE,
+        )
+        if h_big:
+            user32.SendMessageW(hwnd, WM_SETICON, ICON_BIG, h_big)
+        if h_small:
+            user32.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, h_small)
+            user32.SendMessageW(hwnd, WM_SETICON, ICON_SMALL2, h_small)
 
     # ── main loop ──
     def run(self) -> None:
