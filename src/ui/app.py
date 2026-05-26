@@ -40,6 +40,7 @@ class OracleTasksApp:
         # Optimized window sizing for a professional side navigation layout
         self.root.geometry("1100x720")
         self.root.minsize(850, 600)
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(0, self._maximize)
         self._set_window_icon()
 
@@ -158,9 +159,9 @@ class OracleTasksApp:
     def _warn_running_work(self) -> None:
         lang = self.config.get("language", "en")
         msg = (
-            "Wait for the current extraction/injection to finish, or cancel it, before changing the interface."
+            "Wait for the current extraction/injection to finish, or cancel it, before changing the interface or closing the app."
             if lang == "en"
-            else "Espera a que termine la extracción/inyección actual, o cancélala, antes de cambiar la interfaz."
+            else "Espera a que termine la extracción/inyección actual, o cancélala, antes de cambiar la interfaz o cerrar la app."
         )
         messagebox.showwarning(t("app.title"), msg, parent=self.root)
 
@@ -223,6 +224,9 @@ class OracleTasksApp:
         self.root.after(0, lambda v=remote_version: self.show_update_banner(v))
 
     def _on_update_click(self) -> None:
+        if self._has_running_work():
+            self._warn_running_work()
+            return
         updater = REPO_ROOT / "update.bat"
         if not updater.exists():
             webbrowser.open("https://github.com/dpv20/oracle_tasks/releases/latest")
@@ -243,6 +247,12 @@ class OracleTasksApp:
             return
         self.banner.configure(text=t("update.installing"))
         self.root.after(500, self.root.destroy)
+
+    def _on_close(self) -> None:
+        if self._has_running_work():
+            self._warn_running_work()
+            return
+        self.root.destroy()
 
     # ── theme/language switching ──
     def apply_language(self, lang: str) -> None:
