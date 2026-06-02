@@ -95,6 +95,7 @@ class SpoolsCLView(ctk.CTkFrame):
         self._dest_db_lookup: dict[str, dict] = {}
         self._country_lookup: dict[str, str] = {}
         self._existing_spool_paths: list[Path] = []
+        self._last_existing_spool_dir: Path | None = None
 
         # ── header ──
         header = ctk.CTkFrame(self, fg_color="transparent")
@@ -250,6 +251,19 @@ class SpoolsCLView(ctk.CTkFrame):
         self.inject_frame.grid(row=1, column=1, sticky="nsew", padx=(6, 0))
         self._render_pending_accounts()
 
+        # ── existing spools selection card ──
+        self.existing_spools_card = CardFrame(self)
+        existing_spools_inner = ctk.CTkFrame(self.existing_spools_card, fg_color="transparent")
+        existing_spools_inner.pack(fill="both", expand=True, padx=20, pady=20)
+        self.existing_spools_header = SectionLabel(
+            existing_spools_inner,
+            text=t("spools_cl.selected_existing_spools", n=0),
+        )
+        self.existing_spools_header.pack(anchor="w", padx=6, pady=(0, 8))
+        self.existing_spools_frame = ctk.CTkScrollableFrame(existing_spools_inner, height=220)
+        self.existing_spools_frame.pack(fill="both", expand=True, padx=4, pady=(0, 4))
+        self._render_existing_spools()
+
         # ── actions ──
         self.actions_frame = ctk.CTkFrame(self, fg_color="transparent")
         self.actions_frame.pack(fill="x", padx=25, pady=(0, 4))
@@ -403,6 +417,12 @@ class SpoolsCLView(ctk.CTkFrame):
             self.existing_spool_frame.grid()
             self.accounts_card.pack_forget()
             self.results_card.pack_forget()
+            if not self.existing_spools_card.winfo_manager():
+                self.existing_spools_card.pack(
+                    side="top", fill="both", expand=True, padx=25, pady=(0, 15),
+                    before=self.actions_frame,
+                )
+            self._render_existing_spools()
             return
 
         self._apply_spool_type_visibility()
@@ -410,6 +430,7 @@ class SpoolsCLView(ctk.CTkFrame):
         self.db_menu.grid()
         self.existing_spool_label.grid_remove()
         self.existing_spool_frame.grid_remove()
+        self.existing_spools_card.pack_forget()
         self.results_card.pack_forget()
         if not self.accounts_card.winfo_manager():
             self.accounts_card.pack(side="top", fill="both", expand=True, padx=25, pady=(0, 15), before=self.actions_frame)
@@ -444,10 +465,17 @@ class SpoolsCLView(ctk.CTkFrame):
 
     def _show_accounts_card(self) -> None:
         self.results_card.pack_forget()
+        if self._is_apply_existing_mode():
+            self.accounts_card.pack_forget()
+            self.existing_spools_card.pack(side="top", fill="both", expand=True, padx=25, pady=(0, 15), before=self.actions_frame)
+            self._render_existing_spools()
+            return
+        self.existing_spools_card.pack_forget()
         self.accounts_card.pack(side="top", fill="both", expand=True, padx=25, pady=(0, 15), before=self.actions_frame)
 
     def _show_results_card(self) -> None:
         self.accounts_card.pack_forget()
+        self.existing_spools_card.pack_forget()
         self.results_card.pack(side="top", fill="both", expand=True, padx=25, pady=(0, 15), before=self.actions_frame)
 
     def _refresh_db_options(self) -> None:
@@ -511,36 +539,71 @@ class SpoolsCLView(ctk.CTkFrame):
             self.existing_spool_var.set(str(paths[0]))
         else:
             self.existing_spool_var.set(t("spools_cl.selected_spools", n=len(paths)))
+        if hasattr(self, "existing_spools_frame"):
+            self._render_existing_spools()
         self._refresh_run_button()
 
     def _clear_existing_spools(self) -> None:
         if self._existing_spool_paths or self.existing_spool_var.get():
             self._set_existing_spool_paths([])
+        self._last_existing_spool_dir = None
+
+    def _add_existing_spool_paths(self, paths: list[Path]) -> None:
+        merged = list(self._existing_spool_paths)
+        seen = {str(path).lower() for path in merged}
+        for path in paths:
+            key = str(path).lower()
+            if key in seen:
+                continue
+            merged.append(path)
+            seen.add(key)
+        self._set_existing_spool_paths(merged)
+
+    def _remove_existing_spool_path(self, spool_path: Path) -> None:
+        key = str(spool_path).lower()
+        self._set_existing_spool_paths([
+            path for path in self._existing_spool_paths
+            if str(path).lower() != key
+        ])
 
     def _on_browse_existing_spool(self) -> None:
         country = self._selected_country_id()
-        initial_dir = cl_output_folder_for(country or "", self._current_spool_kind())
+        default_dir = cl_output_folder_for(country or "", self._current_spool_kind())
+        initial_dir = self._last_existing_spool_dir or default_dir
         paths = filedialog.askopenfilenames(
             parent=self,
             title=t("spools_cl.select_spool_file"),
-            initialdir=str(initial_dir if initial_dir.exists() else initial_dir.parent),
+            initialdir=str(initial_dir if initial_dir.exists() else default_dir),
             filetypes=[("SQL files", "*.sql *.SQL"), ("All files", "*.*")],
         )
         if not paths:
             return
-        self._set_existing_spool_paths([Path(path) for path in paths])
+        selected_paths = [Path(path) for path in paths]
+        self._last_existing_spool_dir = selected_paths[-1].parent
+        self._add_existing_spool_paths(selected_paths)
 
     @staticmethod
-    def _account_from_spool_path(spool_path: Path) -> str:
+    def _account_from_spool_path(
+        spool_path: Path,
+        spool_kind: str = SPOOL_KIND_CONSUMER_LENDING,
+    ) -> str:
         stem = spool_path.stem
         prefix = "CL_Acc_Spool_"
         if stem.upper().startswith(prefix.upper()):
-            return stem[len(prefix):] or stem
+            payload = stem[len(prefix):]
+            if spool_kind == SPOOL_KIND_CMR:
+                account, sep, branch = payload.rpartition("_")
+                if sep and is_valid_account(account) and is_valid_branch(branch):
+                    return f"{account}  {branch.upper()}"
+            return payload or stem
         return stem
 
     @staticmethod
-    def _apply_existing_items(spool_paths: list[Path]) -> list[tuple[str, Path]]:
-        accounts = [SpoolsCLView._account_from_spool_path(path) for path in spool_paths]
+    def _apply_existing_items(
+        spool_paths: list[Path],
+        spool_kind: str = SPOOL_KIND_CONSUMER_LENDING,
+    ) -> list[tuple[str, Path]]:
+        accounts = [SpoolsCLView._account_from_spool_path(path, spool_kind) for path in spool_paths]
         counts: dict[str, int] = {}
         for account in accounts:
             counts[account] = counts.get(account, 0) + 1
@@ -569,6 +632,53 @@ class SpoolsCLView(ctk.CTkFrame):
             for result in results
             if (result.status == SpoolCLStatus.OK) == ok
         ]
+
+    def _render_existing_spools(self) -> None:
+        for widget in self.existing_spools_frame.winfo_children():
+            widget.destroy()
+        self.existing_spools_header.configure(
+            text=t("spools_cl.selected_existing_spools", n=len(self._existing_spool_paths)),
+        )
+        if not self._existing_spool_paths:
+            ctk.CTkLabel(
+                self.existing_spools_frame,
+                text=t("spools_cl.no_selected_existing_spools"),
+                anchor="w",
+                text_color=("gray45", "gray65"),
+            ).pack(fill="x", padx=8, pady=8)
+            return
+
+        for label, spool_path in self._apply_existing_items(
+            self._existing_spool_paths,
+            self._current_spool_kind(),
+        ):
+            row = ctk.CTkFrame(self.existing_spools_frame, fg_color=("gray92", "gray18"), corner_radius=4)
+            row.pack(fill="x", padx=4, pady=2)
+            text_col = ctk.CTkFrame(row, fg_color="transparent")
+            text_col.pack(side="left", fill="x", expand=True, padx=(10, 6), pady=5)
+            ctk.CTkLabel(
+                text_col,
+                text=f"{label}  -  {spool_path.name}",
+                anchor="w",
+                font=ctk.CTkFont(family="Consolas", size=12),
+            ).pack(fill="x")
+            ctk.CTkLabel(
+                text_col,
+                text=str(spool_path.parent),
+                anchor="w",
+                font=ctk.CTkFont(size=11),
+                text_color=("gray42", "gray65"),
+            ).pack(fill="x")
+            ctk.CTkButton(
+                row,
+                text="x",
+                width=32,
+                height=24,
+                fg_color=("#D9534F", "#A8322C"),
+                hover_color=("#C9302C", "#8B1F1A"),
+                text_color="white",
+                command=lambda path=spool_path: self._remove_existing_spool_path(path),
+            ).pack(side="right", padx=(4, 8), pady=4)
 
     # ── pending accounts ──
     def _on_add_account(self) -> None:
@@ -1010,7 +1120,7 @@ class SpoolsCLView(ctk.CTkFrame):
                                  t("spools_cl.no_creds", db=dest_db["id"]), parent=self)
             return
         dest_connection = self._connection_for_credential(dest_cred, dest_db["id"])
-        items = self._apply_existing_items(spool_paths)
+        items = self._apply_existing_items(spool_paths, self._current_spool_kind())
 
         ok = messagebox.askyesno(
             t("spools_cl.confirm_title"),

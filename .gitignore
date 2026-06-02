@@ -53,8 +53,12 @@ tnsnames.ora
 agent.md
 implementation_plan.md
 progress.md
+handoff.md
 
 # OS
 Thumbs.db
 Desktop.ini
 .DS_Store
+
+# Local presentation/source artifacts
+presentation/

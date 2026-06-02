@@ -85,7 +85,7 @@ The resulting `.SQL` files land in:
 `%LOCALAPPDATA%\OracleTasksChile\spools_CL_out\<Country>\CL_Acc_Spool_<account>.SQL`
 
 CMR Chile files land in:
-`%LOCALAPPDATA%\OracleTasksChile\spools_CMR\CL_Acc_Spool_<account>.SQL`
+`%LOCALAPPDATA%\OracleTasksChile\spools_CMR\CL_Acc_Spool_<account>_<branch>.SQL`
 
 Savings files land in `spools_savings_out\`.
 

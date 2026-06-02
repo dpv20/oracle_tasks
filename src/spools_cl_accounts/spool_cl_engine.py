@@ -148,7 +148,10 @@ def cl_output_path_for(
     country: str,
     account: str,
     spool_kind: str = SPOOL_KIND_CONSUMER_LENDING,
+    branch: str | None = None,
 ) -> Path:
+    if spool_kind == SPOOL_KIND_CMR and branch:
+        return cl_output_folder_for(country, spool_kind) / f"CL_Acc_Spool_{account}_{branch.strip().upper()}.SQL"
     return cl_output_folder_for(country, spool_kind) / f"CL_Acc_Spool_{account}.SQL"
 
 
@@ -193,7 +196,11 @@ class SpoolCLEngine:
         """
         tmpl = cl_template_path(country, spool_kind)
         text = tmpl.read_text(encoding="utf-8")
-        target = cl_output_folder_for(country, spool_kind) / "CL_Acc_Spool_&1..SQL"
+        target_name = (
+            "CL_Acc_Spool_&1._&2..SQL"
+            if spool_kind == SPOOL_KIND_CMR else "CL_Acc_Spool_&1..SQL"
+        )
+        target = cl_output_folder_for(country, spool_kind) / target_name
         if spool_kind == SPOOL_KIND_CMR:
             text = text.replace(r"C:\Account_Spools\CL", str(SPOOLS_CMR_OUT_DIR))
         else:
@@ -261,7 +268,7 @@ class SpoolCLEngine:
         if on_status:
             on_status(account, SpoolCLStatus.RUNNING, "")
 
-        out_path = cl_output_path_for(country, account, spool_kind)
+        out_path = cl_output_path_for(country, account, spool_kind, branch)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         # Pre-clean stale file so existence on success means a fresh write.
         if out_path.exists():
