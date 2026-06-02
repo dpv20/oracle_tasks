@@ -633,6 +633,17 @@ class SpoolsCLView(ctk.CTkFrame):
             if (result.status == SpoolCLStatus.OK) == ok
         ]
 
+    @staticmethod
+    def _pending_account_key(account: str, branch: str = "") -> str:
+        return f"{account}::{branch.upper()}" if branch else account
+
+    @staticmethod
+    def _split_pending_account_key(account_key: str) -> tuple[str, str]:
+        if "::" not in account_key:
+            return account_key, ""
+        account, branch = account_key.rsplit("::", 1)
+        return account, branch.upper()
+
     def _render_existing_spools(self) -> None:
         for widget in self.existing_spools_frame.winfo_children():
             widget.destroy()
@@ -702,13 +713,14 @@ class SpoolsCLView(ctk.CTkFrame):
                     parent=self,
                 )
                 return
-        if raw in self._pending_accounts:
+        account_key = self._pending_account_key(raw, branch if self._is_cmr_mode() else "")
+        if account_key in self._pending_accounts:
             messagebox.showinfo(t("common.info"), t("spools_cl.duplicate_account"), parent=self)
             return
-        self._pending_accounts.append(raw)
-        self._inject_flags[raw] = True
+        self._pending_accounts.append(account_key)
+        self._inject_flags[account_key] = True
         if branch:
-            self._account_branches[raw] = branch
+            self._account_branches[account_key] = branch
         self.account_entry.delete(0, "end")
         self.branch_entry.delete(0, "end")
         self.account_entry.focus_set()
@@ -798,8 +810,14 @@ class SpoolsCLView(ctk.CTkFrame):
     def _add_bulk_accounts(self, text: str) -> dict[str, object]:
         if self._is_cmr_mode():
             valid_pairs, invalid = parse_account_branches(text)
-            valid = [account for account, _branch in valid_pairs]
-            branches = {account: branch for account, branch in valid_pairs}
+            valid = [
+                self._pending_account_key(account, branch)
+                for account, branch in valid_pairs
+            ]
+            branches = {
+                self._pending_account_key(account, branch): branch
+                for account, branch in valid_pairs
+            }
         else:
             valid, invalid = parse_accounts(text)
             branches = {}
@@ -889,7 +907,8 @@ class SpoolsCLView(ctk.CTkFrame):
         return [acc for acc in self._pending_accounts if self._inject_flags.get(acc, False)]
 
     def _account_label(self, account: str) -> str:
-        branch = self._account_branches.get(account, "")
+        account, token_branch = self._split_pending_account_key(account)
+        branch = self._account_branches.get(self._pending_account_key(account, token_branch), token_branch)
         return f"{account}  {branch}" if branch else account
 
     def _render_pending_accounts(self) -> None:

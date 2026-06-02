@@ -117,7 +117,7 @@ def parse_account_branches(text: str) -> tuple[list[tuple[str, str]], list[str]]
     """Parse CMR bulk input as one `account branch` pair per line."""
     valid: list[tuple[str, str]] = []
     invalid: list[str] = []
-    seen: set[str] = set()
+    seen: set[tuple[str, str]] = set()
     for raw in (text or "").splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
@@ -130,9 +130,10 @@ def parse_account_branches(text: str) -> tuple[list[tuple[str, str]], list[str]]
         if not _ACCOUNT_RE.match(account) or not _BRANCH_RE.match(branch):
             invalid.append(line)
             continue
-        if account in seen:
+        pair_key = (account, branch)
+        if pair_key in seen:
             continue
-        seen.add(account)
+        seen.add(pair_key)
         valid.append((account, branch))
     return valid, invalid
 
@@ -169,6 +170,13 @@ def _with_exit(sql_text: str) -> str:
 
 def _is_cancelled(cancel_event: threading.Event | None) -> bool:
     return cancel_event is not None and cancel_event.is_set()
+
+
+def _split_cmr_account_token(account: str) -> tuple[str, str]:
+    if "::" not in account:
+        return account, ""
+    account_no, branch = account.rsplit("::", 1)
+    return account_no, branch.upper()
 
 
 def _cancelled_result(account: str, output_path: Path | None = None) -> CLAccountResult:
@@ -233,42 +241,49 @@ class SpoolCLEngine:
         branch: str | None = None,
         spool_kind: str = SPOOL_KIND_CONSUMER_LENDING,
     ) -> CLAccountResult:
+        status_account = account
+        actual_account = account
+        if spool_kind == SPOOL_KIND_CMR:
+            actual_account, token_branch = _split_cmr_account_token(account)
+            if not branch and token_branch:
+                branch = token_branch
+
         if _is_cancelled(cancel_event):
-            r = _cancelled_result(account)
+            r = _cancelled_result(status_account)
             if on_status:
-                on_status(account, r.status, r.error)
+                on_status(status_account, r.status, r.error)
             return r
 
-        if not _ACCOUNT_RE.match(account):
-            r = CLAccountResult(account, SpoolCLStatus.ERROR, error="Invalid account format")
+        if not _ACCOUNT_RE.match(actual_account):
+            r = CLAccountResult(status_account, SpoolCLStatus.ERROR, error="Invalid account format")
             if on_status:
-                on_status(account, r.status, r.error)
+                on_status(status_account, r.status, r.error)
             return r
 
         if spool_kind == SPOOL_KIND_CMR:
             branch = (branch or "").strip().upper()
             if country.lower() != "chile":
-                r = CLAccountResult(account, SpoolCLStatus.ERROR, error="CMR spool is only available for Chile")
+                r = CLAccountResult(status_account, SpoolCLStatus.ERROR, error="CMR spool is only available for Chile")
                 if on_status:
-                    on_status(account, r.status, r.error)
+                    on_status(status_account, r.status, r.error)
                 return r
             if not _BRANCH_RE.match(branch):
-                r = CLAccountResult(account, SpoolCLStatus.ERROR, error="Invalid branch format")
+                r = CLAccountResult(status_account, SpoolCLStatus.ERROR, error="Invalid branch format")
                 if on_status:
-                    on_status(account, r.status, r.error)
+                    on_status(status_account, r.status, r.error)
                 return r
 
         if not has_cl_template(country, spool_kind):
-            r = CLAccountResult(account, SpoolCLStatus.ERROR,
+            r = CLAccountResult(status_account, SpoolCLStatus.ERROR,
                               error=f"No spool template for country '{country}'")
             if on_status:
-                on_status(account, r.status, r.error)
+                on_status(status_account, r.status, r.error)
             return r
 
         if on_status:
-            on_status(account, SpoolCLStatus.RUNNING, "")
+            on_status(status_account, SpoolCLStatus.RUNNING, "")
 
-        out_path = cl_output_path_for(country, account, spool_kind, branch)
+        out_path = cl_output_path_for(country, actual_account, spool_kind, branch)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         # Pre-clean stale file so existence on success means a fresh write.
         if out_path.exists():
@@ -278,7 +293,7 @@ class SpoolCLEngine:
                 log.warning("Could not remove stale spool %s: %s", out_path, e)
 
         rendered = self._render_template(country, spool_kind)
-        args = [account, branch] if spool_kind == SPOOL_KIND_CMR else [account]
+        args = [actual_account, branch] if spool_kind == SPOOL_KIND_CMR else [actual_account]
         try:
             # Wallclock cap per account. Most spools finish in under 90 s but
             # some legit cases (slow network, heavy account) can take 5-10 min;
@@ -297,29 +312,29 @@ class SpoolCLEngine:
                 pass
 
         if result.exit_code == 130 or _is_cancelled(cancel_event):
-            r = _cancelled_result(account, out_path if out_path.exists() else None)
+            r = _cancelled_result(status_account, out_path if out_path.exists() else None)
             if on_status:
-                on_status(account, r.status, r.error)
+                on_status(status_account, r.status, r.error)
             return r
 
         if not result.ok:
             tail = (result.stderr or result.stdout or "").strip().splitlines()
             err = tail[-1][:240] if tail else f"exit {result.exit_code}"
-            r = CLAccountResult(account, SpoolCLStatus.ERROR, error=err)
+            r = CLAccountResult(status_account, SpoolCLStatus.ERROR, error=err)
             if on_status:
-                on_status(account, r.status, r.error)
+                on_status(status_account, r.status, r.error)
             return r
 
         if not out_path.exists():
-            r = CLAccountResult(account, SpoolCLStatus.ERROR,
+            r = CLAccountResult(status_account, SpoolCLStatus.ERROR,
                               error=f"SQLcl exited 0 but spool file is missing: {out_path.name}")
             if on_status:
-                on_status(account, r.status, r.error)
+                on_status(status_account, r.status, r.error)
             return r
 
-        r = CLAccountResult(account, SpoolCLStatus.OK, output_path=out_path)
+        r = CLAccountResult(status_account, SpoolCLStatus.OK, output_path=out_path)
         if on_status:
-            on_status(account, r.status, "")
+            on_status(status_account, r.status, "")
         return r
 
     def extract_many(
