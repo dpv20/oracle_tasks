@@ -21,6 +21,9 @@ account spool extraction (PROD → QA/DEV) for Chile, Peru, Colombia and Mexico.
 > The app updates itself: when a new version lands on `main`, a banner appears
 > at the top of the home screen — click it and the app installs the update.
 
+Release checklist: before committing a release, bump both `src/version.py` and
+`assets/version.json` to the same version.
+
 ---
 
 ## 2. Configure SQLcl
