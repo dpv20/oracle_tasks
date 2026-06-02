@@ -25,24 +25,30 @@ class HomeView(ctk.CTkFrame):
         if lang == "es":
             welcome_title = "Panel de Automatización Oracle"
             welcome_subtitle = "Flujos de trabajo ágiles para spools y gestión de sucursales Falabella."
-            cl_title = "🇨🇱  Spools CL (Línea de Crédito)"
-            cl_desc = "Extrae y aplica scripts de spools de cuentas de Línea de Crédito directamente desde ambientes origen a ambientes destino de prueba de forma concurrente."
-            cl_btn = "Iniciar Spools CL"
+            cl_title = "▣  Consumer Lending"
+            cl_desc = "Extrae y aplica spools de cuentas CL Consumer Lending entre ambientes origen y destino de prueba."
+            cl_btn = "Iniciar Consumer Lending"
             sav_title = "💵  Spools de Ahorros e Inversión"
             sav_desc = "Genera, gestiona e inyecta archivos INC de spools de cuentas de Ahorro y Fondos de Inversión entre ambientes de base de datos."
             sav_btn = "Iniciar Spools Ahorros"
+            cmr_title = "◇  CMR Chile"
+            cmr_desc = "Extrae y aplica spools CMR para Chile usando número de cuenta y branch."
+            cmr_btn = "Iniciar CMR"
             branch_title = "🌿  Crear Sucursal Falabella"
             branch_desc = "Crea y mantiene datos de sucursales Falabella usando campos de negocio estandarizados."
             branch_btn = "Próximamente"
         else:
             welcome_title = "Oracle Automation Dashboard"
             welcome_subtitle = "Sleek database spool and Falabella branch management workflows in a unified panel."
-            cl_title = "🇨🇱  CL Accounts (Credit Line)"
-            cl_desc = "Extract and apply Credit Line (CL) account spool scripts directly from source database environments to test environments concurrently."
-            cl_btn = "Launch CL Spools"
+            cl_title = "▣  Consumer Lending"
+            cl_desc = "Extract and apply CL Consumer Lending account spools across source and test database environments."
+            cl_btn = "Launch Consumer Lending"
             sav_title = "💵  Savings & Investment Accounts"
             sav_desc = "Generate, manage, and inject spool INC scripts for Savings and Mutual Fund structures across configured environments."
             sav_btn = "Launch Savings Spools"
+            cmr_title = "◇  CMR Chile"
+            cmr_desc = "Extract and apply Chile CMR spools using account number and branch."
+            cmr_btn = "Launch CMR"
             branch_title = "🌿  Create Falabella Branch"
             branch_desc = "Create and maintain Falabella branch records using standardized business fields."
             branch_btn = "Coming Soon"
@@ -68,9 +74,10 @@ class HomeView(ctk.CTkFrame):
         # Cards Grid Layout Frame
         self.cards_frame = ctk.CTkFrame(self.scroll_container, fg_color="transparent")
         self.cards_frame.pack(fill="both", expand=True, pady=10)
-        self.cards_frame.grid_columnconfigure((0, 1, 2), weight=1, uniform="home_cards")
+        self.cards_frame.grid_columnconfigure((0, 1), weight=1, uniform="home_cards")
+        self.cards_frame.grid_rowconfigure((0, 1), weight=1, uniform="home_cards")
 
-        # ── Card 1: Credit Line (CL) Spools ──
+        # ── Card 1: Consumer Lending (CL) Spools ──
         self.cl_card = CardFrame(self.cards_frame)
         self.cl_card.grid(row=0, column=0, padx=10, pady=10, sticky="nsew")
         self._build_card_content(
@@ -92,9 +99,20 @@ class HomeView(ctk.CTkFrame):
             command=self._on_savings_accounts
         )
 
-        # ── Card 3: Create Falabella Branch ──
+        # ── Card 3: CMR Chile ──
+        self.cmr_card = CardFrame(self.cards_frame)
+        self.cmr_card.grid(row=1, column=0, padx=10, pady=10, sticky="nsew")
+        self._build_card_content(
+            self.cmr_card,
+            title=cmr_title,
+            description=cmr_desc,
+            btn_text=cmr_btn,
+            command=self._on_cmr_chile
+        )
+
+        # ── Card 4: Create Falabella Branch ──
         self.branch_card = CardFrame(self.cards_frame)
-        self.branch_card.grid(row=0, column=2, padx=10, pady=10, sticky="nsew")
+        self.branch_card.grid(row=1, column=1, padx=10, pady=10, sticky="nsew")
         self._build_card_content(
             self.branch_card,
             title=branch_title,
@@ -156,10 +174,13 @@ class HomeView(ctk.CTkFrame):
         btn.pack(fill="x", side="bottom")
 
     def _on_spools_cl(self) -> None:
-        self.app.show_view("spools_cl")
+        self.app.show_consumer_lending()
 
     def _on_savings_accounts(self) -> None:
         self.app.show_view("spools_savings")
+
+    def _on_cmr_chile(self) -> None:
+        self.app.show_cmr_chile()
 
     def _on_create_branch(self) -> None:
         from tkinter import messagebox

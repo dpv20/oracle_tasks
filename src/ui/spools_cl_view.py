@@ -29,13 +29,15 @@ import customtkinter as ctk
 from tkinter import filedialog, messagebox
 
 from i18n import t
-from paths import SPOOLS_CL_OUT_DIR
 from settings.config import decrypt_password
 from settings.credentials import to_sqlcl_arg
 from spools_cl_accounts import databases as dbs
 from spools_cl_accounts.spool_cl_engine import (
     MAX_PARALLEL_ACCOUNTS, CLAccountResult, SpoolCLEngine, SpoolCLStatus,
-    has_cl_template, is_valid_account, parse_accounts, worker_count_for,
+    SPOOL_KIND_CMR, SPOOL_KIND_CONSUMER_LENDING,
+    cl_output_folder_for,
+    has_cl_template, is_valid_account, is_valid_branch, parse_account_branches,
+    parse_accounts, worker_count_for,
 )
 from spools_cl_accounts.sqlcl import SqlclRunner
 
@@ -73,6 +75,7 @@ _PRIMARY_BUTTON_HOVER = ("#1A5BBF", "#154A9F")
 _CANCEL_BUTTON_FG = ("#D9534F", "#A8322C")
 _CANCEL_BUTTON_HOVER = ("#C9302C", "#8B1F1A")
 _TERMINAL_STATUSES = {SpoolCLStatus.OK, SpoolCLStatus.ERROR, SpoolCLStatus.CANCELLED}
+_BULK_DIALOG_SIZE = (560, 430)
 
 
 class SpoolsCLView(ctk.CTkFrame):
@@ -82,6 +85,7 @@ class SpoolsCLView(ctk.CTkFrame):
         self._status_rows: dict[str, AccountStatusRow] = {}
         self._pending_accounts: list[str] = []
         self._inject_flags: dict[str, bool] = {}
+        self._account_branches: dict[str, str] = {}
         self._completed_steps = 0
         self._run_id = 0
         self._active_summary_phase: str | None = None
@@ -90,7 +94,7 @@ class SpoolsCLView(ctk.CTkFrame):
         self._db_lookup: dict[str, dict] = {}
         self._dest_db_lookup: dict[str, dict] = {}
         self._country_lookup: dict[str, str] = {}
-        self._existing_spool_path: Path | None = None
+        self._existing_spool_paths: list[Path] = []
 
         # ── header ──
         header = ctk.CTkFrame(self, fg_color="transparent")
@@ -130,25 +134,40 @@ class SpoolsCLView(ctk.CTkFrame):
             form,
             values=[label for _, label in _EXTRACT_COUNTRIES] or ["—"],
             variable=self.country_var,
-            command=lambda _v: self._refresh_db_options(),
+            command=lambda _v: self._on_country_change(),
         )
         self.country_menu.grid(row=1, column=1, padx=4, pady=4, sticky="ew")
 
+        self.spool_type_label = ctk.CTkLabel(
+            form, text=t("spools_cl.spool_type"), anchor="w", width=160,
+        )
+        self.spool_type_label.grid(row=2, column=0, padx=4, pady=4, sticky="w")
+        self.spool_type_segment = ctk.CTkSegmentedButton(
+            form,
+            values=[
+                t("spools_cl.spool_type.consumer_lending"),
+                t("spools_cl.spool_type.cmr"),
+            ],
+            command=lambda _v: self._on_spool_type_change(),
+        )
+        self.spool_type_segment.grid(row=2, column=1, padx=4, pady=4, sticky="ew")
+        self.spool_type_segment.set(t("spools_cl.spool_type.consumer_lending"))
+
         self.source_label = ctk.CTkLabel(form, text=t("spools_cl.source_db"), anchor="w", width=160)
         self.source_label.grid(
-            row=2, column=0, padx=4, pady=4, sticky="w",
+            row=3, column=0, padx=4, pady=4, sticky="w",
         )
         self.db_var = ctk.StringVar(value="")
         self.db_menu = ctk.CTkOptionMenu(form, values=["—"], variable=self.db_var)
-        self.db_menu.grid(row=2, column=1, padx=4, pady=4, sticky="ew")
+        self.db_menu.grid(row=3, column=1, padx=4, pady=4, sticky="ew")
 
         self.dest_label = ctk.CTkLabel(form, text=t("spools_cl.destination_db"), anchor="w", width=160)
         self.dest_label.grid(
-            row=3, column=0, padx=4, pady=4, sticky="w",
+            row=4, column=0, padx=4, pady=4, sticky="w",
         )
         self.dest_db_var = ctk.StringVar(value="")
         self.dest_db_menu = ctk.CTkOptionMenu(form, values=["-"], variable=self.dest_db_var)
-        self.dest_db_menu.grid(row=3, column=1, padx=4, pady=4, sticky="ew")
+        self.dest_db_menu.grid(row=4, column=1, padx=4, pady=4, sticky="ew")
 
         self.existing_spool_label = ctk.CTkLabel(
             form, text=t("spools_cl.existing_spool"), anchor="w", width=160,
@@ -167,8 +186,8 @@ class SpoolsCLView(ctk.CTkFrame):
             width=110,
             command=self._on_browse_existing_spool,
         ).pack(side="left", padx=(8, 0))
-        self.existing_spool_label.grid(row=4, column=0, padx=4, pady=4, sticky="w")
-        self.existing_spool_frame.grid(row=4, column=1, padx=4, pady=4, sticky="ew")
+        self.existing_spool_label.grid(row=5, column=0, padx=4, pady=4, sticky="w")
+        self.existing_spool_frame.grid(row=5, column=1, padx=4, pady=4, sticky="ew")
 
         # ── accounts card ──
         self.accounts_card = CardFrame(self)
@@ -181,15 +200,26 @@ class SpoolsCLView(ctk.CTkFrame):
         # ── account input row ──
         self.account_row = ctk.CTkFrame(accounts_inner, fg_color="transparent")
         self.account_row.pack(fill="x", padx=4, pady=(0, 4))
-        ctk.CTkLabel(
+        self.account_label = ctk.CTkLabel(
             self.account_row, text=t("spools_cl.account_number"), anchor="w", width=140,
-        ).pack(side="left", padx=4)
+        )
+        self.account_label.pack(side="left", padx=4)
         self.account_entry = ctk.CTkEntry(
             self.account_row, font=ctk.CTkFont(family="Consolas", size=12),
             placeholder_text="e.g. 209991341468",
         )
         self.account_entry.pack(side="left", padx=4, fill="x", expand=True)
         self.account_entry.bind("<Return>", lambda _e: self._on_add_account())
+        self.branch_label = ctk.CTkLabel(
+            self.account_row, text=t("spools_cl.branch"), anchor="w", width=58,
+        )
+        self.branch_entry = ctk.CTkEntry(
+            self.account_row,
+            width=90,
+            font=ctk.CTkFont(family="Consolas", size=12),
+            placeholder_text="U01",
+        )
+        self.branch_entry.bind("<Return>", lambda _e: self._on_add_account())
         IconButton(
             self.account_row, text=t("spools_cl.add_account"), width=90,
             command=self._on_add_account,
@@ -292,6 +322,18 @@ class SpoolsCLView(ctk.CTkFrame):
     def _is_apply_existing_mode(self) -> bool:
         return self._current_mode() == MODE_APPLY_EXISTING
 
+    def _is_cmr_selected(self) -> bool:
+        return (
+            self._selected_country_id() == "chile"
+            and self.spool_type_segment.get() == t("spools_cl.spool_type.cmr")
+        )
+
+    def _is_cmr_mode(self) -> bool:
+        return not self._is_apply_existing_mode() and self._is_cmr_selected()
+
+    def _current_spool_kind(self) -> str:
+        return SPOOL_KIND_CMR if self._is_cmr_selected() else SPOOL_KIND_CONSUMER_LENDING
+
     def _country_options(self) -> list[tuple[str, str]]:
         return _APPLY_EXISTING_COUNTRIES if self._is_apply_existing_mode() else _EXTRACT_COUNTRIES
 
@@ -305,13 +347,56 @@ class SpoolsCLView(ctk.CTkFrame):
 
     def _on_mode_change(self) -> None:
         previous_country = self._selected_country_id()
+        self._clear_existing_spools()
         self._refresh_country_options(previous_country)
+        self._apply_mode_visibility()
+        self._refresh_db_options()
+        self._refresh_run_button()
+
+    def _on_spool_type_change(self) -> None:
+        self._clear_pending_accounts()
+        self._clear_existing_spools()
+        self._apply_branch_visibility()
+        self._refresh_open_folder_button()
+        self._refresh_run_button()
+
+    def _on_country_change(self) -> None:
+        self._clear_existing_spools()
+        self._refresh_db_options()
+
+    def _clear_pending_accounts(self) -> None:
+        if not self._pending_accounts and not self._account_branches:
+            return
+        self._pending_accounts.clear()
+        self._inject_flags.clear()
+        self._account_branches.clear()
+        self._render_pending_accounts()
+
+    def select_consumer_lending(self) -> None:
+        if self._running:
+            return
+        self.mode_segment.set(t("spools_cl.mode.extract"))
+        self.spool_type_segment.set(t("spools_cl.spool_type.consumer_lending"))
+        self._clear_pending_accounts()
+        self._apply_mode_visibility()
+        self._refresh_db_options()
+        self._refresh_run_button()
+
+    def select_cmr_chile(self) -> None:
+        if self._running:
+            return
+        self.mode_segment.set(t("spools_cl.mode.extract"))
+        self._refresh_country_options("chile")
+        self.spool_type_segment.set(t("spools_cl.spool_type.cmr"))
+        self._clear_pending_accounts()
         self._apply_mode_visibility()
         self._refresh_db_options()
         self._refresh_run_button()
 
     def _apply_mode_visibility(self) -> None:
         if self._is_apply_existing_mode():
+            self._apply_spool_type_visibility()
+            self._apply_branch_visibility()
             self.source_label.grid_remove()
             self.db_menu.grid_remove()
             self.existing_spool_label.grid()
@@ -320,6 +405,7 @@ class SpoolsCLView(ctk.CTkFrame):
             self.results_card.pack_forget()
             return
 
+        self._apply_spool_type_visibility()
         self.source_label.grid()
         self.db_menu.grid()
         self.existing_spool_label.grid_remove()
@@ -327,6 +413,30 @@ class SpoolsCLView(ctk.CTkFrame):
         self.results_card.pack_forget()
         if not self.accounts_card.winfo_manager():
             self.accounts_card.pack(side="top", fill="both", expand=True, padx=25, pady=(0, 15), before=self.actions_frame)
+
+    def _apply_spool_type_visibility(self) -> None:
+        if self._selected_country_id() != "chile":
+            self.spool_type_segment.set(t("spools_cl.spool_type.consumer_lending"))
+            self.spool_type_label.grid_remove()
+            self.spool_type_segment.grid_remove()
+        else:
+            self.spool_type_label.grid()
+            self.spool_type_segment.grid()
+        self._apply_branch_visibility()
+        if not self._is_cmr_mode() and self._account_branches:
+            self._account_branches.clear()
+            self._render_pending_accounts()
+
+    def _apply_branch_visibility(self) -> None:
+        if self._is_cmr_mode():
+            if not self.branch_label.winfo_manager():
+                self.branch_label.pack(side="left", padx=(8, 4), after=self.account_entry)
+            if not self.branch_entry.winfo_manager():
+                self.branch_entry.pack(side="left", padx=4, after=self.branch_label)
+            return
+        self.branch_entry.delete(0, "end")
+        self.branch_label.pack_forget()
+        self.branch_entry.pack_forget()
 
     def _selected_country_id(self) -> str | None:
         label = self.country_var.get()
@@ -342,6 +452,7 @@ class SpoolsCLView(ctk.CTkFrame):
 
     def _refresh_db_options(self) -> None:
         country = self._selected_country_id()
+        self._apply_spool_type_visibility()
         self._refresh_open_folder_button()
         labels: list[str] = []
         dest_labels: list[str] = []
@@ -384,24 +495,40 @@ class SpoolsCLView(ctk.CTkFrame):
     def _refresh_open_folder_button(self) -> None:
         if not hasattr(self, "open_folder_btn"):
             return
+        if self._current_spool_kind() == SPOOL_KIND_CMR:
+            self.open_folder_btn.configure(text=t("spools_cl.open_cmr_folder"))
+            return
         country_label = self.country_var.get()
         if not country_label or country_label == "—":
             country_label = t("spools_cl.country")
         self.open_folder_btn.configure(text=t("spools_cl.open_country_folder", country=country_label))
 
+    def _set_existing_spool_paths(self, paths: list[Path]) -> None:
+        self._existing_spool_paths = paths
+        if not paths:
+            self.existing_spool_var.set("")
+        elif len(paths) == 1:
+            self.existing_spool_var.set(str(paths[0]))
+        else:
+            self.existing_spool_var.set(t("spools_cl.selected_spools", n=len(paths)))
+        self._refresh_run_button()
+
+    def _clear_existing_spools(self) -> None:
+        if self._existing_spool_paths or self.existing_spool_var.get():
+            self._set_existing_spool_paths([])
+
     def _on_browse_existing_spool(self) -> None:
         country = self._selected_country_id()
-        initial_dir = SPOOLS_CL_OUT_DIR / (country.title() if country else "")
-        path = filedialog.askopenfilename(
+        initial_dir = cl_output_folder_for(country or "", self._current_spool_kind())
+        paths = filedialog.askopenfilenames(
             parent=self,
             title=t("spools_cl.select_spool_file"),
-            initialdir=str(initial_dir if initial_dir.exists() else SPOOLS_CL_OUT_DIR),
+            initialdir=str(initial_dir if initial_dir.exists() else initial_dir.parent),
             filetypes=[("SQL files", "*.sql *.SQL"), ("All files", "*.*")],
         )
-        if not path:
+        if not paths:
             return
-        self._existing_spool_path = Path(path)
-        self.existing_spool_var.set(str(self._existing_spool_path))
+        self._set_existing_spool_paths([Path(path) for path in paths])
 
     @staticmethod
     def _account_from_spool_path(spool_path: Path) -> str:
@@ -410,6 +537,38 @@ class SpoolsCLView(ctk.CTkFrame):
         if stem.upper().startswith(prefix.upper()):
             return stem[len(prefix):] or stem
         return stem
+
+    @staticmethod
+    def _apply_existing_items(spool_paths: list[Path]) -> list[tuple[str, Path]]:
+        accounts = [SpoolsCLView._account_from_spool_path(path) for path in spool_paths]
+        counts: dict[str, int] = {}
+        for account in accounts:
+            counts[account] = counts.get(account, 0) + 1
+        seen: dict[str, int] = {}
+        items: list[tuple[str, Path]] = []
+        for account, path in zip(accounts, spool_paths):
+            if counts[account] == 1:
+                items.append((account, path))
+                continue
+            seen[account] = seen.get(account, 0) + 1
+            items.append((f"{account} #{seen[account]}", path))
+        return items
+
+    @staticmethod
+    def _format_spool_file_names(spool_paths: list[Path], limit: int = 12) -> str:
+        names = [path.name for path in spool_paths]
+        if len(names) > limit:
+            hidden = len(names) - limit
+            names = names[:limit] + [f"... (+{hidden})"]
+        return "\n   ".join(names)
+
+    @staticmethod
+    def _format_result_accounts(results: list[CLAccountResult], ok: bool) -> list[str]:
+        return [
+            result.account
+            for result in results
+            if (result.status == SpoolCLStatus.OK) == ok
+        ]
 
     # ── pending accounts ──
     def _on_add_account(self) -> None:
@@ -420,19 +579,36 @@ class SpoolsCLView(ctk.CTkFrame):
             messagebox.showerror(t("common.error"),
                                  t("spools_cl.invalid_account", acc=raw), parent=self)
             return
+        branch = ""
+        if self._is_cmr_mode():
+            branch = self.branch_entry.get().strip().upper()
+            if not branch:
+                messagebox.showerror(t("common.error"), t("spools_cl.branch_required"), parent=self)
+                return
+            if not is_valid_branch(branch):
+                messagebox.showerror(
+                    t("common.error"),
+                    t("spools_cl.invalid_branch", branch=branch),
+                    parent=self,
+                )
+                return
         if raw in self._pending_accounts:
             messagebox.showinfo(t("common.info"), t("spools_cl.duplicate_account"), parent=self)
             return
         self._pending_accounts.append(raw)
         self._inject_flags[raw] = True
+        if branch:
+            self._account_branches[raw] = branch
         self.account_entry.delete(0, "end")
+        self.branch_entry.delete(0, "end")
         self.account_entry.focus_set()
         self._render_pending_accounts()
 
     def _open_bulk_accounts_dialog(self) -> None:
         dialog = ctk.CTkToplevel(self)
         dialog.title(t("spools_cl.bulk_title"))
-        dialog.geometry("560x430")
+        width, height = _BULK_DIALOG_SIZE
+        self._center_dialog(dialog, width, height)
         dialog.minsize(500, 360)
         dialog.transient(self.winfo_toplevel())
         dialog.grab_set()
@@ -441,7 +617,7 @@ class SpoolsCLView(ctk.CTkFrame):
 
         ctk.CTkLabel(
             dialog,
-            text=t("spools_cl.bulk_hint"),
+            text=t("spools_cl.bulk_hint_cmr" if self._is_cmr_mode() else "spools_cl.bulk_hint"),
             anchor="w",
             justify="left",
             wraplength=520,
@@ -449,6 +625,10 @@ class SpoolsCLView(ctk.CTkFrame):
 
         text_box = ctk.CTkTextbox(dialog, font=ctk.CTkFont(family="Consolas", size=12))
         text_box.grid(row=1, column=0, padx=18, pady=(0, 10), sticky="nsew")
+        self._install_textbox_placeholder(
+            text_box,
+            t("spools_cl.bulk_placeholder_cmr" if self._is_cmr_mode() else "spools_cl.bulk_placeholder"),
+        )
         text_box.focus_set()
 
         status_var = ctk.StringVar(value="")
@@ -506,7 +686,13 @@ class SpoolsCLView(ctk.CTkFrame):
         ).grid(row=0, column=2, sticky="e")
 
     def _add_bulk_accounts(self, text: str) -> dict[str, object]:
-        valid, invalid = parse_accounts(text)
+        if self._is_cmr_mode():
+            valid_pairs, invalid = parse_account_branches(text)
+            valid = [account for account, _branch in valid_pairs]
+            branches = {account: branch for account, branch in valid_pairs}
+        else:
+            valid, invalid = parse_accounts(text)
+            branches = {}
         added = 0
         duplicates = 0
         for account in valid:
@@ -515,6 +701,8 @@ class SpoolsCLView(ctk.CTkFrame):
                 continue
             self._pending_accounts.append(account)
             self._inject_flags[account] = True
+            if account in branches:
+                self._account_branches[account] = branches[account]
             added += 1
 
         if added:
@@ -535,12 +723,52 @@ class SpoolsCLView(ctk.CTkFrame):
             preview += ", ..."
         return preview
 
+    def _center_dialog(self, dialog: ctk.CTkToplevel, width: int, height: int) -> None:
+        parent = self.winfo_toplevel()
+        parent.update_idletasks()
+        px, py = parent.winfo_rootx(), parent.winfo_rooty()
+        pw, ph = parent.winfo_width(), parent.winfo_height()
+        if pw <= 1 or ph <= 1:
+            sw, sh = dialog.winfo_screenwidth(), dialog.winfo_screenheight()
+            x, y = (sw - width) // 2, (sh - height) // 2
+        else:
+            x, y = px + (pw - width) // 2, py + (ph - height) // 2
+        dialog.geometry(f"{width}x{height}+{max(0, x)}+{max(0, y)}")
+
+    @staticmethod
+    def _install_textbox_placeholder(text_box: ctk.CTkTextbox, text: str) -> None:
+        placeholder = ctk.CTkLabel(
+            text_box,
+            text=text,
+            font=ctk.CTkFont(family="Consolas", size=12),
+            text_color=("gray58", "gray48"),
+            justify="left",
+            anchor="nw",
+        )
+
+        def refresh(_event=None) -> None:
+            has_text = bool(text_box.get("1.0", "end-1c").strip())
+            if has_text:
+                placeholder.place_forget()
+            else:
+                placeholder.place(x=10, y=8)
+
+        def focus_textbox(_event=None) -> str:
+            text_box.focus_set()
+            return "break"
+
+        placeholder.bind("<Button-1>", focus_textbox)
+        text_box.bind("<KeyRelease>", refresh)
+        text_box.bind("<<Paste>>", lambda _e: text_box.after(1, refresh))
+        refresh()
+
     def _remove_pending(self, account: str) -> None:
         try:
             self._pending_accounts.remove(account)
         except ValueError:
             return
         self._inject_flags.pop(account, None)
+        self._account_branches.pop(account, None)
         self._render_pending_accounts()
 
     def _set_inject_flag(self, account: str, value: bool) -> None:
@@ -549,6 +777,10 @@ class SpoolsCLView(ctk.CTkFrame):
 
     def _selected_inject_accounts(self) -> list[str]:
         return [acc for acc in self._pending_accounts if self._inject_flags.get(acc, False)]
+
+    def _account_label(self, account: str) -> str:
+        branch = self._account_branches.get(account, "")
+        return f"{account}  {branch}" if branch else account
 
     def _render_pending_accounts(self) -> None:
         for w in self.extract_only_frame.winfo_children():
@@ -570,7 +802,7 @@ class SpoolsCLView(ctk.CTkFrame):
         row = ctk.CTkFrame(parent, fg_color=("gray92", "gray18"), corner_radius=4)
         row.pack(fill="x", padx=4, pady=2)
         ctk.CTkLabel(
-            row, text=account, anchor="w",
+            row, text=self._account_label(account), anchor="w",
             font=ctk.CTkFont(family="Consolas", size=12),
         ).pack(side="left", padx=(10, 6), pady=4, fill="x", expand=True)
         ctk.CTkButton(
@@ -589,7 +821,7 @@ class SpoolsCLView(ctk.CTkFrame):
         row = ctk.CTkFrame(parent, fg_color=("gray92", "gray18"), corner_radius=4)
         row.pack(fill="x", padx=4, pady=2)
         ctk.CTkLabel(
-            row, text=account, anchor="w",
+            row, text=self._account_label(account), anchor="w",
             font=ctk.CTkFont(family="Consolas", size=12),
         ).pack(side="left", padx=(10, 6), pady=4, fill="x", expand=True)
         ctk.CTkButton(
@@ -647,7 +879,8 @@ class SpoolsCLView(ctk.CTkFrame):
         if self._is_apply_existing_mode():
             self._on_run_apply_existing(country)
             return
-        if not country or not has_cl_template(country):
+        spool_kind = self._current_spool_kind()
+        if not country or not has_cl_template(country, spool_kind):
             messagebox.showerror(
                 t("common.error"),
                 t("spools_cl.no_template", country=(country or "(none)").title()),
@@ -663,6 +896,11 @@ class SpoolsCLView(ctk.CTkFrame):
         if not accounts:
             messagebox.showerror(t("common.error"), t("spools_cl.no_pending"), parent=self)
             return
+        if spool_kind == SPOOL_KIND_CMR:
+            missing_branch = [account for account in accounts if account not in self._account_branches]
+            if missing_branch:
+                messagebox.showerror(t("common.error"), t("spools_cl.branch_required"), parent=self)
+                return
         inject_accounts = self._selected_inject_accounts()
         dest_db = self._selected_dest_db() if inject_accounts else None
         if inject_accounts:
@@ -692,7 +930,7 @@ class SpoolsCLView(ctk.CTkFrame):
                                      t("spools_cl.no_creds", db=dest_db["id"]), parent=self)
                 return
             dest_connection = self._connection_for_credential(dest_cred, dest_db["id"])
-            listed = ", ".join(inject_accounts[:12])
+            listed = ", ".join(self._account_label(account) for account in inject_accounts[:12])
             if len(inject_accounts) > 12:
                 listed += ", ..."
             ok = messagebox.askyesno(
@@ -729,7 +967,7 @@ class SpoolsCLView(ctk.CTkFrame):
             target=self._do_run,
             args=(
                 run_id, country, accounts, inject_accounts, source_connection,
-                dest_connection, sqlcl_path, cancel_event,
+                dest_connection, sqlcl_path, cancel_event, dict(self._account_branches), spool_kind,
             ),
             daemon=True,
         ).start()
@@ -744,19 +982,19 @@ class SpoolsCLView(ctk.CTkFrame):
             messagebox.showerror(t("common.error"), t("spools_cl.invalid_destination_db"), parent=self)
             return
 
-        spool_path = self._existing_spool_path
-        if spool_path is None and self.existing_spool_var.get().strip():
-            spool_path = Path(self.existing_spool_var.get().strip())
-        if spool_path is None:
+        spool_paths = list(self._existing_spool_paths)
+        if not spool_paths:
             messagebox.showerror(t("common.error"), t("spools_cl.no_existing_spool"), parent=self)
             return
-        if spool_path.suffix.lower() != ".sql":
+        invalid_file = next((path for path in spool_paths if path.suffix.lower() != ".sql"), None)
+        if invalid_file is not None:
             messagebox.showerror(t("common.error"), t("spools_cl.invalid_spool_file"), parent=self)
             return
-        if not spool_path.is_file():
+        missing_file = next((path for path in spool_paths if not path.is_file()), None)
+        if missing_file is not None:
             messagebox.showerror(
                 t("common.error"),
-                t("spools_cl.spool_file_missing", file=spool_path.name),
+                t("spools_cl.spool_file_missing", file=missing_file.name),
                 parent=self,
             )
             return
@@ -772,13 +1010,14 @@ class SpoolsCLView(ctk.CTkFrame):
                                  t("spools_cl.no_creds", db=dest_db["id"]), parent=self)
             return
         dest_connection = self._connection_for_credential(dest_cred, dest_db["id"])
-        account = self._account_from_spool_path(spool_path)
+        items = self._apply_existing_items(spool_paths)
 
         ok = messagebox.askyesno(
             t("spools_cl.confirm_title"),
             t(
                 "spools_cl.confirm_apply_existing",
-                file=spool_path.name,
+                n=len(items),
+                files=self._format_spool_file_names(spool_paths),
                 db=dest_db["id"],
             ),
             icon="warning",
@@ -789,7 +1028,7 @@ class SpoolsCLView(ctk.CTkFrame):
             return
 
         self._show_results_card()
-        self._prepare_results([account])
+        self._prepare_results([account for account, _path in items])
 
         self._running = True
         self._completed_steps = 0
@@ -800,11 +1039,11 @@ class SpoolsCLView(ctk.CTkFrame):
         cancel_event = self._cancel_event
         self.result_detail_label.configure(text="")
         self._set_run_button_running(True)
-        self.summary_label.configure(text=t("spools_cl.injecting", done=0, total=1))
+        self.summary_label.configure(text=t("spools_cl.injecting", done=0, total=len(items)))
 
         threading.Thread(
             target=self._do_apply_existing,
-            args=(run_id, account, spool_path, dest_connection, sqlcl_path, cancel_event),
+            args=(run_id, items, dest_connection, sqlcl_path, cancel_event),
             daemon=True,
         ).start()
 
@@ -813,7 +1052,7 @@ class SpoolsCLView(ctk.CTkFrame):
             w.destroy()
         self._status_rows = {}
         for acc in accounts:
-            row = AccountStatusRow(self.results_frame, account=acc)
+            row = AccountStatusRow(self.results_frame, account=self._account_label(acc))
             row.pack(fill="x", padx=4, pady=2)
             self._status_rows[acc] = row
 
@@ -853,6 +1092,8 @@ class SpoolsCLView(ctk.CTkFrame):
         dest_connection: str,
         sqlcl_path: str,
         cancel_event: threading.Event,
+        branches: dict[str, str],
+        spool_kind: str,
     ) -> None:
         engine = SpoolCLEngine(SqlclRunner(sqlcl_path))
         total = len(accounts)
@@ -883,6 +1124,8 @@ class SpoolsCLView(ctk.CTkFrame):
             on_extract_status,
             max_workers=MAX_PARALLEL_ACCOUNTS,
             cancel_event=cancel_event,
+            branches=branches,
+            spool_kind=spool_kind,
         )
         extract_ok = sum(1 for result in results if result.status == SpoolCLStatus.OK)
         extract_err = total - extract_ok
@@ -950,14 +1193,14 @@ class SpoolsCLView(ctk.CTkFrame):
     def _do_apply_existing(
         self,
         run_id: int,
-        account: str,
-        spool_path: Path,
+        items: list[tuple[str, Path]],
         dest_connection: str,
         sqlcl_path: str,
         cancel_event: threading.Event,
     ) -> None:
         engine = SpoolCLEngine(SqlclRunner(sqlcl_path))
-        log.info("Starting existing spool apply: account=%s spool=%s", account, spool_path)
+        log.info("Starting existing spool apply batch: spools=%s", len(items))
+        total = len(items)
 
         def on_apply_status(account_: str, status: SpoolCLStatus, msg: str) -> None:
             display = msg
@@ -969,18 +1212,25 @@ class SpoolsCLView(ctk.CTkFrame):
                 display = t("spools_cl.status_cancelled")
             self._post_ui(
                 lambda a=account_, s=status, m=display, r=run_id:
-                    self._apply_status(a, s, m, 1, "spools_cl.injecting", r, "apply_existing")
+                    self._apply_status(a, s, m, total, "spools_cl.injecting", r, "apply_existing")
             )
 
-        result = engine.apply_one(account, dest_connection, spool_path, on_apply_status, cancel_event)
-        log.info(
-            "Existing spool apply result: %s status=%s out=%s err=%s",
-            result.account, result.status.value, result.output_path, result.error,
+        results = engine.apply_many(
+            items,
+            dest_connection,
+            on_apply_status,
+            max_workers=MAX_PARALLEL_ACCOUNTS,
+            cancel_event=cancel_event,
         )
-        ok = 1 if result.status == SpoolCLStatus.OK else 0
-        err = 0 if result.status == SpoolCLStatus.OK else 1
+        for result in results:
+            log.info(
+                "Existing spool apply result: %s status=%s out=%s err=%s",
+                result.account, result.status.value, result.output_path, result.error,
+            )
+        ok = sum(1 for result in results if result.status == SpoolCLStatus.OK)
+        err = total - ok
         self._post_ui(
-            lambda r=run_id, c=cancel_event.is_set(): self._finish_apply_existing(ok, err, r, result, c)
+            lambda r=run_id, c=cancel_event.is_set(): self._finish_apply_existing(ok, err, r, results, c)
         )
 
     @staticmethod
@@ -1008,9 +1258,8 @@ class SpoolsCLView(ctk.CTkFrame):
             "nothing": [acc for acc in accounts if acc not in extracted_ok],
         }
 
-    @staticmethod
-    def _format_accounts(accounts: list[str]) -> str:
-        return ", ".join(accounts) if accounts else "-"
+    def _format_accounts(self, accounts: list[str]) -> str:
+        return ", ".join(self._account_label(account) for account in accounts) if accounts else "-"
 
     def _show_extract_apply_details(self, details: dict[str, list[str]]) -> None:
         self.result_detail_label.configure(
@@ -1022,12 +1271,12 @@ class SpoolsCLView(ctk.CTkFrame):
             ),
         )
 
-    def _show_apply_existing_details(self, account: str, ok: bool) -> None:
+    def _show_apply_existing_details(self, results: list[CLAccountResult]) -> None:
         self.result_detail_label.configure(
             text=t(
                 "spools_cl.detail_apply_existing",
-                injected=account if ok else "-",
-                nothing="-" if ok else account,
+                injected=self._format_accounts(self._format_result_accounts(results, ok=True)),
+                nothing=self._format_accounts(self._format_result_accounts(results, ok=False)),
             ),
         )
 
@@ -1121,7 +1370,7 @@ class SpoolsCLView(ctk.CTkFrame):
         ok: int,
         err: int,
         run_id: int,
-        result: CLAccountResult,
+        results: list[CLAccountResult],
         cancelled: bool,
     ) -> None:
         if run_id != self._run_id:
@@ -1130,7 +1379,7 @@ class SpoolsCLView(ctk.CTkFrame):
         self._active_summary_phase = None
         self._cancel_event = None
         self._set_run_button_running(False)
-        self._show_apply_existing_details(result.account, result.status == SpoolCLStatus.OK)
+        self._show_apply_existing_details(results)
         if cancelled:
             self.summary_label.configure(text=t("spools_cl.summary_apply_existing_cancelled"))
             return
@@ -1141,7 +1390,7 @@ class SpoolsCLView(ctk.CTkFrame):
     # ── open folder ──
     def _on_open_folder(self) -> None:
         country = self._selected_country_id()
-        folder = SPOOLS_CL_OUT_DIR / (country.title() if country else "")
+        folder = cl_output_folder_for(country or "", self._current_spool_kind())
         folder.mkdir(parents=True, exist_ok=True)
         try:
             os.startfile(str(folder))  # Windows-only — same as the rest of the app

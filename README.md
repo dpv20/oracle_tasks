@@ -59,22 +59,32 @@ Windows user on this machine.
 
 ## 4. Use it — extract account spools
 
-Home → **Spools / CL Accounts** (Chile Loans) or **Spools / Savings
-Accounts** (Savings).
+Home → **Consumer Lending**, **CMR Chile** or **Spools / Savings Accounts**.
 
 1. Pick **Country**.
 2. Pick **Source DB** — dropdown lists every environment of that country
    (PROD / BUP PROD / QA / BUP QA / DEV), each tagged so it's clear.
-3. Type an account number, click **+ Add** (or press Enter). Repeat for
+3. CMR Chile asks for both account number and branch.
+4. Type an account number, click **+ Add** (or press Enter). Repeat for
    every account you want. Each row has a red **[×]** to remove it.
-4. Click **Extract spools**.
-5. Watch the status rows: `⟳` running (blue) → `✓` OK (green) or `✗`
+   **Add many** is line-based: one account per line, or one `account branch`
+   pair per line for Chile CMR.
+5. Click **Extract spools**.
+6. Watch the status rows: `⟳` running (blue) → `✓` OK (green) or `✗`
    error (red) with the last error line.
-6. Click **Open spools folder** to open the destination folder in Explorer.
+7. Click **Open spools folder** to open the destination folder in Explorer.
+
+In **Apply existing**, choose **Consumer Lending** or **CMR** when Chile is
+selected, then browse one or more existing `.SQL` files and apply them to the
+destination DB in one batch.
 
 The resulting `.SQL` files land in:
 `%LOCALAPPDATA%\OracleTasksChile\spools_CL_out\<Country>\CL_Acc_Spool_<account>.SQL`
-(or `spools_savings_out\` for the savings flow).
+
+CMR Chile files land in:
+`%LOCALAPPDATA%\OracleTasksChile\spools_CMR\CL_Acc_Spool_<account>.SQL`
+
+Savings files land in `spools_savings_out\`.
 
 ---
 

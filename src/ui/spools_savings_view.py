@@ -56,6 +56,7 @@ _PRIMARY_BUTTON_HOVER = ("#1A5BBF", "#154A9F")
 _CANCEL_BUTTON_FG = ("#D9534F", "#A8322C")
 _CANCEL_BUTTON_HOVER = ("#C9302C", "#8B1F1A")
 _TERMINAL_STATUSES = {SpoolSavingsStatus.OK, SpoolSavingsStatus.ERROR, SpoolSavingsStatus.CANCELLED}
+_BULK_DIALOG_SIZE = (560, 430)
 
 
 class SpoolsSavingsView(ctk.CTkFrame):
@@ -407,7 +408,8 @@ class SpoolsSavingsView(ctk.CTkFrame):
     def _open_bulk_accounts_dialog(self) -> None:
         dialog = ctk.CTkToplevel(self)
         dialog.title(t("spools_savings.bulk_title"))
-        dialog.geometry("560x430")
+        width, height = _BULK_DIALOG_SIZE
+        self._center_dialog(dialog, width, height)
         dialog.minsize(500, 360)
         dialog.transient(self.winfo_toplevel())
         dialog.grab_set()
@@ -424,6 +426,7 @@ class SpoolsSavingsView(ctk.CTkFrame):
 
         text_box = ctk.CTkTextbox(dialog, font=ctk.CTkFont(family="Consolas", size=12))
         text_box.grid(row=1, column=0, padx=18, pady=(0, 10), sticky="nsew")
+        self._install_textbox_placeholder(text_box, t("spools_savings.bulk_placeholder"))
         text_box.focus_set()
 
         status_var = ctk.StringVar(value="")
@@ -503,6 +506,45 @@ class SpoolsSavingsView(ctk.CTkFrame):
         if len(invalid) > 12:
             preview += ", ..."
         return preview
+
+    def _center_dialog(self, dialog: ctk.CTkToplevel, width: int, height: int) -> None:
+        parent = self.winfo_toplevel()
+        parent.update_idletasks()
+        px, py = parent.winfo_rootx(), parent.winfo_rooty()
+        pw, ph = parent.winfo_width(), parent.winfo_height()
+        if pw <= 1 or ph <= 1:
+            sw, sh = dialog.winfo_screenwidth(), dialog.winfo_screenheight()
+            x, y = (sw - width) // 2, (sh - height) // 2
+        else:
+            x, y = px + (pw - width) // 2, py + (ph - height) // 2
+        dialog.geometry(f"{width}x{height}+{max(0, x)}+{max(0, y)}")
+
+    @staticmethod
+    def _install_textbox_placeholder(text_box: ctk.CTkTextbox, text: str) -> None:
+        placeholder = ctk.CTkLabel(
+            text_box,
+            text=text,
+            font=ctk.CTkFont(family="Consolas", size=12),
+            text_color=("gray58", "gray48"),
+            justify="left",
+            anchor="nw",
+        )
+
+        def refresh(_event=None) -> None:
+            has_text = bool(text_box.get("1.0", "end-1c").strip())
+            if has_text:
+                placeholder.place_forget()
+            else:
+                placeholder.place(x=10, y=8)
+
+        def focus_textbox(_event=None) -> str:
+            text_box.focus_set()
+            return "break"
+
+        placeholder.bind("<Button-1>", focus_textbox)
+        text_box.bind("<KeyRelease>", refresh)
+        text_box.bind("<<Paste>>", lambda _e: text_box.after(1, refresh))
+        refresh()
 
     def _remove_pending(self, account: str) -> None:
         try:

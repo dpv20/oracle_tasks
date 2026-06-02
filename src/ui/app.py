@@ -129,7 +129,7 @@ class OracleTasksApp:
         lang = self.config.get("language", "en")
         menu_labels = {
             "home": "🏠  " + ("Inicio" if lang == "es" else "Dashboard"),
-            "spools_cl": "🇨🇱  " + t("home.spools_cl_button"),
+            "spools_cl": "▣  " + t("home.spools_cl_button"),
             "spools_savings": "💵  " + t("home.savings_button"),
             "settings": "⚙️  " + t("settings.title"),
         }
@@ -189,6 +189,24 @@ class OracleTasksApp:
                     hover_color=("#e2e8f0", "#1e293b"),
                     font=ctk.CTkFont(size=13, weight="normal")
                 )
+
+    def show_consumer_lending(self) -> None:
+        if self._has_running_work():
+            self._warn_running_work()
+            return
+        self.show_view("spools_cl")
+        view = self._views.get("spools_cl")
+        if hasattr(view, "select_consumer_lending"):
+            view.select_consumer_lending()
+
+    def show_cmr_chile(self) -> None:
+        if self._has_running_work():
+            self._warn_running_work()
+            return
+        self.show_view("spools_cl")
+        view = self._views.get("spools_cl")
+        if hasattr(view, "select_cmr_chile"):
+            view.select_cmr_chile()
 
     def _build_view(self, name: str) -> ctk.CTkFrame:
         if name == "home":

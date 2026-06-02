@@ -71,12 +71,17 @@ def parse_savings_accounts(text: str) -> tuple[list[str], list[str]]:
     valid: list[str] = []
     invalid: list[str] = []
     seen: set[str] = set()
-    for raw in re.split(r"[\s,;]+", text or ""):
-        s = raw.strip()
-        if not s or s.startswith("#"):
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
             continue
+        parts = line.split()
+        if len(parts) != 1:
+            invalid.append(line)
+            continue
+        s = parts[0]
         if not _ACCOUNT_RE.match(s):
-            invalid.append(s)
+            invalid.append(line)
             continue
         if s in seen:
             continue

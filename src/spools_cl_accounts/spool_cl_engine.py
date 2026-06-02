@@ -21,7 +21,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable, Iterable
 
-from paths import SPOOLS_CL_DIR, SPOOLS_CL_OUT_DIR
+from paths import SPOOLS_CL_DIR, SPOOLS_CL_OUT_DIR, SPOOLS_CMR_OUT_DIR
 from spools_cl_accounts.sqlcl import RunResult, SqlclRunner
 
 log = logging.getLogger(__name__)
@@ -43,7 +43,7 @@ class CLAccountResult:
     error: str = ""
 
 
-# Lowercase country id → folder name under SPOOLS_CL_OUT_DIR (matches paths.ensure_dirs).
+# Lowercase country id -> Consumer Lending output folder name.
 _COUNTRY_FOLDER = {
     "chile":    "Chile",
     "peru":     "Peru",
@@ -54,41 +54,57 @@ _COUNTRY_FOLDER = {
 # Conservative account regex: alphanumerics + underscore/dash, length 3..40.
 # Same chars used by the original SQL substitution & by the generated filename.
 _ACCOUNT_RE = re.compile(r"^[A-Za-z0-9_-]{3,40}$")
+_BRANCH_RE = re.compile(r"^[A-Za-z0-9_-]{1,20}$")
 
 CLStatusCallback = Callable[[str, SpoolCLStatus, str], None]
 
 MAX_PARALLEL_ACCOUNTS = 3
 
 _LEGACY_SPOOL_ROOT = r"C:\Users\Diego Pavez\Desktop\sqlcl\spools\spools_files\Accounts"
+SPOOL_KIND_CONSUMER_LENDING = "consumer_lending"
+SPOOL_KIND_CMR = "cmr"
 
 
-def cl_template_path(country: str) -> Path:
+def cl_template_path(country: str, spool_kind: str = SPOOL_KIND_CONSUMER_LENDING) -> Path:
+    if spool_kind == SPOOL_KIND_CMR:
+        return SPOOLS_CL_DIR / "CL_ACCOUNT_SPOOL_CHILE_CMR.sql"
     return SPOOLS_CL_DIR / f"CL_ACCOUNT_SPOOL_{country.upper()}2.sql"
 
 
-def has_cl_template(country: str) -> bool:
-    return cl_template_path(country).is_file()
+def has_cl_template(country: str, spool_kind: str = SPOOL_KIND_CONSUMER_LENDING) -> bool:
+    if spool_kind == SPOOL_KIND_CMR and country.lower() != "chile":
+        return False
+    return cl_template_path(country, spool_kind).is_file()
 
 
 def is_valid_account(s: str) -> bool:
     return bool(_ACCOUNT_RE.match(s.strip()))
 
 
+def is_valid_branch(s: str) -> bool:
+    return bool(_BRANCH_RE.match(s.strip()))
+
+
 def parse_accounts(text: str) -> tuple[list[str], list[str]]:
     """Split a textarea blob into valid + invalid account ids.
 
-    Accepts one per line plus comma/space separators. Strips inline comments
-    starting with `#`. De-duplicates while preserving order.
+    Bulk input is deliberately line-based so a pasted Excel column remains
+    predictable. A line with extra columns is invalid for the non-CMR flow.
     """
     valid: list[str] = []
     invalid: list[str] = []
     seen: set[str] = set()
-    for raw in re.split(r"[\s,;]+", text or ""):
-        s = raw.strip()
-        if not s or s.startswith("#"):
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
             continue
+        parts = line.split()
+        if len(parts) != 1:
+            invalid.append(line)
+            continue
+        s = parts[0]
         if not _ACCOUNT_RE.match(s):
-            invalid.append(s)
+            invalid.append(line)
             continue
         if s in seen:
             continue
@@ -97,9 +113,43 @@ def parse_accounts(text: str) -> tuple[list[str], list[str]]:
     return valid, invalid
 
 
-def cl_output_path_for(country: str, account: str) -> Path:
+def parse_account_branches(text: str) -> tuple[list[tuple[str, str]], list[str]]:
+    """Parse CMR bulk input as one `account branch` pair per line."""
+    valid: list[tuple[str, str]] = []
+    invalid: list[str] = []
+    seen: set[str] = set()
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) != 2:
+            invalid.append(line)
+            continue
+        account, branch = parts[0], parts[1].upper()
+        if not _ACCOUNT_RE.match(account) or not _BRANCH_RE.match(branch):
+            invalid.append(line)
+            continue
+        if account in seen:
+            continue
+        seen.add(account)
+        valid.append((account, branch))
+    return valid, invalid
+
+
+def cl_output_folder_for(country: str, spool_kind: str = SPOOL_KIND_CONSUMER_LENDING) -> Path:
+    if spool_kind == SPOOL_KIND_CMR:
+        return SPOOLS_CMR_OUT_DIR
     folder = _COUNTRY_FOLDER.get(country.lower(), country.title())
-    return SPOOLS_CL_OUT_DIR / folder / f"CL_Acc_Spool_{account}.SQL"
+    return SPOOLS_CL_OUT_DIR / folder
+
+
+def cl_output_path_for(
+    country: str,
+    account: str,
+    spool_kind: str = SPOOL_KIND_CONSUMER_LENDING,
+) -> Path:
+    return cl_output_folder_for(country, spool_kind) / f"CL_Acc_Spool_{account}.SQL"
 
 
 def worker_count_for(account_count: int, max_workers: int = MAX_PARALLEL_ACCOUNTS) -> int:
@@ -125,26 +175,37 @@ def _cancelled_result(account: str, output_path: Path | None = None) -> CLAccoun
 class SpoolCLEngine:
     """EXTRACT_ONLY: run the country template against a source DB.
 
-    Output spool files land in SPOOLS_CL_OUT_DIR/<Country>/.
+    Consumer Lending output lands in SPOOLS_CL_OUT_DIR/<Country>/.
+    Chile CMR output lands in SPOOLS_CMR_OUT_DIR/.
     """
 
     def __init__(self, runner: SqlclRunner):
         self.runner = runner
 
-    def _render_template(self, country: str) -> Path:
+    def _render_template(self, country: str, spool_kind: str = SPOOL_KIND_CONSUMER_LENDING) -> Path:
         """Materialize a temp .sql with the output folder rewritten.
 
         The versioned `spools_CL/*2.sql` scripts are the non-interactive originals
-        that use SQLcl positional arg `&1`. We do not edit them in place; this
-        temp copy points the `spool` command to the app output directory and
-        appends `exit;` if the script doesn't already end with one — without
-        it SQLcl runs the script and then sits at the prompt waiting for input,
-        so the subprocess only returns when our timeout fires.
+        that use SQLcl positional args. We do not edit them in place; this temp
+        copy points the `spool` command to the app output directory and appends
+        `exit;` if the script doesn't already end with one, otherwise SQLcl sits
+        at the prompt after the script finishes.
         """
-        tmpl = cl_template_path(country)
+        tmpl = cl_template_path(country, spool_kind)
         text = tmpl.read_text(encoding="utf-8")
-        rendered = _with_exit(text.replace(_LEGACY_SPOOL_ROOT, str(SPOOLS_CL_OUT_DIR)))
-        out = Path(tempfile.gettempdir()) / f"oracle_tasks_{country.lower()}_{uuid.uuid4().hex[:8]}.sql"
+        target = cl_output_folder_for(country, spool_kind) / "CL_Acc_Spool_&1..SQL"
+        if spool_kind == SPOOL_KIND_CMR:
+            text = text.replace(r"C:\Account_Spools\CL", str(SPOOLS_CMR_OUT_DIR))
+        else:
+            text = text.replace(_LEGACY_SPOOL_ROOT, str(SPOOLS_CL_OUT_DIR))
+        text = re.sub(
+            r'(?im)^spool\s+"?[^"\r\n]*CL_Acc_Spool_&1\.\.SQL"?\s*$',
+            lambda _m: f'spool "{target}"',
+            text,
+            count=1,
+        )
+        rendered = _with_exit(text)
+        out = Path(tempfile.gettempdir()) / f"oracle_tasks_{country.lower()}_{spool_kind}_{uuid.uuid4().hex[:8]}.sql"
         out.write_text(rendered, encoding="utf-8")
         return out
 
@@ -162,6 +223,8 @@ class SpoolCLEngine:
         connection: str,
         on_status: CLStatusCallback | None = None,
         cancel_event: threading.Event | None = None,
+        branch: str | None = None,
+        spool_kind: str = SPOOL_KIND_CONSUMER_LENDING,
     ) -> CLAccountResult:
         if _is_cancelled(cancel_event):
             r = _cancelled_result(account)
@@ -175,7 +238,20 @@ class SpoolCLEngine:
                 on_status(account, r.status, r.error)
             return r
 
-        if not has_cl_template(country):
+        if spool_kind == SPOOL_KIND_CMR:
+            branch = (branch or "").strip().upper()
+            if country.lower() != "chile":
+                r = CLAccountResult(account, SpoolCLStatus.ERROR, error="CMR spool is only available for Chile")
+                if on_status:
+                    on_status(account, r.status, r.error)
+                return r
+            if not _BRANCH_RE.match(branch):
+                r = CLAccountResult(account, SpoolCLStatus.ERROR, error="Invalid branch format")
+                if on_status:
+                    on_status(account, r.status, r.error)
+                return r
+
+        if not has_cl_template(country, spool_kind):
             r = CLAccountResult(account, SpoolCLStatus.ERROR,
                               error=f"No spool template for country '{country}'")
             if on_status:
@@ -185,7 +261,7 @@ class SpoolCLEngine:
         if on_status:
             on_status(account, SpoolCLStatus.RUNNING, "")
 
-        out_path = cl_output_path_for(country, account)
+        out_path = cl_output_path_for(country, account, spool_kind)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         # Pre-clean stale file so existence on success means a fresh write.
         if out_path.exists():
@@ -194,7 +270,8 @@ class SpoolCLEngine:
             except OSError as e:
                 log.warning("Could not remove stale spool %s: %s", out_path, e)
 
-        rendered = self._render_template(country)
+        rendered = self._render_template(country, spool_kind)
+        args = [account, branch] if spool_kind == SPOOL_KIND_CMR else [account]
         try:
             # Wallclock cap per account. Most spools finish in under 90 s but
             # some legit cases (slow network, heavy account) can take 5-10 min;
@@ -202,7 +279,7 @@ class SpoolCLEngine:
             result: RunResult = self.runner.run_script(
                 connection,
                 rendered,
-                [account],
+                args,
                 timeout=1800,
                 cancel_event=cancel_event,
             )
@@ -246,15 +323,26 @@ class SpoolCLEngine:
         on_status: CLStatusCallback | None = None,
         max_workers: int = MAX_PARALLEL_ACCOUNTS,
         cancel_event: threading.Event | None = None,
+        branches: dict[str, str] | None = None,
+        spool_kind: str = SPOOL_KIND_CONSUMER_LENDING,
     ) -> list[CLAccountResult]:
         account_list = list(accounts)
+        branch_lookup = branches or {}
         workers = worker_count_for(len(account_list), max_workers)
         if workers == 0:
             return []
         if workers == 1:
             results: list[CLAccountResult] = []
             for acc in account_list:
-                result = self.extract_one(country, acc, connection, on_status, cancel_event)
+                result = self.extract_one(
+                    country,
+                    acc,
+                    connection,
+                    on_status,
+                    cancel_event,
+                    branch_lookup.get(acc),
+                    spool_kind,
+                )
                 results.append(result)
             return results
 
@@ -278,6 +366,8 @@ class SpoolCLEngine:
                     connection,
                     on_status,
                     cancel_event,
+                    branch_lookup.get(account_list[idx]),
+                    spool_kind,
                 )
                 pending.add(future)
                 future_to_index[future] = idx
