@@ -6,6 +6,7 @@ password retry). `CREATE_NO_WINDOW` keeps the SQLcl console from flashing.
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
 import threading
 import time
@@ -16,6 +17,8 @@ from pathlib import Path
 log = logging.getLogger(__name__)
 
 _CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+_CREATE_NEW_PROCESS_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+_SQLCL_CREATION_FLAGS = _CREATE_NO_WINDOW | _CREATE_NEW_PROCESS_GROUP
 _ES_CONTINUOUS = 0x80000000
 _ES_SYSTEM_REQUIRED = 0x00000001
 _ES_DISPLAY_REQUIRED = 0x00000002
@@ -120,7 +123,7 @@ class SqlclRunner:
                         encoding="utf-8",
                         errors="replace",
                         timeout=timeout,
-                        creationflags=_CREATE_NO_WINDOW,
+                        creationflags=_SQLCL_CREATION_FLAGS,
                     )
                 except FileNotFoundError as e:
                     log.error("SQLcl binary not found at %s: %s", self.exe, e)
@@ -139,7 +142,7 @@ class SqlclRunner:
                     text=True,
                     encoding="utf-8",
                     errors="replace",
-                    creationflags=_CREATE_NO_WINDOW,
+                    creationflags=_SQLCL_CREATION_FLAGS,
                 )
             except FileNotFoundError as e:
                 log.error("SQLcl binary not found at %s: %s", self.exe, e)
@@ -164,13 +167,42 @@ class SqlclRunner:
                     input_data = None
 
     @staticmethod
-    def _stop_process(proc: subprocess.Popen, message: str, code: int) -> RunResult:
+    def _kill_process_tree(proc: subprocess.Popen) -> None:
+        if proc.poll() is not None:
+            return
+        if os.name == "nt":
+            try:
+                subprocess.run(
+                    ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                    capture_output=True,
+                    timeout=5,
+                    creationflags=_CREATE_NO_WINDOW,
+                )
+                return
+            except (OSError, subprocess.TimeoutExpired) as e:
+                log.debug("Could not taskkill SQLcl process tree %s: %s", proc.pid, e)
         try:
-            proc.terminate()
+            proc.kill()
+        except OSError as e:
+            log.debug("Could not kill SQLcl process %s: %s", proc.pid, e)
+
+    @classmethod
+    def _stop_process(cls, proc: subprocess.Popen, message: str, code: int) -> RunResult:
+        if os.name == "nt":
+            cls._kill_process_tree(proc)
+        else:
+            try:
+                proc.terminate()
+            except OSError as e:
+                log.debug("Could not terminate SQLcl process %s: %s", proc.pid, e)
+        try:
             stdout, stderr = proc.communicate(timeout=5)
         except subprocess.TimeoutExpired:
-            proc.kill()
-            stdout, stderr = proc.communicate()
+            cls._kill_process_tree(proc)
+            try:
+                stdout, stderr = proc.communicate(timeout=2)
+            except subprocess.TimeoutExpired:
+                stdout, stderr = "", message
         except OSError:
-            stdout, stderr = proc.communicate()
+            stdout, stderr = "", message
         return RunResult(code, stdout or "", (stderr or message))
