@@ -256,7 +256,6 @@ select max(branch_code)
                 connection,
                 rendered,
                 [],
-                timeout=1800,
                 cancel_event=cancel_event,
             )
         finally:
@@ -389,7 +388,6 @@ select max(branch_code)
                 connection,
                 rendered,
                 [],
-                timeout=1800,
                 cancel_event=cancel_event,
             )
         finally:

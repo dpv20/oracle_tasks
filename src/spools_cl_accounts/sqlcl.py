@@ -9,12 +9,40 @@ import logging
 import subprocess
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
 log = logging.getLogger(__name__)
 
 _CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+_ES_CONTINUOUS = 0x80000000
+_ES_SYSTEM_REQUIRED = 0x00000001
+_ES_DISPLAY_REQUIRED = 0x00000002
+
+
+@contextmanager
+def _keep_windows_awake():
+    """Ask Windows not to sleep or turn off the display while SQLcl is busy."""
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        active = bool(kernel32.SetThreadExecutionState(
+            _ES_CONTINUOUS | _ES_SYSTEM_REQUIRED | _ES_DISPLAY_REQUIRED
+        ))
+    except (AttributeError, OSError) as e:
+        active = False
+        log.debug("Could not request Windows awake mode: %s", e)
+
+    try:
+        yield
+    finally:
+        if active:
+            try:
+                kernel32.SetThreadExecutionState(_ES_CONTINUOUS)
+            except OSError as e:
+                log.debug("Could not restore Windows execution state: %s", e)
 
 
 @dataclass
@@ -63,7 +91,7 @@ class SqlclRunner:
         connection: str,
         script_path: str | Path,
         args: list[str] | None = None,
-        timeout: float = 180.0,
+        timeout: float | None = None,
         cancel_event: threading.Event | None = None,
     ) -> RunResult:
         """Run a SQL script file with optional positional args (`&1`, `&2`, ...)."""
@@ -76,62 +104,64 @@ class SqlclRunner:
         self,
         cmd: list[str],
         stdin: str | None,
-        timeout: float,
+        timeout: float | None,
         cancel_event: threading.Event | None = None,
     ) -> RunResult:
         if cancel_event is not None and cancel_event.is_set():
             return RunResult(130, "", "Cancelled")
-        if cancel_event is None:
+        with _keep_windows_awake():
+            if cancel_event is None:
+                try:
+                    proc = subprocess.run(
+                        cmd,
+                        input=stdin,
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        timeout=timeout,
+                        creationflags=_CREATE_NO_WINDOW,
+                    )
+                except FileNotFoundError as e:
+                    log.error("SQLcl binary not found at %s: %s", self.exe, e)
+                    return RunResult(127, "", f"SQLcl not found: {self.exe}")
+                except subprocess.TimeoutExpired as e:
+                    log.error("SQLcl timed out after %ss", timeout)
+                    return RunResult(124, e.stdout or "", f"Timed out after {timeout}s")
+                return RunResult(proc.returncode, proc.stdout or "", proc.stderr or "")
+
             try:
-                proc = subprocess.run(
+                proc = subprocess.Popen(
                     cmd,
-                    input=stdin,
-                    capture_output=True,
+                    stdin=subprocess.PIPE if stdin is not None else None,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
                     text=True,
                     encoding="utf-8",
                     errors="replace",
-                    timeout=timeout,
                     creationflags=_CREATE_NO_WINDOW,
                 )
             except FileNotFoundError as e:
                 log.error("SQLcl binary not found at %s: %s", self.exe, e)
                 return RunResult(127, "", f"SQLcl not found: {self.exe}")
-            except subprocess.TimeoutExpired as e:
-                log.error("SQLcl timed out after %ss", timeout)
-                return RunResult(124, e.stdout or "", f"Timed out after {timeout}s")
-            return RunResult(proc.returncode, proc.stdout or "", proc.stderr or "")
 
-        try:
-            proc = subprocess.Popen(
-                cmd,
-                stdin=subprocess.PIPE if stdin is not None else None,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                creationflags=_CREATE_NO_WINDOW,
-            )
-        except FileNotFoundError as e:
-            log.error("SQLcl binary not found at %s: %s", self.exe, e)
-            return RunResult(127, "", f"SQLcl not found: {self.exe}")
+            deadline = None if timeout is None else time.monotonic() + timeout
+            input_data = stdin
+            while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    return self._stop_process(proc, "Cancelled", 130)
 
-        deadline = time.monotonic() + timeout
-        input_data = stdin
-        while True:
-            if cancel_event is not None and cancel_event.is_set():
-                return self._stop_process(proc, "Cancelled", 130)
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    log.error("SQLcl timed out after %ss", timeout)
+                    return self._stop_process(proc, f"Timed out after {timeout}s", 124)
 
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                log.error("SQLcl timed out after %ss", timeout)
-                return self._stop_process(proc, f"Timed out after {timeout}s", 124)
-
-            try:
-                stdout, stderr = proc.communicate(input=input_data, timeout=min(0.2, remaining))
-                return RunResult(proc.returncode, stdout or "", stderr or "")
-            except subprocess.TimeoutExpired:
-                input_data = None
+                try:
+                    poll_timeout = 0.2 if remaining is None else min(0.2, remaining)
+                    stdout, stderr = proc.communicate(input=input_data, timeout=poll_timeout)
+                    return RunResult(proc.returncode, stdout or "", stderr or "")
+                except subprocess.TimeoutExpired:
+                    input_data = None
 
     @staticmethod
     def _stop_process(proc: subprocess.Popen, message: str, code: int) -> RunResult:

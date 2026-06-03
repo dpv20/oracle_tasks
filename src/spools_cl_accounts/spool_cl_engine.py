@@ -295,14 +295,10 @@ class SpoolCLEngine:
         rendered = self._render_template(country, spool_kind)
         args = [actual_account, branch] if spool_kind == SPOOL_KIND_CMR else [actual_account]
         try:
-            # Wallclock cap per account. Most spools finish in under 90 s but
-            # some legit cases (slow network, heavy account) can take 5-10 min;
-            # 30 min is generous enough to never kill a working extraction.
             result: RunResult = self.runner.run_script(
                 connection,
                 rendered,
                 args,
-                timeout=1800,
                 cancel_event=cancel_event,
             )
         finally:
@@ -451,7 +447,6 @@ class SpoolCLEngine:
                 connection,
                 rendered,
                 [],
-                timeout=1800,
                 cancel_event=cancel_event,
             )
         finally:
