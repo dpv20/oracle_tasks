@@ -88,6 +88,9 @@ declare
     g_currency    varchar2(20)  := '&currency';
     g_customer_no varchar2(100) := '&customer_no';
     g_fatal_generation_errors pls_integer := 0;
+    g_checkpoint_interval constant pls_integer := 800;
+    g_dml_since_commit pls_integer := 0;
+    g_total_dml pls_integer := 0;
 
     type t_text_tab is table of varchar2(32767) index by pls_integer;
 
@@ -104,6 +107,31 @@ declare
     begin
         dbms_output.put_line(p_text);
     end put_line;
+
+    procedure emit_commit_checkpoint(
+        p_reason in varchar2,
+        p_force  in boolean default false
+    ) is
+    begin
+        if g_dml_since_commit = 0 then
+            return;
+        end if;
+
+        if p_force or g_dml_since_commit >= g_checkpoint_interval then
+            put_line('COMMIT;');
+            put_line('SELECT ''IC_DB_CHECKPOINT_OK|' || g_total_dml || '|' || replace(p_reason, '''', '''''') || ''' FROM DUAL;');
+            put_line('PROMPT IC checkpoint commit after ' || g_total_dml || ' DML statements - ' || p_reason);
+            put_line(null);
+            g_dml_since_commit := 0;
+        end if;
+    end emit_commit_checkpoint;
+
+    procedure note_dml(p_reason in varchar2) is
+    begin
+        g_dml_since_commit := g_dml_since_commit + 1;
+        g_total_dml := g_total_dml + 1;
+        emit_commit_checkpoint(p_reason);
+    end note_dml;
 
     procedure append_text(
         p_clob in out nocopy clob,
@@ -278,6 +306,7 @@ declare
         emit_token_list('INSERT INTO ' || upper(p_table) || '(', p_cols, p_count, ')');
         emit_token_list(' VALUES (', p_vals, p_count, ');');
         put_line(null);
+        note_dml('insert ' || upper(p_table));
     end emit_insert;
 
     procedure emit_delete(
@@ -299,6 +328,7 @@ declare
             put_line('-- INFO: DELETE skipped for ' || upper(p_table) || ' - source object is a ' || l_type || '.');
         else
             put_line('DELETE FROM ' || upper(p_table) || ' WHERE ' || p_where || ';');
+            note_dml('delete ' || upper(p_table));
         end if;
     end emit_delete;
 
@@ -462,6 +492,7 @@ declare
         emit_delete('LMTB_LINEACC_UTIL', 'ACC = ' || lit(g_account));
         emit_delete('STTM_AC_STAT_CHANGE', 'BRANCH_CODE = ' || lit(g_branch) || ' AND CUST_AC_NO = ' || lit(g_account));
         emit_delete('CSTB_AUTO_SETTLE_BLOCK', 'MODULE = ''IC'' AND ACCOUNT_NO = ' || lit(g_account));
+        emit_commit_checkpoint('delete section complete', true);
         put_line(null);
     end emit_deletes;
 
@@ -505,6 +536,7 @@ declare
         emit_table('ICTB_BACK_DATED_UDEVALS', 'COND_KEY LIKE ''%' || replace(g_aclass, '''', '''''') || '%''');
         emit_table('ICTB_BACK_DATED_UDEVALS', 'COND_KEY LIKE ''%' || replace(g_account, '''', '''''') || '%''');
         emit_table('ICTB_BACK_DATED_EVENTS', 'ACC LIKE ' || lit(g_account));
+        emit_commit_checkpoint('account IC history/balance section complete', true);
         emit_table('STTM_CUSTOMER', 'CUSTOMER_NO = ' || lit(g_customer_no));
         emit_table('STTM_ACCOUNT_CLASS', 'ACCOUNT_CLASS = ' || lit(g_aclass));
         emit_table('STTB_ACCOUNT', 'AC_GL_NO = ' || lit(g_account));
@@ -522,6 +554,7 @@ declare
         emit_table('ICTB_CHG_DUE', 'ACC = ' || lit(g_account));
         emit_table('ICTB_ACC_ACCR_BAL_BREAKUP', 'ACCOUNT_NUMBER = ' || lit(g_account));
         emit_table('ICTB_CHG_ERR', 'ACC = ' || lit(g_account));
+        emit_commit_checkpoint('account/customer section complete', true);
         emit_table('ICTM_BRANCH_PARAMETERS', 'BRANCH_CODE = ' || lit(g_branch));
         emit_table('CSTM_PRODUCT_EVENT_ACCT_ENTRY', l_all_products, 'PRODUCT_CODE, EVENT_CODE, AMT_TAG, DR_CR_INDICATOR');
         emit_table('CSTM_PRODUCT_ACCROLE', l_all_products, 'PRODUCT_CODE');
@@ -544,6 +577,7 @@ declare
         emit_table('ICTM_RULE_FRM_ELEMENTS', l_rules);
         emit_table('ICTM_RULE_SDE', l_rules);
         emit_table('ICTM_RULE_UDE', l_rules);
+        emit_commit_checkpoint('product/rule dependency section complete', true);
         emit_table('STTM_LCL_HOLIDAY', 'BRANCH_CODE = ' || lit(g_branch) || ' AND YEAR = (SELECT TO_CHAR(TODAY, ''YYYY'') FROM STTM_DATES WHERE BRANCH_CODE = ' || lit(g_branch) || ')');
         emit_table('GETM_FACILITY', 'LIAB_ID = (SELECT ID FROM GETM_LIAB, STTM_CUST_ACCOUNT WHERE LIAB_NO = CUST_NO AND CUST_AC_NO = ' || lit(g_account) || ')');
         emit_table('GETM_FACILITY_VD_DETAILS', 'ID IN (SELECT ID FROM GETM_FACILITY WHERE LIAB_ID = (SELECT ID FROM GETM_LIAB, STTM_CUST_ACCOUNT WHERE LIAB_NO = CUST_NO AND CUST_AC_NO = ' || lit(g_account) || '))');
@@ -552,19 +586,24 @@ declare
         emit_table('LMTB_LINEACC_UTIL', 'ACC = ' || lit(g_account));
         emit_table('STTM_AC_STAT_CHANGE', 'BRANCH_CODE = ' || lit(g_branch) || ' AND CUST_AC_NO = ' || lit(g_account));
         emit_table('CSTB_AUTO_SETTLE_BLOCK', 'MODULE = ''IC'' AND ACCOUNT_NO = ' || lit(g_account));
+        emit_commit_checkpoint('liability/utilization section complete', true);
         emit_table('ICTM_RATE_DEF');
         emit_table('ICTM_RATES');
+        emit_commit_checkpoint('interest rate dependency section complete', true);
 
         put_line('-- Chile UF/UFR index data for readjustment calculations');
         put_line('-- CYPKS_UTILS.FN_INDEX_RATE reads CYTMS_INDEX_RATES, backed here by CYTM_INDEX_RATES.');
         emit_table('CYTM_CCY_DEFN', 'CCY_CODE IN (' || lit(g_currency) || ', ''UFR'') OR INDEX_FLAG = ''Y''', 'CCY_CODE');
         emit_table('CYTM_INDEX_PAIRS', '(INDEX_CCY = ''UFR'' AND BASE_CCY = ' || lit(g_currency) || ') OR INDEX_CCY IN (SELECT CCY_CODE FROM CYTM_CCY_DEFN WHERE INDEX_FLAG = ''Y'')', 'INDEX_CCY, BASE_CCY, BRANCH_CODE');
         emit_table('CYTM_INDEX_RATES', l_index_rate_filter, 'INDEX_CCY, BASE_CCY, RATE_DATE');
+        emit_commit_checkpoint('currency index dependency section complete', true);
     end emit_inserts;
 begin
     put_line('WHENEVER SQLERROR CONTINUE;');
     put_line('SET DEFINE OFF;');
     put_line('SET SQLBLANKLINES ON;');
+    put_line('SET HEADING OFF;');
+    put_line('SET FEEDBACK OFF;');
     put_line('ALTER SESSION SET NLS_LANGUAGE = ''AMERICAN'';');
     put_line('ALTER SESSION SET NLS_DATE_LANGUAGE = ''AMERICAN'';');
     put_line('ALTER SESSION SET NLS_DATE_FORMAT = ''DD-MM-YYYY'';');
@@ -588,6 +627,7 @@ begin
         put_line('PROMPT ============================================================');
     else
         put_line('COMMIT;');
+        put_line('SELECT ''IC_DB_FINAL_OK|' || g_total_dml || '|complete'' FROM DUAL;');
         put_line('PROMPT ============================================================');
         put_line('PROMPT IC ACCOUNT DATA SCRIPT EXECUTION COMPLETE AND COMMITTED');
         put_line('PROMPT Review any ORA-/SP2-/PLS- messages above; script continues on errors.');

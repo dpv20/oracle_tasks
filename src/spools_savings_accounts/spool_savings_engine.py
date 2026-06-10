@@ -15,6 +15,7 @@ import threading
 import uuid
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Callable, Iterable
@@ -53,6 +54,52 @@ _ACCOUNT_RE = re.compile(r"^[A-Za-z0-9_-]{3,40}$")
 MAX_PARALLEL_SAVINGS_ACCOUNTS = 3
 
 SavingsStatusCallback = Callable[[str, SpoolSavingsStatus, str], None]
+
+_VERIFY_TABLES: tuple[str, ...] = (
+    "STTM_CUST_ACCOUNT",
+    "STTB_ACCOUNT",
+    "ICTM_ACC",
+    "ICTB_ACC_PR",
+    "ICTB_ENTRIES_HISTORY",
+    "ACTB_VD_BAL",
+    "ICTB_ITM_TOV",
+)
+_VERIFY_TABLE_SPECS: tuple[tuple[str, str, str, str | None], ...] = (
+    ("STTM_CUST_ACCOUNT", "sttm_cust_account", "cust_ac_no", "branch_code"),
+    ("STTB_ACCOUNT", "sttb_account", "ac_gl_no", "branch_code"),
+    ("ICTM_ACC", "ictm_acc", "acc", "brn"),
+    ("ICTB_ACC_PR", "ictb_acc_pr", "acc", "brn"),
+    ("ICTB_ENTRIES_HISTORY", "ictb_entries_history", "acc", "brn"),
+    ("ACTB_VD_BAL", "actb_vd_bal", "acc", "brn"),
+    ("ICTB_ITM_TOV", "ictb_itm_tov", "acc", "brn"),
+)
+_INSERT_TABLE_RE = re.compile(r"^\s*insert\s+into\s+([a-z0-9_]+)\s*\(", re.IGNORECASE)
+_GENERATED_HEADER_RE = re.compile(
+    r"--\s*IC account data generated for branch\s+(\S+)\s+account\s+(\S+)",
+    re.IGNORECASE,
+)
+_VERIFY_ROW_RE = re.compile(r"^\s*([A-Z0-9_]+)\s*=\s*(-?\d+)\s*$", re.IGNORECASE)
+_GENERATION_ERROR_MARKER = "IC ACCOUNT DATA SCRIPT COMPLETED WITH GENERATION ERRORS"
+_DB_FINAL_MARKER = "IC_DB_FINAL_OK|"
+_DB_PROGRESS_RE = re.compile(
+    r"^\s*IC_DB_(CHECKPOINT|FINAL)_OK\|(\d+)\|([^\r\n]+)\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+_CRITICAL_SQLCL_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"\bSQL Error:\s*Closed\s+Connection\b", re.IGNORECASE), "SQLcl closed connection"),
+    (re.compile(r"\bClosed\s+Connection\b", re.IGNORECASE), "SQLcl closed connection"),
+    (re.compile(r"\bORA-03113\b", re.IGNORECASE), "ORA-03113 end-of-file on communication channel"),
+    (re.compile(r"\bORA-03114\b", re.IGNORECASE), "ORA-03114 not connected to Oracle"),
+    (re.compile(r"\bORA-03135\b", re.IGNORECASE), "ORA-03135 connection lost contact"),
+    (re.compile(r"\bORA-01012\b", re.IGNORECASE), "ORA-01012 not logged on"),
+    (re.compile(r"\bORA-01033\b", re.IGNORECASE), "ORA-01033 initialization/shutdown in progress"),
+    (re.compile(r"\bORA-01034\b", re.IGNORECASE), "ORA-01034 Oracle not available"),
+    (re.compile(r"\bORA-01089\b", re.IGNORECASE), "ORA-01089 immediate shutdown in progress"),
+    (re.compile(r"\bORA-12154\b", re.IGNORECASE), "ORA-12154 connect identifier could not be resolved"),
+    (re.compile(r"\bORA-125\d{2}\b", re.IGNORECASE), "Oracle network/listener error"),
+    (re.compile(r"\bSP2-\d{4}\b", re.IGNORECASE), "SQLcl/SP2 client error"),
+    (re.compile(r"\bPLS-\d{4}\b", re.IGNORECASE), "PL/SQL error"),
+)
 
 
 def savings_template_path() -> Path:
@@ -125,8 +172,121 @@ def _sql_literal(value: str) -> str:
 
 
 def _tail_error(result: RunResult) -> str:
-    tail = (result.stderr or result.stdout or "").strip().splitlines()
+    tail = _combined_output(result).strip().splitlines()
     return tail[-1][:240] if tail else f"exit {result.exit_code}"
+
+
+def _combined_output(result: RunResult) -> str:
+    parts = []
+    if result.stdout:
+        parts.append(result.stdout)
+    if result.stderr:
+        parts.append(result.stderr)
+    return "\n".join(parts)
+
+
+def _line_for_offset(text: str, offset: int) -> str:
+    start = text.rfind("\n", 0, offset) + 1
+    end = text.find("\n", offset)
+    if end == -1:
+        end = len(text)
+    return text[start:end].strip()
+
+
+def _critical_sqlcl_error(result: RunResult) -> str:
+    output = _combined_output(result)
+    for pattern, description in _CRITICAL_SQLCL_PATTERNS:
+        match = pattern.search(output)
+        if match:
+            line = _line_for_offset(output, match.start())
+            return f"{description}: {line[:220]}"
+    return ""
+
+
+def _apply_log_path(spool_path: Path) -> Path:
+    return spool_path.with_name(f"{spool_path.stem}_apply.log")
+
+
+def _write_apply_log(account: str, spool_path: Path, result: RunResult) -> Path | None:
+    log_path = _apply_log_path(spool_path)
+    body = [
+        f"Applied at: {datetime.now().isoformat(timespec='seconds')}",
+        f"Account: {account}",
+        f"Spool: {spool_path}",
+        f"Exit code: {result.exit_code}",
+        "",
+        "=== STDOUT ===",
+        result.stdout or "",
+        "",
+        "=== STDERR ===",
+        result.stderr or "",
+    ]
+    try:
+        log_path.write_text("\n".join(body), encoding="utf-8", errors="replace")
+        return log_path
+    except OSError as exc:
+        log.warning("Could not write savings apply log %s: %s", log_path, exc)
+        return None
+
+
+def _inspect_spool(spool_path: Path) -> tuple[dict[str, int], str]:
+    counts = {table: 0 for table in _VERIFY_TABLES}
+    branch = ""
+    try:
+        with spool_path.open("r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if not branch:
+                    header = _GENERATED_HEADER_RE.search(line)
+                    if header:
+                        branch = header.group(1).upper()
+
+                insert = _INSERT_TABLE_RE.match(line)
+                if insert:
+                    table = insert.group(1).upper()
+                    if table in counts:
+                        counts[table] += 1
+    except OSError as exc:
+        log.warning("Could not inspect savings spool %s: %s", spool_path, exc)
+    return counts, branch
+
+
+def _db_progress(result: RunResult) -> tuple[bool, str]:
+    final_seen = False
+    last_kind = ""
+    last_dml = ""
+    last_reason = ""
+    for match in _DB_PROGRESS_RE.finditer(_combined_output(result)):
+        last_kind = match.group(1).upper()
+        last_dml = match.group(2)
+        last_reason = match.group(3).strip()
+        if last_kind == "FINAL":
+            final_seen = True
+
+    if not last_kind:
+        return False, "no DB progress marker reached"
+
+    label = "final marker" if last_kind == "FINAL" else "last checkpoint"
+    return final_seen, f"{label}: {last_dml} DML - {last_reason}"
+
+
+def _requires_final_db_marker(spool_path: Path) -> bool:
+    try:
+        with spool_path.open("r", encoding="utf-8", errors="replace") as fh:
+            return any(_DB_FINAL_MARKER in line for line in fh)
+    except OSError as exc:
+        log.warning("Could not inspect savings spool markers %s: %s", spool_path, exc)
+        return False
+
+
+def _spool_generation_error(spool_path: Path) -> str:
+    try:
+        with spool_path.open("r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if _GENERATION_ERROR_MARKER in line:
+                    return "Spool was generated with fatal errors; regenerate it before applying."
+    except OSError as exc:
+        return f"Could not read spool before apply: {exc}"
+    return ""
 
 
 class SpoolSavingsEngine:
@@ -197,6 +357,68 @@ select max(branch_code)
         out = Path(tempfile.gettempdir()) / f"oracle_tasks_savings_apply_{uuid.uuid4().hex[:8]}.sql"
         out.write_text(_with_exit(text), encoding="utf-8")
         return out
+
+    def _verify_account_apply(
+        self,
+        account: str,
+        connection: str,
+        spool_path: Path,
+        cancel_event: threading.Event | None = None,
+    ) -> tuple[bool, str]:
+        expected, branch = _inspect_spool(spool_path)
+        selects: list[str] = []
+        for label, table, account_col, branch_col in _VERIFY_TABLE_SPECS:
+            where = f"{account_col} = {_sql_literal(account)}"
+            if branch and branch_col:
+                where += f" and {branch_col} = {_sql_literal(branch)}"
+            selects.append(f"select '{label}=' || count(*) from {table} where {where}")
+
+        result = self.runner.run_query(
+            connection,
+            "\nunion all\n".join(selects),
+            timeout=180,
+            cancel_event=cancel_event,
+        )
+        if result.exit_code == 130 or _is_cancelled(cancel_event):
+            return False, "verification cancelled"
+        if not result.ok:
+            return False, f"verification query failed: {_tail_error(result)}"
+
+        critical = _critical_sqlcl_error(result)
+        if critical:
+            return False, f"verification query failed: {critical}"
+
+        actual: dict[str, int] = {}
+        for line in (result.stdout or "").splitlines():
+            match = _VERIFY_ROW_RE.match(line)
+            if match:
+                actual[match.group(1).upper()] = int(match.group(2))
+
+        failures: list[str] = []
+        for table in ("STTM_CUST_ACCOUNT", "STTB_ACCOUNT", "ICTM_ACC"):
+            if actual.get(table, 0) < 1:
+                failures.append(f"{table} missing")
+
+        for table in _VERIFY_TABLES:
+            expected_count = expected.get(table, 0)
+            if expected_count <= 0:
+                continue
+            actual_count = actual.get(table)
+            if actual_count is None:
+                failures.append(f"{table} not returned")
+            elif actual_count != expected_count:
+                failures.append(f"{table} expected {expected_count}, found {actual_count}")
+
+        if failures:
+            suffix = f" for branch {branch}" if branch else ""
+            return False, "post-apply verification failed" + suffix + ": " + "; ".join(failures[:8])
+
+        compared = ", ".join(
+            f"{table}={expected[table]}"
+            for table in _VERIFY_TABLES
+            if expected.get(table, 0) > 0
+        )
+        return True, f"verified key tables{(' for branch ' + branch) if branch else ''}: {compared or 'existence checks only'}"
 
     def extract_one(
         self,
@@ -283,6 +505,13 @@ select max(branch_code)
                 error=f"SQLcl exited 0 but spool file is missing: {out_path.name}",
                 branch=branch,
             )
+            if on_status:
+                on_status(account, r.status, r.error)
+            return r
+
+        generation_error = _spool_generation_error(out_path)
+        if generation_error:
+            r = SavingsAccountResult(account, SpoolSavingsStatus.ERROR, output_path=out_path, error=generation_error, branch=branch)
             if on_status:
                 on_status(account, r.status, r.error)
             return r
@@ -379,6 +608,13 @@ select max(branch_code)
                 on_status(account, r.status, r.error)
             return r
 
+        generation_error = _spool_generation_error(spool_path)
+        if generation_error:
+            r = SavingsAccountResult(account, SpoolSavingsStatus.ERROR, output_path=spool_path, error=generation_error)
+            if on_status:
+                on_status(account, r.status, r.error)
+            return r
+
         if on_status:
             on_status(account, SpoolSavingsStatus.RUNNING, "")
 
@@ -396,21 +632,58 @@ select max(branch_code)
             except OSError:
                 pass
 
+        log_path = _write_apply_log(account, spool_path, result)
+        log_hint = f" Log: {log_path.name}" if log_path else ""
+
         if result.exit_code == 130 or _is_cancelled(cancel_event):
             r = _cancelled_result(account, spool_path)
             if on_status:
                 on_status(account, r.status, r.error)
             return r
 
+        if on_status:
+            on_status(account, SpoolSavingsStatus.RUNNING, "verifying...")
+        verified, verification_message = self._verify_account_apply(
+            account,
+            connection,
+            spool_path,
+            cancel_event,
+        )
+        final_marker_seen, progress_message = _db_progress(result)
+        requires_final_marker = _requires_final_db_marker(spool_path)
+
         if not result.ok:
-            r = SavingsAccountResult(account, SpoolSavingsStatus.ERROR, output_path=spool_path, error=_tail_error(result))
+            error = f"{_tail_error(result)}. {progress_message}.{log_hint} {verification_message}".strip()
+            r = SavingsAccountResult(account, SpoolSavingsStatus.ERROR, output_path=spool_path, error=error)
+            if on_status:
+                on_status(account, r.status, r.error)
+            return r
+
+        critical = _critical_sqlcl_error(result)
+        if critical:
+            error = f"{critical}. {progress_message}.{log_hint} {verification_message}".strip()
+            r = SavingsAccountResult(account, SpoolSavingsStatus.ERROR, output_path=spool_path, error=error)
+            if on_status:
+                on_status(account, r.status, r.error)
+            return r
+
+        if requires_final_marker and not final_marker_seen:
+            error = f"Apply did not reach final DB marker. {progress_message}.{log_hint} {verification_message}".strip()
+            r = SavingsAccountResult(account, SpoolSavingsStatus.ERROR, output_path=spool_path, error=error)
+            if on_status:
+                on_status(account, r.status, r.error)
+            return r
+
+        if not verified:
+            error = f"{verification_message}. {progress_message}.{log_hint}".strip()
+            r = SavingsAccountResult(account, SpoolSavingsStatus.ERROR, output_path=spool_path, error=error)
             if on_status:
                 on_status(account, r.status, r.error)
             return r
 
         r = SavingsAccountResult(account, SpoolSavingsStatus.OK, output_path=spool_path)
         if on_status:
-            on_status(account, r.status, "")
+            on_status(account, r.status, verification_message)
         return r
 
     def apply_many(
