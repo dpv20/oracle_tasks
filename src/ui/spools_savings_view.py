@@ -33,6 +33,7 @@ from .widgets import AccountStatusRow, CardFrame, IconButton, SectionLabel
 log = logging.getLogger(__name__)
 
 MODE_EXTRACT = "extract"
+MODE_EXTRACT_ONLY = "extract_only"
 MODE_APPLY_EXISTING = "apply_existing"
 
 _ENV_DISPLAY_ORDER = ("prod", "bup_prod", "qa", "bup_qa", "dev")
@@ -75,6 +76,7 @@ class SpoolsSavingsView(ctk.CTkFrame):
         self._dest_db_lookup: dict[str, dict] = {}
         self._country_lookup: dict[str, str] = {}
         self._existing_spool_path: Path | None = None
+        self.serial_accounts_var = tk.BooleanVar(value=False)
 
         # ── header ──
         header = ctk.CTkFrame(self, fg_color="transparent")
@@ -99,7 +101,11 @@ class SpoolsSavingsView(ctk.CTkFrame):
         )
         self.mode_segment = ctk.CTkSegmentedButton(
             form,
-            values=[t("spools_savings.mode.extract"), t("spools_savings.mode.apply_existing")],
+            values=[
+                t("spools_savings.mode.extract"),
+                t("spools_savings.mode.extract_only"),
+                t("spools_savings.mode.apply_existing"),
+            ],
             command=lambda _v: self._on_mode_change(),
         )
         self.mode_segment.grid(row=0, column=1, padx=4, pady=4, sticky="ew")
@@ -210,6 +216,13 @@ class SpoolsSavingsView(ctk.CTkFrame):
             command=self._on_run,
         )
         self.run_btn.pack(side="left")
+        self.serial_accounts_check = ctk.CTkCheckBox(
+            self.actions_frame,
+            text=t("spools_savings.serial_accounts"),
+            variable=self.serial_accounts_var,
+            width=150,
+        )
+        self.serial_accounts_check.pack(side="left", padx=(10, 0))
         self.open_folder_btn = ctk.CTkButton(
             self.actions_frame, text=t("spools_savings.open_folder"), width=220,
             command=self._on_open_folder,
@@ -268,12 +281,18 @@ class SpoolsSavingsView(ctk.CTkFrame):
         self._refresh_db_options()
 
     def _current_mode(self) -> str:
-        if self.mode_segment.get() == t("spools_savings.mode.apply_existing"):
+        mode = self.mode_segment.get()
+        if mode == t("spools_savings.mode.apply_existing"):
             return MODE_APPLY_EXISTING
+        if mode == t("spools_savings.mode.extract_only"):
+            return MODE_EXTRACT_ONLY
         return MODE_EXTRACT
 
     def _is_apply_existing_mode(self) -> bool:
         return self._current_mode() == MODE_APPLY_EXISTING
+
+    def _is_extract_only_mode(self) -> bool:
+        return self._current_mode() == MODE_EXTRACT_ONLY
 
     def _country_options(self) -> list[tuple[str, str]]:
         return _APPLY_EXISTING_COUNTRIES if self._is_apply_existing_mode() else _COUNTRIES
@@ -292,11 +311,14 @@ class SpoolsSavingsView(ctk.CTkFrame):
         self._apply_mode_visibility()
         self._refresh_db_options()
         self._refresh_run_button()
+        self._render_pending_accounts()
 
     def _apply_mode_visibility(self) -> None:
         if self._is_apply_existing_mode():
             self.source_label.grid_remove()
             self.db_menu.grid_remove()
+            self.dest_label.grid()
+            self.dest_db_menu.grid()
             self.existing_spool_label.grid()
             self.existing_spool_frame.grid()
             self.accounts_card.pack_forget()
@@ -305,12 +327,38 @@ class SpoolsSavingsView(ctk.CTkFrame):
 
         self.source_label.grid()
         self.db_menu.grid()
+        if self._is_extract_only_mode():
+            self.dest_label.grid_remove()
+            self.dest_db_menu.grid_remove()
+        else:
+            self.dest_label.grid()
+            self.dest_db_menu.grid()
         self.existing_spool_label.grid_remove()
         self.existing_spool_label.grid_remove()
         self.existing_spool_frame.grid_remove()
         self.results_card.pack_forget()
+        self._apply_account_list_visibility()
         if not self.accounts_card.winfo_manager():
             self.accounts_card.pack(side="top", fill="both", expand=True, padx=25, pady=(0, 15), before=self.actions_frame)
+
+    def _apply_account_list_visibility(self) -> None:
+        if not hasattr(self, "inject_header"):
+            return
+        if self._is_extract_only_mode():
+            self.inject_header.grid_remove()
+            self.inject_frame.grid_remove()
+            self.account_split.grid_columnconfigure(0, weight=1, uniform="")
+            self.account_split.grid_columnconfigure(1, weight=0, uniform="")
+            self.extract_only_header.grid_configure(columnspan=2, padx=(0, 0))
+            self.extract_only_frame.grid_configure(columnspan=2, padx=(0, 0))
+            return
+
+        self.account_split.grid_columnconfigure(0, weight=1, uniform="savings_account_lists")
+        self.account_split.grid_columnconfigure(1, weight=1, uniform="savings_account_lists")
+        self.extract_only_header.grid_configure(columnspan=1, padx=(0, 6))
+        self.extract_only_frame.grid_configure(columnspan=1, padx=(0, 6))
+        self.inject_header.grid(row=0, column=1, sticky="ew", padx=(6, 0), pady=(0, 4))
+        self.inject_frame.grid(row=1, column=1, sticky="nsew", padx=(6, 0))
 
     def _show_accounts_card(self) -> None:
         self.results_card.pack_forget()
@@ -559,6 +607,8 @@ class SpoolsSavingsView(ctk.CTkFrame):
         self._render_pending_accounts()
 
     def _selected_inject_accounts(self) -> list[str]:
+        if self._is_extract_only_mode():
+            return []
         return [acc for acc in self._pending_accounts if self._inject_flags.get(acc, False)]
 
     def _render_pending_accounts(self) -> None:
@@ -566,7 +616,7 @@ class SpoolsSavingsView(ctk.CTkFrame):
             w.destroy()
         for w in self.inject_frame.winfo_children():
             w.destroy()
-        inject_accounts = self._selected_inject_accounts()
+        inject_accounts = [] if self._is_extract_only_mode() else self._selected_inject_accounts()
         self.pending_header.configure(text=t("spools_savings.accounts_summary", n=len(self._pending_accounts)))
         self.extract_only_header.configure(text=t("spools_savings.extract_only_header", n=len(self._pending_accounts)))
         self.inject_header.configure(text=t("spools_savings.inject_header", n=len(inject_accounts)))
@@ -595,7 +645,7 @@ class SpoolsSavingsView(ctk.CTkFrame):
             text_color="white",
             command=lambda a=account: self._remove_pending(a),
         ).pack(side="right", padx=(4, 8), pady=4)
-        if not self._inject_flags.get(account, False):
+        if not self._is_extract_only_mode() and not self._inject_flags.get(account, False):
             ctk.CTkButton(
                 row,
                 text=t("spools_savings.move_to_inject"),
@@ -629,12 +679,16 @@ class SpoolsSavingsView(ctk.CTkFrame):
             return
         if self._is_apply_existing_mode():
             key = "spools_savings.run_apply_existing"
+        elif self._is_extract_only_mode():
+            key = "spools_savings.run_extract_only"
         else:
             key = "spools_savings.run_extract_apply" if self._selected_inject_accounts() else "spools_savings.run_extract_only"
         self.run_btn.configure(text=t(key))
 
     def _set_run_button_running(self, running: bool) -> None:
         if running:
+            if hasattr(self, "serial_accounts_check"):
+                self.serial_accounts_check.configure(state="disabled")
             self.run_btn.configure(
                 text=t("spools_savings.cancel"),
                 command=self._on_cancel,
@@ -644,6 +698,8 @@ class SpoolsSavingsView(ctk.CTkFrame):
                 text_color="white",
             )
             return
+        if hasattr(self, "serial_accounts_check"):
+            self.serial_accounts_check.configure(state="normal")
         self.run_btn.configure(
             command=self._on_run,
             state="normal",
@@ -682,7 +738,7 @@ class SpoolsSavingsView(ctk.CTkFrame):
         if not accounts:
             messagebox.showerror(t("common.error"), t("spools_savings.no_pending"), parent=self)
             return
-        inject_accounts = self._selected_inject_accounts()
+        inject_accounts = [] if self._is_extract_only_mode() else self._selected_inject_accounts()
         dest_db = self._selected_dest_db() if inject_accounts else None
         if inject_accounts:
             if not dest_db:
@@ -741,6 +797,7 @@ class SpoolsSavingsView(ctk.CTkFrame):
         self.result_detail_label.configure(text="")
         self._set_run_button_running(True)
         self.summary_label.configure(text=t("spools_savings.extracting", done=0, total=len(accounts)))
+        savings_max_workers = 1 if self.serial_accounts_var.get() else MAX_PARALLEL_SAVINGS_ACCOUNTS
 
         threading.Thread(
             target=self._do_run,
@@ -753,6 +810,7 @@ class SpoolsSavingsView(ctk.CTkFrame):
                 dest_connection,
                 sqlcl_path,
                 cancel_event,
+                savings_max_workers,
             ),
             daemon=True,
         ).start()
@@ -869,10 +927,11 @@ class SpoolsSavingsView(ctk.CTkFrame):
         dest_connection: str,
         sqlcl_path: str,
         cancel_event: threading.Event,
+        max_workers: int,
     ) -> None:
         engine = SpoolSavingsEngine(SqlclRunner(sqlcl_path))
         total = len(accounts)
-        workers = worker_count_for(total, MAX_PARALLEL_SAVINGS_ACCOUNTS)
+        workers = worker_count_for(total, max_workers)
         log.info("Starting Savings extraction batch: accounts=%s workers=%s", total, workers)
         inject_set = set(inject_accounts)
 
@@ -897,7 +956,7 @@ class SpoolsSavingsView(ctk.CTkFrame):
             accounts,
             source_connection,
             on_extract_status,
-            max_workers=MAX_PARALLEL_SAVINGS_ACCOUNTS,
+            max_workers=max_workers,
             cancel_event=cancel_event,
         )
         extract_ok = sum(1 for result in results if result.status == SpoolSavingsStatus.OK)
@@ -928,7 +987,7 @@ class SpoolsSavingsView(ctk.CTkFrame):
         self._post_ui(
             lambda total_=len(apply_items), r=run_id, e=cancel_event: self._start_inject_stage(total_, r, e)
         )
-        apply_workers = worker_count_for(len(apply_items), MAX_PARALLEL_SAVINGS_ACCOUNTS)
+        apply_workers = worker_count_for(len(apply_items), max_workers)
         log.info("Starting Savings inject batch: accounts=%s workers=%s", len(apply_items), apply_workers)
 
         def on_apply_status(account: str, status: SpoolSavingsStatus, msg: str) -> None:
@@ -948,7 +1007,7 @@ class SpoolsSavingsView(ctk.CTkFrame):
             apply_items,
             dest_connection,
             on_apply_status,
-            max_workers=MAX_PARALLEL_SAVINGS_ACCOUNTS,
+            max_workers=max_workers,
             cancel_event=cancel_event,
         )
         inject_ok = sum(1 for result in apply_results if result.status == SpoolSavingsStatus.OK)

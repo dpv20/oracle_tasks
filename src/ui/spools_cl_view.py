@@ -52,6 +52,7 @@ _EXTRACT_COUNTRIES = [
     (c, c.title()) for c in dbs.countries() if has_cl_template(c)
 ]
 MODE_EXTRACT = "extract"
+MODE_EXTRACT_ONLY = "extract_only"
 MODE_APPLY_EXISTING = "apply_existing"
 
 # Order in which envs appear in the Source DB dropdown.
@@ -120,7 +121,11 @@ class SpoolsCLView(ctk.CTkFrame):
         )
         self.mode_segment = ctk.CTkSegmentedButton(
             form,
-            values=[t("spools_cl.mode.extract"), t("spools_cl.mode.apply_existing")],
+            values=[
+                t("spools_cl.mode.extract"),
+                t("spools_cl.mode.extract_only"),
+                t("spools_cl.mode.apply_existing"),
+            ],
             command=lambda _v: self._on_mode_change(),
         )
         self.mode_segment.grid(row=0, column=1, padx=4, pady=4, sticky="ew")
@@ -329,12 +334,18 @@ class SpoolsCLView(ctk.CTkFrame):
 
     # ── DB dropdown ──
     def _current_mode(self) -> str:
-        if self.mode_segment.get() == t("spools_cl.mode.apply_existing"):
+        mode = self.mode_segment.get()
+        if mode == t("spools_cl.mode.apply_existing"):
             return MODE_APPLY_EXISTING
+        if mode == t("spools_cl.mode.extract_only"):
+            return MODE_EXTRACT_ONLY
         return MODE_EXTRACT
 
     def _is_apply_existing_mode(self) -> bool:
         return self._current_mode() == MODE_APPLY_EXISTING
+
+    def _is_extract_only_mode(self) -> bool:
+        return self._current_mode() == MODE_EXTRACT_ONLY
 
     def _is_cmr_selected(self) -> bool:
         return (
@@ -366,6 +377,7 @@ class SpoolsCLView(ctk.CTkFrame):
         self._apply_mode_visibility()
         self._refresh_db_options()
         self._refresh_run_button()
+        self._render_pending_accounts()
 
     def _on_spool_type_change(self) -> None:
         self._clear_pending_accounts()
@@ -413,6 +425,8 @@ class SpoolsCLView(ctk.CTkFrame):
             self._apply_branch_visibility()
             self.source_label.grid_remove()
             self.db_menu.grid_remove()
+            self.dest_label.grid()
+            self.dest_db_menu.grid()
             self.existing_spool_label.grid()
             self.existing_spool_frame.grid()
             self.accounts_card.pack_forget()
@@ -428,12 +442,38 @@ class SpoolsCLView(ctk.CTkFrame):
         self._apply_spool_type_visibility()
         self.source_label.grid()
         self.db_menu.grid()
+        if self._is_extract_only_mode():
+            self.dest_label.grid_remove()
+            self.dest_db_menu.grid_remove()
+        else:
+            self.dest_label.grid()
+            self.dest_db_menu.grid()
         self.existing_spool_label.grid_remove()
         self.existing_spool_frame.grid_remove()
         self.existing_spools_card.pack_forget()
         self.results_card.pack_forget()
+        self._apply_account_list_visibility()
         if not self.accounts_card.winfo_manager():
             self.accounts_card.pack(side="top", fill="both", expand=True, padx=25, pady=(0, 15), before=self.actions_frame)
+
+    def _apply_account_list_visibility(self) -> None:
+        if not hasattr(self, "inject_header"):
+            return
+        if self._is_extract_only_mode():
+            self.inject_header.grid_remove()
+            self.inject_frame.grid_remove()
+            self.account_split.grid_columnconfigure(0, weight=1, uniform="")
+            self.account_split.grid_columnconfigure(1, weight=0, uniform="")
+            self.extract_only_header.grid_configure(columnspan=2, padx=(0, 0))
+            self.extract_only_frame.grid_configure(columnspan=2, padx=(0, 0))
+            return
+
+        self.account_split.grid_columnconfigure(0, weight=1, uniform="account_lists")
+        self.account_split.grid_columnconfigure(1, weight=1, uniform="account_lists")
+        self.extract_only_header.grid_configure(columnspan=1, padx=(0, 6))
+        self.extract_only_frame.grid_configure(columnspan=1, padx=(0, 6))
+        self.inject_header.grid(row=0, column=1, sticky="ew", padx=(6, 0), pady=(0, 4))
+        self.inject_frame.grid(row=1, column=1, sticky="nsew", padx=(6, 0))
 
     def _apply_spool_type_visibility(self) -> None:
         if self._selected_country_id() != "chile":
@@ -904,6 +944,8 @@ class SpoolsCLView(ctk.CTkFrame):
         self._render_pending_accounts()
 
     def _selected_inject_accounts(self) -> list[str]:
+        if self._is_extract_only_mode():
+            return []
         return [acc for acc in self._pending_accounts if self._inject_flags.get(acc, False)]
 
     def _account_label(self, account: str) -> str:
@@ -916,7 +958,7 @@ class SpoolsCLView(ctk.CTkFrame):
             w.destroy()
         for w in self.inject_frame.winfo_children():
             w.destroy()
-        inject_accounts = self._selected_inject_accounts()
+        inject_accounts = [] if self._is_extract_only_mode() else self._selected_inject_accounts()
         self.pending_header.configure(text=t("spools_cl.accounts_summary", n=len(self._pending_accounts)))
         self.extract_only_header.configure(text=t("spools_cl.extract_only_header", n=len(self._pending_accounts)))
         self.inject_header.configure(text=t("spools_cl.inject_header", n=len(inject_accounts)))
@@ -940,7 +982,7 @@ class SpoolsCLView(ctk.CTkFrame):
             text_color="white",
             command=lambda a=account: self._remove_pending(a),
         ).pack(side="right", padx=(4, 8), pady=4)
-        if not self._inject_flags.get(account, False):
+        if not self._is_extract_only_mode() and not self._inject_flags.get(account, False):
             ctk.CTkButton(
                 row, text=t("spools_cl.move_to_inject"), width=90, height=24,
                 command=lambda a=account: self._set_inject_flag(a, True),
@@ -967,6 +1009,8 @@ class SpoolsCLView(ctk.CTkFrame):
             return
         if self._is_apply_existing_mode():
             key = "spools_cl.run_apply_existing"
+        elif self._is_extract_only_mode():
+            key = "spools_cl.run_extract_only"
         else:
             key = "spools_cl.run_extract_apply" if self._selected_inject_accounts() else "spools_cl.run_extract_only"
         self.run_btn.configure(text=t(key))
@@ -1030,7 +1074,7 @@ class SpoolsCLView(ctk.CTkFrame):
             if missing_branch:
                 messagebox.showerror(t("common.error"), t("spools_cl.branch_required"), parent=self)
                 return
-        inject_accounts = self._selected_inject_accounts()
+        inject_accounts = [] if self._is_extract_only_mode() else self._selected_inject_accounts()
         dest_db = self._selected_dest_db() if inject_accounts else None
         if inject_accounts:
             if not dest_db:
