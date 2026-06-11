@@ -144,7 +144,7 @@ T: dict[str, dict[str, str]] = {
         "spools_savings.run_extract_only": "Extract",
         "spools_savings.run_extract_apply": "Apply",
         "spools_savings.run_apply_existing": "Apply existing",
-        "spools_savings.serial_accounts": "1 account at a time",
+        "spools_savings.serial_accounts": "Inject 1 at a time",
         "spools_savings.cancel": "Cancel",
         "spools_savings.cancelling": "Cancelling...",
         "spools_savings.cancel_requested": "Cancelling current work...",

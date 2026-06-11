@@ -190,17 +190,6 @@ class SpoolsSavingsView(ctk.CTkFrame):
             self.account_row, text=t("spools_savings.add_many_accounts"), width=120,
             command=self._open_bulk_accounts_dialog,
         ).pack(side="left", padx=4)
-
-        self.account_options_row = ctk.CTkFrame(accounts_inner, fg_color="transparent")
-        self.account_options_row.pack(fill="x", padx=4, pady=(2, 4))
-        ctk.CTkFrame(self.account_options_row, fg_color="transparent", width=148, height=1).pack(side="left")
-        self.serial_accounts_check = ctk.CTkCheckBox(
-            self.account_options_row,
-            text=t("spools_savings.serial_accounts"),
-            variable=self.serial_accounts_var,
-            width=150,
-        )
-        self.serial_accounts_check.pack(side="left", padx=4)
         self.pending_header = SectionLabel(accounts_inner, text=t("spools_savings.accounts_summary", n=0))
         self.pending_header.pack(anchor="w", padx=6, pady=(10, 4))
 
@@ -214,8 +203,17 @@ class SpoolsSavingsView(ctk.CTkFrame):
             self.account_split, text=t("spools_savings.extract_only_header", n=0),
         )
         self.extract_only_header.grid(row=0, column=0, sticky="ew", padx=(0, 6), pady=(0, 4))
-        self.inject_header = SectionLabel(self.account_split, text=t("spools_savings.inject_header", n=0))
-        self.inject_header.grid(row=0, column=1, sticky="ew", padx=(6, 0), pady=(0, 4))
+        self.inject_header_bar = ctk.CTkFrame(self.account_split, fg_color="transparent")
+        self.inject_header_bar.grid(row=0, column=1, sticky="ew", padx=(6, 0), pady=(0, 4))
+        self.inject_header = SectionLabel(self.inject_header_bar, text=t("spools_savings.inject_header", n=0))
+        self.inject_header.pack(side="left")
+        self.serial_accounts_check = ctk.CTkCheckBox(
+            self.inject_header_bar,
+            text=t("spools_savings.serial_accounts"),
+            variable=self.serial_accounts_var,
+            width=150,
+        )
+        self.serial_accounts_check.pack(side="right", padx=(8, 0))
 
         self.extract_only_frame = ctk.CTkScrollableFrame(self.account_split, height=180)
         self.extract_only_frame.grid(row=1, column=0, sticky="nsew", padx=(0, 6))
@@ -353,7 +351,7 @@ class SpoolsSavingsView(ctk.CTkFrame):
         if not hasattr(self, "inject_header"):
             return
         if self._is_extract_only_mode():
-            self.inject_header.grid_remove()
+            self.inject_header_bar.grid_remove()
             self.inject_frame.grid_remove()
             self.account_split.grid_columnconfigure(0, weight=1, uniform="")
             self.account_split.grid_columnconfigure(1, weight=0, uniform="")
@@ -365,7 +363,7 @@ class SpoolsSavingsView(ctk.CTkFrame):
         self.account_split.grid_columnconfigure(1, weight=1, uniform="savings_account_lists")
         self.extract_only_header.grid_configure(columnspan=1, padx=(0, 6))
         self.extract_only_frame.grid_configure(columnspan=1, padx=(0, 6))
-        self.inject_header.grid(row=0, column=1, sticky="ew", padx=(6, 0), pady=(0, 4))
+        self.inject_header_bar.grid(row=0, column=1, sticky="ew", padx=(6, 0), pady=(0, 4))
         self.inject_frame.grid(row=1, column=1, sticky="nsew", padx=(6, 0))
 
     def _show_accounts_card(self) -> None:
@@ -816,7 +814,8 @@ class SpoolsSavingsView(ctk.CTkFrame):
         self.result_detail_label.configure(text="")
         self._set_run_button_running(True)
         self.summary_label.configure(text=t("spools_savings.extracting", done=0, total=len(accounts)))
-        savings_max_workers = 1 if self.serial_accounts_var.get() else MAX_PARALLEL_SAVINGS_ACCOUNTS
+        extract_max_workers = MAX_PARALLEL_SAVINGS_ACCOUNTS
+        inject_max_workers = 1 if self.serial_accounts_var.get() else MAX_PARALLEL_SAVINGS_ACCOUNTS
 
         threading.Thread(
             target=self._do_run,
@@ -829,7 +828,8 @@ class SpoolsSavingsView(ctk.CTkFrame):
                 dest_connection,
                 sqlcl_path,
                 cancel_event,
-                savings_max_workers,
+                extract_max_workers,
+                inject_max_workers,
                 extract_archive_dir,
             ),
             daemon=True,
@@ -947,12 +947,13 @@ class SpoolsSavingsView(ctk.CTkFrame):
         dest_connection: str,
         sqlcl_path: str,
         cancel_event: threading.Event,
-        max_workers: int,
+        extract_max_workers: int,
+        inject_max_workers: int,
         extract_archive_dir: Path | None,
     ) -> None:
         engine = SpoolSavingsEngine(SqlclRunner(sqlcl_path))
         total = len(accounts)
-        workers = worker_count_for(total, max_workers)
+        workers = worker_count_for(total, extract_max_workers)
         log.info("Starting Savings extraction batch: accounts=%s workers=%s", total, workers)
         inject_set = set(inject_accounts)
         temp_dir = tempfile.TemporaryDirectory(prefix="oracle_tasks_savings_")
@@ -980,7 +981,7 @@ class SpoolsSavingsView(ctk.CTkFrame):
                 accounts,
                 source_connection,
                 on_extract_status,
-                max_workers=max_workers,
+                max_workers=extract_max_workers,
                 cancel_event=cancel_event,
                 output_dir=working_dir,
             )
@@ -1023,7 +1024,7 @@ class SpoolsSavingsView(ctk.CTkFrame):
             self._post_ui(
                 lambda total_=len(apply_items), r=run_id, e=cancel_event: self._start_inject_stage(total_, r, e)
             )
-            apply_workers = worker_count_for(len(apply_items), max_workers)
+            apply_workers = worker_count_for(len(apply_items), inject_max_workers)
             log.info("Starting Savings inject batch: accounts=%s workers=%s", len(apply_items), apply_workers)
 
             def on_apply_status(account: str, status: SpoolSavingsStatus, msg: str) -> None:
@@ -1043,7 +1044,7 @@ class SpoolsSavingsView(ctk.CTkFrame):
                 apply_items,
                 dest_connection,
                 on_apply_status,
-                max_workers=max_workers,
+                max_workers=inject_max_workers,
                 cancel_event=cancel_event,
             )
             inject_ok = sum(1 for result in apply_results if result.status == SpoolSavingsStatus.OK)
