@@ -20,9 +20,13 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import subprocess
+import tempfile
 import tkinter as tk
 import threading
+import zipfile
+from datetime import datetime
 from pathlib import Path
 
 import customtkinter as ctk
@@ -36,6 +40,7 @@ from spools_cl_accounts.spool_cl_engine import (
     MAX_PARALLEL_ACCOUNTS, CLAccountResult, SpoolCLEngine, SpoolCLStatus,
     SPOOL_KIND_CMR, SPOOL_KIND_CONSUMER_LENDING,
     cl_output_folder_for,
+    cl_output_path_for,
     has_cl_template, is_valid_account, is_valid_branch, parse_account_branches,
     parse_accounts, worker_count_for,
 )
@@ -1084,6 +1089,17 @@ class SpoolsCLView(ctk.CTkFrame):
                 messagebox.showerror(t("common.error"), t("spools_cl.same_source_destination"), parent=self)
                 return
 
+        extract_archive_dir: Path | None = None
+        if not inject_accounts:
+            default_dir = cl_output_folder_for(country, spool_kind)
+            selected_dir = filedialog.askdirectory(
+                parent=self,
+                title=t("spools_cl.select_extract_folder"),
+                initialdir=str(default_dir if default_dir.exists() else default_dir.parent),
+            )
+            if not selected_dir:
+                return
+            extract_archive_dir = Path(selected_dir)
         sqlcl_path = (self.app.config.get("sqlcl_path") or "").strip()
         if not sqlcl_path or not os.path.exists(sqlcl_path):
             messagebox.showerror(t("common.error"), t("spools_cl.no_sqlcl"), parent=self)
@@ -1141,6 +1157,7 @@ class SpoolsCLView(ctk.CTkFrame):
             args=(
                 run_id, country, accounts, inject_accounts, source_connection,
                 dest_connection, sqlcl_path, cancel_event, dict(self._account_branches), spool_kind,
+                extract_archive_dir,
             ),
             daemon=True,
         ).start()
@@ -1267,12 +1284,15 @@ class SpoolsCLView(ctk.CTkFrame):
         cancel_event: threading.Event,
         branches: dict[str, str],
         spool_kind: str,
+        extract_archive_dir: Path | None,
     ) -> None:
         engine = SpoolCLEngine(SqlclRunner(sqlcl_path))
         total = len(accounts)
         workers = worker_count_for(total, MAX_PARALLEL_ACCOUNTS)
         log.info("Starting spool extraction batch: accounts=%s workers=%s", total, workers)
         inject_set = set(inject_accounts)
+        temp_dir = tempfile.TemporaryDirectory(prefix="oracle_tasks_cl_")
+        working_dir = Path(temp_dir.name)
 
         def on_extract_status(account: str, status: SpoolCLStatus, msg: str) -> None:
             display = msg
@@ -1290,78 +1310,106 @@ class SpoolsCLView(ctk.CTkFrame):
                     self._apply_status(a, s, m, T, "spools_cl.extracting", r, "extract")
             )
 
-        results: list[CLAccountResult] = engine.extract_many(
-            country,
-            accounts,
-            source_connection,
-            on_extract_status,
-            max_workers=MAX_PARALLEL_ACCOUNTS,
-            cancel_event=cancel_event,
-            branches=branches,
-            spool_kind=spool_kind,
-        )
-        extract_ok = sum(1 for result in results if result.status == SpoolCLStatus.OK)
-        extract_err = total - extract_ok
-        for result in results:
-            log.info(
-                "Spool extract result: %s status=%s out=%s err=%s",
-                result.account, result.status.value, result.output_path, result.error,
+        try:
+            results: list[CLAccountResult] = engine.extract_many(
+                country,
+                accounts,
+                source_connection,
+                on_extract_status,
+                max_workers=MAX_PARALLEL_ACCOUNTS,
+                cancel_event=cancel_event,
+                branches=branches,
+                spool_kind=spool_kind,
+                output_dir=working_dir,
             )
+            extract_ok = sum(1 for result in results if result.status == SpoolCLStatus.OK)
+            extract_err = total - extract_ok
+            for result in results:
+                log.info(
+                    "Spool extract result: %s status=%s out=%s err=%s",
+                    result.account, result.status.value, result.output_path, result.error,
+                )
 
-        by_account = {result.account: result for result in results}
-        apply_items = [
-            (acc, by_account[acc].output_path)
-            for acc in inject_accounts
-            if by_account.get(acc)
-            and by_account[acc].status == SpoolCLStatus.OK
-            and by_account[acc].output_path is not None
-        ]
-        if cancel_event.is_set() or not apply_items:
-            details = self._classify_extract_apply(accounts, results, [])
+            by_account = {result.account: result for result in results}
+            apply_items = [
+                (acc, by_account[acc].output_path)
+                for acc in inject_accounts
+                if by_account.get(acc)
+                and by_account[acc].status == SpoolCLStatus.OK
+                and by_account[acc].output_path is not None
+            ]
+            if cancel_event.is_set() or not apply_items:
+                details = self._classify_extract_apply(accounts, results, [])
+                if not cancel_event.is_set():
+                    try:
+                        if extract_archive_dir is not None:
+                            archive_path = self._create_extract_archive(country, spool_kind, results, extract_archive_dir)
+                            if archive_path is not None:
+                                details["archive"] = [str(archive_path)]
+                        else:
+                            self._persist_generated_spools(country, spool_kind, results)
+                    except OSError as exc:
+                        log.exception("Could not persist spool extract output")
+                        details["save_error"] = [str(exc)]
+                self._post_ui(
+                    lambda r=run_id, d=details, c=cancel_event.is_set(): self._finish(
+                        extract_ok, extract_err, 0, 0, total, 0, r, d, c,
+                    )
+                )
+                return
+
+            self._post_ui(
+                lambda total_=len(apply_items), r=run_id, e=cancel_event: self._start_inject_stage(total_, r, e)
+            )
+            apply_workers = worker_count_for(len(apply_items), MAX_PARALLEL_ACCOUNTS)
+            log.info("Starting spool inject batch: accounts=%s workers=%s", len(apply_items), apply_workers)
+
+            def on_apply_status(account: str, status: SpoolCLStatus, msg: str) -> None:
+                display = msg
+                if status == SpoolCLStatus.RUNNING:
+                    display = t("spools_cl.status_injecting")
+                elif status == SpoolCLStatus.OK:
+                    display = t("spools_cl.status_injected")
+                elif status == SpoolCLStatus.CANCELLED:
+                    display = t("spools_cl.status_cancelled")
+                self._post_ui(
+                    lambda a=account, s=status, m=display, T=len(apply_items), r=run_id:
+                        self._apply_status(a, s, m, T, "spools_cl.injecting", r, "inject")
+                )
+
+            apply_results = engine.apply_many(
+                apply_items,
+                dest_connection,
+                on_apply_status,
+                max_workers=MAX_PARALLEL_ACCOUNTS,
+                cancel_event=cancel_event,
+            )
+            inject_ok = sum(1 for result in apply_results if result.status == SpoolCLStatus.OK)
+            inject_err = len(apply_items) - inject_ok
+            for result in apply_results:
+                log.info(
+                    "Spool inject result: %s status=%s out=%s err=%s",
+                    result.account, result.status.value, result.output_path, result.error,
+                )
+            details = self._classify_extract_apply(accounts, results, apply_results)
+            if not cancel_event.is_set():
+                try:
+                    self._persist_apply_outputs(country, spool_kind, apply_results)
+                    self._persist_generated_spools(
+                        country,
+                        spool_kind,
+                        [result for result in results if result.account not in inject_set],
+                    )
+                except OSError as exc:
+                    log.exception("Could not persist spool apply output")
+                    details["save_error"] = [str(exc)]
             self._post_ui(
                 lambda r=run_id, d=details, c=cancel_event.is_set(): self._finish(
-                    extract_ok, extract_err, 0, 0, total, 0, r, d, c,
+                    extract_ok, extract_err, inject_ok, inject_err, total, len(apply_items), r, d, c,
                 )
             )
-            return
-
-        self._post_ui(
-            lambda total_=len(apply_items), r=run_id, e=cancel_event: self._start_inject_stage(total_, r, e)
-        )
-        apply_workers = worker_count_for(len(apply_items), MAX_PARALLEL_ACCOUNTS)
-        log.info("Starting spool inject batch: accounts=%s workers=%s", len(apply_items), apply_workers)
-
-        def on_apply_status(account: str, status: SpoolCLStatus, msg: str) -> None:
-            display = msg
-            if status == SpoolCLStatus.RUNNING:
-                display = t("spools_cl.status_injecting")
-            elif status == SpoolCLStatus.OK:
-                display = t("spools_cl.status_injected")
-            self._post_ui(
-                lambda a=account, s=status, m=display, T=len(apply_items), r=run_id:
-                    self._apply_status(a, s, m, T, "spools_cl.injecting", r, "inject")
-            )
-
-        apply_results = engine.apply_many(
-            apply_items,
-            dest_connection,
-            on_apply_status,
-            max_workers=MAX_PARALLEL_ACCOUNTS,
-            cancel_event=cancel_event,
-        )
-        inject_ok = sum(1 for result in apply_results if result.status == SpoolCLStatus.OK)
-        inject_err = len(apply_items) - inject_ok
-        for result in apply_results:
-            log.info(
-                "Spool inject result: %s status=%s out=%s err=%s",
-                result.account, result.status.value, result.output_path, result.error,
-            )
-        details = self._classify_extract_apply(accounts, results, apply_results)
-        self._post_ui(
-            lambda r=run_id, d=details, c=cancel_event.is_set(): self._finish(
-                extract_ok, extract_err, inject_ok, inject_err, total, len(apply_items), r, d, c,
-            )
-        )
+        finally:
+            temp_dir.cleanup()
 
     def _do_apply_existing(
         self,
@@ -1406,6 +1454,73 @@ class SpoolsCLView(ctk.CTkFrame):
             lambda r=run_id, c=cancel_event.is_set(): self._finish_apply_existing(ok, err, r, results, c)
         )
 
+    def _result_final_spool_path(self, country: str, spool_kind: str, result: CLAccountResult) -> Path:
+        account, branch = self._split_pending_account_key(result.account)
+        return cl_output_path_for(
+            country,
+            account,
+            spool_kind,
+            branch if spool_kind == SPOOL_KIND_CMR else None,
+        )
+
+    def _persist_generated_spools(
+        self,
+        country: str,
+        spool_kind: str,
+        results: list[CLAccountResult],
+    ) -> list[Path]:
+        saved: list[Path] = []
+        for result in results:
+            if result.status != SpoolCLStatus.OK or result.output_path is None:
+                continue
+            if not result.output_path.exists():
+                continue
+            dest = self._result_final_spool_path(country, spool_kind, result)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            if result.output_path != dest:
+                shutil.copy2(result.output_path, dest)
+            saved.append(dest)
+        return saved
+
+    def _persist_apply_outputs(
+        self,
+        country: str,
+        spool_kind: str,
+        results: list[CLAccountResult],
+    ) -> None:
+        for result in results:
+            if result.status != SpoolCLStatus.OK or result.output_path is None:
+                continue
+            if not result.output_path.exists():
+                continue
+            dest = self._result_final_spool_path(country, spool_kind, result)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            if result.output_path != dest:
+                shutil.copy2(result.output_path, dest)
+
+    def _create_extract_archive(
+        self,
+        country: str,
+        spool_kind: str,
+        results: list[CLAccountResult],
+        archive_dir: Path,
+    ) -> Path | None:
+        files = [
+            result.output_path
+            for result in results
+            if result.status == SpoolCLStatus.OK and result.output_path is not None and result.output_path.exists()
+        ]
+        if not files:
+            return None
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        country_part = (country or "country").title().replace(" ", "_")
+        kind_part = "CMR" if spool_kind == SPOOL_KIND_CMR else "CL"
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        archive_path = archive_dir / f"{kind_part}_Spools_{country_part}_{stamp}.zip"
+        with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for path in files:
+                zf.write(path, arcname=path.name)
+        return archive_path
     @staticmethod
     def _classify_extract_apply(
         accounts: list[str],
@@ -1435,14 +1550,19 @@ class SpoolsCLView(ctk.CTkFrame):
         return ", ".join(self._account_label(account) for account in accounts) if accounts else "-"
 
     def _show_extract_apply_details(self, details: dict[str, list[str]]) -> None:
-        self.result_detail_label.configure(
-            text=t(
-                "spools_cl.detail_extract_apply",
-                injected=self._format_accounts(details.get("injected", [])),
-                only_extracted=self._format_accounts(details.get("only_extracted", [])),
-                nothing=self._format_accounts(details.get("nothing", [])),
-            ),
+        text = t(
+            "spools_cl.detail_extract_apply",
+            injected=self._format_accounts(details.get("injected", [])),
+            only_extracted=self._format_accounts(details.get("only_extracted", [])),
+            nothing=self._format_accounts(details.get("nothing", [])),
         )
+        archive = details.get("archive", [])
+        if archive:
+            text += "\n" + t("spools_cl.detail_archive", file=archive[0])
+        save_error = details.get("save_error", [])
+        if save_error:
+            text += "\n" + t("spools_cl.detail_save_error", error=save_error[0])
+        self.result_detail_label.configure(text=text)
 
     def _show_apply_existing_details(self, results: list[CLAccountResult]) -> None:
         self.result_detail_label.configure(

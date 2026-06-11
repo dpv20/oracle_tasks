@@ -3,9 +3,13 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import subprocess
+import tempfile
 import tkinter as tk
 import threading
+import zipfile
+from datetime import datetime
 from pathlib import Path
 
 import customtkinter as ctk
@@ -20,6 +24,7 @@ from spools_cl_accounts.sqlcl import SqlclRunner
 from spools_savings_accounts.spool_savings_engine import (
     MAX_PARALLEL_SAVINGS_ACCOUNTS,
     SavingsAccountResult,
+    savings_output_path_for,
     SpoolSavingsEngine,
     SpoolSavingsStatus,
     has_savings_template,
@@ -186,6 +191,16 @@ class SpoolsSavingsView(ctk.CTkFrame):
             command=self._open_bulk_accounts_dialog,
         ).pack(side="left", padx=4)
 
+        self.account_options_row = ctk.CTkFrame(accounts_inner, fg_color="transparent")
+        self.account_options_row.pack(fill="x", padx=4, pady=(2, 4))
+        ctk.CTkFrame(self.account_options_row, fg_color="transparent", width=148, height=1).pack(side="left")
+        self.serial_accounts_check = ctk.CTkCheckBox(
+            self.account_options_row,
+            text=t("spools_savings.serial_accounts"),
+            variable=self.serial_accounts_var,
+            width=150,
+        )
+        self.serial_accounts_check.pack(side="left", padx=4)
         self.pending_header = SectionLabel(accounts_inner, text=t("spools_savings.accounts_summary", n=0))
         self.pending_header.pack(anchor="w", padx=6, pady=(10, 4))
 
@@ -216,13 +231,6 @@ class SpoolsSavingsView(ctk.CTkFrame):
             command=self._on_run,
         )
         self.run_btn.pack(side="left")
-        self.serial_accounts_check = ctk.CTkCheckBox(
-            self.actions_frame,
-            text=t("spools_savings.serial_accounts"),
-            variable=self.serial_accounts_var,
-            width=150,
-        )
-        self.serial_accounts_check.pack(side="left", padx=(10, 0))
         self.open_folder_btn = ctk.CTkButton(
             self.actions_frame, text=t("spools_savings.open_folder"), width=220,
             command=self._on_open_folder,
@@ -748,6 +756,17 @@ class SpoolsSavingsView(ctk.CTkFrame):
                 messagebox.showerror(t("common.error"), t("spools_savings.same_source_destination"), parent=self)
                 return
 
+        extract_archive_dir: Path | None = None
+        if not inject_accounts:
+            default_dir = SPOOLS_SAVINGS_OUT_DIR / (country.title() if country else "")
+            selected_dir = filedialog.askdirectory(
+                parent=self,
+                title=t("spools_savings.select_extract_folder"),
+                initialdir=str(default_dir if default_dir.exists() else SPOOLS_SAVINGS_OUT_DIR),
+            )
+            if not selected_dir:
+                return
+            extract_archive_dir = Path(selected_dir)
         sqlcl_path = (self.app.config.get("sqlcl_path") or "").strip()
         if not sqlcl_path or not os.path.exists(sqlcl_path):
             messagebox.showerror(t("common.error"), t("spools_savings.no_sqlcl"), parent=self)
@@ -811,6 +830,7 @@ class SpoolsSavingsView(ctk.CTkFrame):
                 sqlcl_path,
                 cancel_event,
                 savings_max_workers,
+                extract_archive_dir,
             ),
             daemon=True,
         ).start()
@@ -928,12 +948,15 @@ class SpoolsSavingsView(ctk.CTkFrame):
         sqlcl_path: str,
         cancel_event: threading.Event,
         max_workers: int,
+        extract_archive_dir: Path | None,
     ) -> None:
         engine = SpoolSavingsEngine(SqlclRunner(sqlcl_path))
         total = len(accounts)
         workers = worker_count_for(total, max_workers)
         log.info("Starting Savings extraction batch: accounts=%s workers=%s", total, workers)
         inject_set = set(inject_accounts)
+        temp_dir = tempfile.TemporaryDirectory(prefix="oracle_tasks_savings_")
+        working_dir = Path(temp_dir.name)
 
         def on_extract_status(account: str, status: SpoolSavingsStatus, msg: str) -> None:
             display = msg
@@ -951,73 +974,98 @@ class SpoolsSavingsView(ctk.CTkFrame):
                     self._apply_status(a, s, m, T, "spools_savings.extracting", r, "extract")
             )
 
-        results = engine.extract_many(
-            country,
-            accounts,
-            source_connection,
-            on_extract_status,
-            max_workers=max_workers,
-            cancel_event=cancel_event,
-        )
-        extract_ok = sum(1 for result in results if result.status == SpoolSavingsStatus.OK)
-        extract_err = total - extract_ok
-        for result in results:
-            log.info(
-                "Savings extract result: %s status=%s branch=%s out=%s err=%s",
-                result.account, result.status.value, result.branch, result.output_path, result.error,
+        try:
+            results = engine.extract_many(
+                country,
+                accounts,
+                source_connection,
+                on_extract_status,
+                max_workers=max_workers,
+                cancel_event=cancel_event,
+                output_dir=working_dir,
             )
+            extract_ok = sum(1 for result in results if result.status == SpoolSavingsStatus.OK)
+            extract_err = total - extract_ok
+            for result in results:
+                log.info(
+                    "Savings extract result: %s status=%s branch=%s out=%s err=%s",
+                    result.account, result.status.value, result.branch, result.output_path, result.error,
+                )
 
-        by_account = {result.account: result for result in results}
-        apply_items = [
-            (acc, by_account[acc].output_path)
-            for acc in inject_accounts
-            if by_account.get(acc)
-            and by_account[acc].status == SpoolSavingsStatus.OK
-            and by_account[acc].output_path is not None
-        ]
-        if cancel_event.is_set() or not apply_items:
-            details = self._classify_extract_apply(accounts, results, [])
+            by_account = {result.account: result for result in results}
+            apply_items = [
+                (acc, by_account[acc].output_path)
+                for acc in inject_accounts
+                if by_account.get(acc)
+                and by_account[acc].status == SpoolSavingsStatus.OK
+                and by_account[acc].output_path is not None
+            ]
+            if cancel_event.is_set() or not apply_items:
+                details = self._classify_extract_apply(accounts, results, [])
+                if not cancel_event.is_set():
+                    try:
+                        if extract_archive_dir is not None:
+                            archive_path = self._create_extract_archive(country, results, extract_archive_dir)
+                            if archive_path is not None:
+                                details["archive"] = [str(archive_path)]
+                        else:
+                            self._persist_generated_spools(country, results)
+                    except OSError as exc:
+                        log.exception("Could not persist Savings extract output")
+                        details["save_error"] = [str(exc)]
+                self._post_ui(
+                    lambda r=run_id, d=details, c=cancel_event.is_set(): self._finish(
+                        extract_ok, extract_err, 0, 0, total, 0, r, d, c,
+                    )
+                )
+                return
+
+            self._post_ui(
+                lambda total_=len(apply_items), r=run_id, e=cancel_event: self._start_inject_stage(total_, r, e)
+            )
+            apply_workers = worker_count_for(len(apply_items), max_workers)
+            log.info("Starting Savings inject batch: accounts=%s workers=%s", len(apply_items), apply_workers)
+
+            def on_apply_status(account: str, status: SpoolSavingsStatus, msg: str) -> None:
+                display = msg
+                if status == SpoolSavingsStatus.RUNNING:
+                    display = t("spools_savings.status_injecting")
+                elif status == SpoolSavingsStatus.OK:
+                    display = t("spools_savings.status_injected")
+                elif status == SpoolSavingsStatus.CANCELLED:
+                    display = t("spools_savings.status_cancelled")
+                self._post_ui(
+                    lambda a=account, s=status, m=display, T=len(apply_items), r=run_id:
+                        self._apply_status(a, s, m, T, "spools_savings.injecting", r, "inject")
+                )
+
+            apply_results = engine.apply_many(
+                apply_items,
+                dest_connection,
+                on_apply_status,
+                max_workers=max_workers,
+                cancel_event=cancel_event,
+            )
+            inject_ok = sum(1 for result in apply_results if result.status == SpoolSavingsStatus.OK)
+            inject_err = len(apply_items) - inject_ok
+            details = self._classify_extract_apply(accounts, results, apply_results)
+            if not cancel_event.is_set():
+                try:
+                    self._persist_apply_outputs(country, apply_results)
+                    self._persist_generated_spools(
+                        country,
+                        [result for result in results if result.account not in inject_set],
+                    )
+                except OSError as exc:
+                    log.exception("Could not persist Savings apply output")
+                    details["save_error"] = [str(exc)]
             self._post_ui(
                 lambda r=run_id, d=details, c=cancel_event.is_set(): self._finish(
-                    extract_ok, extract_err, 0, 0, total, 0, r, d, c,
+                    extract_ok, extract_err, inject_ok, inject_err, total, len(apply_items), r, d, c,
                 )
             )
-            return
-
-        self._post_ui(
-            lambda total_=len(apply_items), r=run_id, e=cancel_event: self._start_inject_stage(total_, r, e)
-        )
-        apply_workers = worker_count_for(len(apply_items), max_workers)
-        log.info("Starting Savings inject batch: accounts=%s workers=%s", len(apply_items), apply_workers)
-
-        def on_apply_status(account: str, status: SpoolSavingsStatus, msg: str) -> None:
-            display = msg
-            if status == SpoolSavingsStatus.RUNNING:
-                display = t("spools_savings.status_injecting")
-            elif status == SpoolSavingsStatus.OK:
-                display = t("spools_savings.status_injected")
-            elif status == SpoolSavingsStatus.CANCELLED:
-                display = t("spools_savings.status_cancelled")
-            self._post_ui(
-                lambda a=account, s=status, m=display, T=len(apply_items), r=run_id:
-                    self._apply_status(a, s, m, T, "spools_savings.injecting", r, "inject")
-            )
-
-        apply_results = engine.apply_many(
-            apply_items,
-            dest_connection,
-            on_apply_status,
-            max_workers=max_workers,
-            cancel_event=cancel_event,
-        )
-        inject_ok = sum(1 for result in apply_results if result.status == SpoolSavingsStatus.OK)
-        inject_err = len(apply_items) - inject_ok
-        details = self._classify_extract_apply(accounts, results, apply_results)
-        self._post_ui(
-            lambda r=run_id, d=details, c=cancel_event.is_set(): self._finish(
-                extract_ok, extract_err, inject_ok, inject_err, total, len(apply_items), r, d, c,
-            )
-        )
+        finally:
+            temp_dir.cleanup()
 
     def _do_apply_existing(
         self,
@@ -1051,6 +1099,53 @@ class SpoolsSavingsView(ctk.CTkFrame):
             lambda r=run_id, c=cancel_event.is_set(): self._finish_apply_existing(ok, err, r, result, c)
         )
 
+    def _persist_generated_spools(self, country: str, results: list[SavingsAccountResult]) -> list[Path]:
+        saved: list[Path] = []
+        for result in results:
+            if result.status != SpoolSavingsStatus.OK or result.output_path is None:
+                continue
+            if not result.output_path.exists():
+                continue
+            dest = savings_output_path_for(country, result.account)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            if result.output_path != dest:
+                shutil.copy2(result.output_path, dest)
+            saved.append(dest)
+        return saved
+
+    def _persist_apply_outputs(self, country: str, results: list[SavingsAccountResult]) -> None:
+        for result in results:
+            if result.output_path is None:
+                continue
+            dest = savings_output_path_for(country, result.account)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            if result.status == SpoolSavingsStatus.OK and result.output_path.exists():
+                shutil.copy2(result.output_path, dest)
+            log_path = result.output_path.with_name(f"{result.output_path.stem}_apply.log")
+            if log_path.exists():
+                shutil.copy2(log_path, dest.with_name(f"{dest.stem}_apply.log"))
+
+    def _create_extract_archive(
+        self,
+        country: str,
+        results: list[SavingsAccountResult],
+        archive_dir: Path,
+    ) -> Path | None:
+        files = [
+            result.output_path
+            for result in results
+            if result.status == SpoolSavingsStatus.OK and result.output_path is not None and result.output_path.exists()
+        ]
+        if not files:
+            return None
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        country_part = (country or "country").title().replace(" ", "_")
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        archive_path = archive_dir / f"Savings_Spools_{country_part}_{stamp}.zip"
+        with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for path in files:
+                zf.write(path, arcname=path.name)
+        return archive_path
     @staticmethod
     def _classify_extract_apply(
         accounts: list[str],
@@ -1070,14 +1165,19 @@ class SpoolsSavingsView(ctk.CTkFrame):
         return ", ".join(accounts) if accounts else "-"
 
     def _show_extract_apply_details(self, details: dict[str, list[str]]) -> None:
-        self.result_detail_label.configure(
-            text=t(
-                "spools_savings.detail_extract_apply",
-                injected=self._format_accounts(details.get("injected", [])),
-                only_extracted=self._format_accounts(details.get("only_extracted", [])),
-                nothing=self._format_accounts(details.get("nothing", [])),
-            ),
+        text = t(
+            "spools_savings.detail_extract_apply",
+            injected=self._format_accounts(details.get("injected", [])),
+            only_extracted=self._format_accounts(details.get("only_extracted", [])),
+            nothing=self._format_accounts(details.get("nothing", [])),
         )
+        archive = details.get("archive", [])
+        if archive:
+            text += "\n" + t("spools_savings.detail_archive", file=archive[0])
+        save_error = details.get("save_error", [])
+        if save_error:
+            text += "\n" + t("spools_savings.detail_save_error", error=save_error[0])
+        self.result_detail_label.configure(text=text)
 
     def _show_apply_existing_details(self, account: str, ok: bool) -> None:
         self.result_detail_label.configure(

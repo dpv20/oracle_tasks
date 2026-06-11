@@ -138,7 +138,13 @@ def parse_account_branches(text: str) -> tuple[list[tuple[str, str]], list[str]]
     return valid, invalid
 
 
-def cl_output_folder_for(country: str, spool_kind: str = SPOOL_KIND_CONSUMER_LENDING) -> Path:
+def cl_output_folder_for(
+    country: str,
+    spool_kind: str = SPOOL_KIND_CONSUMER_LENDING,
+    output_dir: Path | None = None,
+) -> Path:
+    if output_dir is not None:
+        return Path(output_dir)
     if spool_kind == SPOOL_KIND_CMR:
         return SPOOLS_CMR_OUT_DIR
     folder = _COUNTRY_FOLDER.get(country.lower(), country.title())
@@ -150,10 +156,11 @@ def cl_output_path_for(
     account: str,
     spool_kind: str = SPOOL_KIND_CONSUMER_LENDING,
     branch: str | None = None,
+    output_dir: Path | None = None,
 ) -> Path:
     if spool_kind == SPOOL_KIND_CMR and branch:
-        return cl_output_folder_for(country, spool_kind) / f"CL_Acc_Spool_{account}_{branch.strip().upper()}.SQL"
-    return cl_output_folder_for(country, spool_kind) / f"CL_Acc_Spool_{account}.SQL"
+        return cl_output_folder_for(country, spool_kind, output_dir) / f"CL_Acc_Spool_{account}_{branch.strip().upper()}.SQL"
+    return cl_output_folder_for(country, spool_kind, output_dir) / f"CL_Acc_Spool_{account}.SQL"
 
 
 def worker_count_for(account_count: int, max_workers: int = MAX_PARALLEL_ACCOUNTS) -> int:
@@ -193,7 +200,12 @@ class SpoolCLEngine:
     def __init__(self, runner: SqlclRunner):
         self.runner = runner
 
-    def _render_template(self, country: str, spool_kind: str = SPOOL_KIND_CONSUMER_LENDING) -> Path:
+    def _render_template(
+        self,
+        country: str,
+        spool_kind: str = SPOOL_KIND_CONSUMER_LENDING,
+        output_dir: Path | None = None,
+    ) -> Path:
         """Materialize a temp .sql with the output folder rewritten.
 
         The versioned `spools_CL/*2.sql` scripts are the non-interactive originals
@@ -208,11 +220,12 @@ class SpoolCLEngine:
             "CL_Acc_Spool_&1._&2..SQL"
             if spool_kind == SPOOL_KIND_CMR else "CL_Acc_Spool_&1..SQL"
         )
-        target = cl_output_folder_for(country, spool_kind) / target_name
+        target_folder = cl_output_folder_for(country, spool_kind, output_dir)
+        target = target_folder / target_name
         if spool_kind == SPOOL_KIND_CMR:
-            text = text.replace(r"C:\Account_Spools\CL", str(SPOOLS_CMR_OUT_DIR))
+            text = text.replace(r"C:\Account_Spools\CL", str(target_folder))
         else:
-            text = text.replace(_LEGACY_SPOOL_ROOT, str(SPOOLS_CL_OUT_DIR))
+            text = text.replace(_LEGACY_SPOOL_ROOT, str(target_folder.parent if output_dir is None else target_folder))
         text = re.sub(
             r'(?im)^spool\s+"?[^"\r\n]*CL_Acc_Spool_&1\.\.SQL"?\s*$',
             lambda _m: f'spool "{target}"',
@@ -240,6 +253,7 @@ class SpoolCLEngine:
         cancel_event: threading.Event | None = None,
         branch: str | None = None,
         spool_kind: str = SPOOL_KIND_CONSUMER_LENDING,
+        output_dir: Path | None = None,
     ) -> CLAccountResult:
         status_account = account
         actual_account = account
@@ -283,7 +297,7 @@ class SpoolCLEngine:
         if on_status:
             on_status(status_account, SpoolCLStatus.RUNNING, "")
 
-        out_path = cl_output_path_for(country, actual_account, spool_kind, branch)
+        out_path = cl_output_path_for(country, actual_account, spool_kind, branch, output_dir)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         # Pre-clean stale file so existence on success means a fresh write.
         if out_path.exists():
@@ -292,7 +306,7 @@ class SpoolCLEngine:
             except OSError as e:
                 log.warning("Could not remove stale spool %s: %s", out_path, e)
 
-        rendered = self._render_template(country, spool_kind)
+        rendered = self._render_template(country, spool_kind, output_dir)
         args = [actual_account, branch] if spool_kind == SPOOL_KIND_CMR else [actual_account]
         try:
             result: RunResult = self.runner.run_script(
@@ -343,6 +357,7 @@ class SpoolCLEngine:
         cancel_event: threading.Event | None = None,
         branches: dict[str, str] | None = None,
         spool_kind: str = SPOOL_KIND_CONSUMER_LENDING,
+        output_dir: Path | None = None,
     ) -> list[CLAccountResult]:
         account_list = list(accounts)
         branch_lookup = branches or {}
@@ -360,6 +375,7 @@ class SpoolCLEngine:
                     cancel_event,
                     branch_lookup.get(acc),
                     spool_kind,
+                    output_dir,
                 )
                 results.append(result)
             return results
@@ -386,6 +402,7 @@ class SpoolCLEngine:
                     cancel_event,
                     branch_lookup.get(account_list[idx]),
                     spool_kind,
+                    output_dir,
                 )
                 pending.add(future)
                 future_to_index[future] = idx

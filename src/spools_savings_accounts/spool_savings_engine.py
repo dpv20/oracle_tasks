@@ -137,9 +137,12 @@ def parse_savings_accounts(text: str) -> tuple[list[str], list[str]]:
     return valid, invalid
 
 
-def savings_output_path_for(country: str, account: str) -> Path:
+def savings_output_path_for(country: str, account: str, output_dir: Path | None = None) -> Path:
+    filename = f"IC_account_data_{account}.INC"
+    if output_dir is not None:
+        return Path(output_dir) / filename
     folder = _COUNTRY_FOLDER.get(country.lower(), country.title())
-    return SPOOLS_SAVINGS_OUT_DIR / folder / f"IC_account_data_{account}.INC"
+    return SPOOLS_SAVINGS_OUT_DIR / folder / filename
 
 
 def worker_count_for(account_count: int, max_workers: int = MAX_PARALLEL_SAVINGS_ACCOUNTS) -> int:
@@ -449,7 +452,7 @@ select max(branch_code)
         if on_status:
             on_status(account, SpoolSavingsStatus.RUNNING, "resolving branch...")
 
-        out_path = savings_output_path_for(country, account)
+        out_path = savings_output_path_for(country, account, output_dir)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         if out_path.exists():
             try:
@@ -536,7 +539,7 @@ select max(branch_code)
             return []
         if workers == 1:
             return [
-                self.extract_one(country, account, connection, on_status, cancel_event)
+                self.extract_one(country, account, connection, on_status, cancel_event, output_dir)
                 for account in account_list
             ]
 
@@ -556,6 +559,7 @@ select max(branch_code)
                     connection,
                     on_status,
                     cancel_event,
+                    output_dir,
                 )
                 pending.add(future)
                 future_to_index[future] = idx
