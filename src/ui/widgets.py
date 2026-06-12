@@ -80,6 +80,8 @@ class AccountStatusRow(ctk.CTkFrame):
         "ready_to_inject": "⏳",
         "injecting": "📤",
         "ok":      "✅",
+        "verified": "✅✅",
+        "warning": "!",
         "error":   "❌",
         "cancelled": "➖",
     }
@@ -90,6 +92,8 @@ class AccountStatusRow(ctk.CTkFrame):
         "ready_to_inject": ("#1F6FEB", "#3FB950"),
         "injecting": ("#9333ea", "#c084fc"),
         "ok":      ("#1A7F37", "#3FB950"),
+        "verified": ("#1A7F37", "#3FB950"),
+        "warning": ("#9A6700", "#F0C36D"),
         "error":   ("#CF222E", "#FF6B6B"),
         "cancelled": ("gray45", "gray60"),
     }

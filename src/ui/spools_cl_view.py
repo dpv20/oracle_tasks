@@ -259,6 +259,7 @@ class SpoolsCLView(ctk.CTkFrame):
         self.extract_only_frame.grid(row=1, column=0, sticky="nsew", padx=(0, 6))
         self.inject_frame = ctk.CTkScrollableFrame(self.account_split, height=180)
         self.inject_frame.grid(row=1, column=1, sticky="nsew", padx=(6, 0))
+        self._bind_account_list_resize()
         self._render_pending_accounts()
 
         # ── existing spools selection card ──
@@ -470,15 +471,17 @@ class SpoolsCLView(ctk.CTkFrame):
             self.account_split.grid_columnconfigure(0, weight=1, uniform="")
             self.account_split.grid_columnconfigure(1, weight=0, uniform="")
             self.extract_only_header.grid_configure(columnspan=2, padx=(0, 0))
-            self.extract_only_frame.grid_configure(columnspan=2, padx=(0, 0))
+            self.extract_only_frame.grid(row=1, column=0, columnspan=2, sticky="nsew", padx=(0, 0))
+            self.after_idle(self._sync_account_list_widths)
             return
 
         self.account_split.grid_columnconfigure(0, weight=1, uniform="account_lists")
         self.account_split.grid_columnconfigure(1, weight=1, uniform="account_lists")
         self.extract_only_header.grid_configure(columnspan=1, padx=(0, 6))
-        self.extract_only_frame.grid_configure(columnspan=1, padx=(0, 6))
+        self.extract_only_frame.grid(row=1, column=0, columnspan=1, sticky="nsew", padx=(0, 6))
         self.inject_header.grid(row=0, column=1, sticky="ew", padx=(6, 0), pady=(0, 4))
         self.inject_frame.grid(row=1, column=1, sticky="nsew", padx=(6, 0))
+        self.after_idle(self._sync_account_list_widths)
 
     def _apply_spool_type_visibility(self) -> None:
         if self._selected_country_id() != "chile":
@@ -959,6 +962,8 @@ class SpoolsCLView(ctk.CTkFrame):
         return f"{account}  {branch}" if branch else account
 
     def _render_pending_accounts(self) -> None:
+        for frame in (self.extract_only_frame, self.inject_frame):
+            setattr(frame, "_oracle_tasks_row_layout_state", None)
         for w in self.extract_only_frame.winfo_children():
             w.destroy()
         for w in self.inject_frame.winfo_children():
@@ -973,39 +978,88 @@ class SpoolsCLView(ctk.CTkFrame):
         for acc in inject_accounts:
             self._render_inject_row(self.inject_frame, acc)
         self._refresh_run_button()
+        self.after_idle(self._sync_account_list_widths)
+        self.after(50, self._sync_account_list_widths)
+
+    def _bind_account_list_resize(self) -> None:
+        for frame in (self.extract_only_frame, self.inject_frame):
+            canvas = getattr(frame, "_parent_canvas", None)
+            parent_frame = getattr(frame, "_parent_frame", None)
+            if canvas is not None:
+                canvas.bind(
+                    "<Configure>",
+                    lambda _event, f=frame: self.after_idle(lambda frame=f: self._sync_account_list_width(frame)),
+                    add="+",
+                )
+            if parent_frame is not None:
+                parent_frame.bind(
+                    "<Configure>",
+                    lambda _event, f=frame: self.after_idle(lambda frame=f: self._sync_account_list_width(frame)),
+                    add="+",
+                )
+
+    def _sync_account_list_widths(self) -> None:
+        for frame in (self.extract_only_frame, self.inject_frame):
+            self._sync_account_list_width(frame)
+
+    @staticmethod
+    def _sync_account_list_width(frame) -> None:
+        try:
+            canvas = getattr(frame, "_parent_canvas", None)
+            window_id = getattr(frame, "_create_window_id", None)
+            if canvas is None or window_id is None:
+                return
+            width = max(120, canvas.winfo_width())
+            children = frame.winfo_children()
+            layout_state = (width, len(children))
+            if getattr(frame, "_oracle_tasks_row_layout_state", None) == layout_state:
+                return
+            setattr(frame, "_oracle_tasks_row_layout_state", layout_state)
+            canvas.itemconfigure(window_id, width=width)
+            for child in children:
+                if isinstance(child, ctk.CTkFrame):
+                    child.configure(height=45)
+                    child.pack_configure(fill="x", padx=4, pady=2)
+                    child.pack_propagate(False)
+        except tk.TclError:
+            return
 
     def _render_extract_row(self, parent, account: str) -> None:
-        row = ctk.CTkFrame(parent, fg_color=("gray92", "gray18"), corner_radius=4)
+        row = ctk.CTkFrame(parent, fg_color=("gray92", "gray18"), corner_radius=4, height=45)
         row.pack(fill="x", padx=4, pady=2)
+        row.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(
             row, text=self._account_label(account), anchor="w",
             font=ctk.CTkFont(family="Consolas", size=12),
-        ).pack(side="left", padx=(10, 6), pady=4, fill="x", expand=True)
+        ).grid(row=0, column=0, padx=(10, 6), pady=4, sticky="ew")
+        button_col = 1
         ctk.CTkButton(
             row, text="x", width=32, height=24,
             fg_color=("#D9534F", "#A8322C"), hover_color=("#C9302C", "#8B1F1A"),
             text_color="white",
             command=lambda a=account: self._remove_pending(a),
-        ).pack(side="right", padx=(4, 8), pady=4)
+        ).grid(row=0, column=button_col, padx=(4, 8), pady=4, sticky="e")
+        button_col += 1
         if not self._is_extract_only_mode() and not self._inject_flags.get(account, False):
             ctk.CTkButton(
                 row, text=t("spools_cl.move_to_inject"), width=90, height=24,
                 command=lambda a=account: self._set_inject_flag(a, True),
-            ).pack(side="right", padx=4, pady=4)
+            ).grid(row=0, column=button_col, padx=4, pady=4, sticky="e")
 
     def _render_inject_row(self, parent, account: str) -> None:
-        row = ctk.CTkFrame(parent, fg_color=("gray92", "gray18"), corner_radius=4)
+        row = ctk.CTkFrame(parent, fg_color=("gray92", "gray18"), corner_radius=4, height=45)
         row.pack(fill="x", padx=4, pady=2)
+        row.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(
             row, text=self._account_label(account), anchor="w",
             font=ctk.CTkFont(family="Consolas", size=12),
-        ).pack(side="left", padx=(10, 6), pady=4, fill="x", expand=True)
+        ).grid(row=0, column=0, padx=(10, 6), pady=4, sticky="ew")
         ctk.CTkButton(
             row, text="x", width=32, height=24,
             fg_color=("#D9534F", "#A8322C"), hover_color=("#C9302C", "#8B1F1A"),
             text_color="white",
             command=lambda a=account: self._set_inject_flag(a, False),
-        ).pack(side="right", padx=(4, 8), pady=4)
+        ).grid(row=0, column=1, padx=(4, 8), pady=4, sticky="e")
 
     def _refresh_run_button(self) -> None:
         if not hasattr(self, "run_btn"):
@@ -1291,8 +1345,11 @@ class SpoolsCLView(ctk.CTkFrame):
         workers = worker_count_for(total, MAX_PARALLEL_ACCOUNTS)
         log.info("Starting spool extraction batch: accounts=%s workers=%s", total, workers)
         inject_set = set(inject_accounts)
-        temp_dir = tempfile.TemporaryDirectory(prefix="oracle_tasks_cl_")
-        working_dir = Path(temp_dir.name)
+        temp_dir = None
+        working_dir: Path | None = None
+        if extract_archive_dir is not None:
+            temp_dir = tempfile.TemporaryDirectory(prefix="oracle_tasks_cl_")
+            working_dir = Path(temp_dir.name)
 
         def on_extract_status(account: str, status: SpoolCLStatus, msg: str) -> None:
             display = msg
@@ -1409,7 +1466,8 @@ class SpoolsCLView(ctk.CTkFrame):
                 )
             )
         finally:
-            temp_dir.cleanup()
+            if temp_dir is not None:
+                temp_dir.cleanup()
 
     def _do_apply_existing(
         self,

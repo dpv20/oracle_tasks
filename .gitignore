@@ -40,6 +40,7 @@ sqlcl-latest.zip
 # Local temp folders
 tmp*/
 temp_savings/
+outputs/
 
 
 
@@ -48,6 +49,7 @@ spools_CL/spools_files/
 cuenta_prod_a_QA.txt
 pantalla_*.png
 tnsnames.ora
+assets/new_icon_backup.png
 
 # Internal project docs (kept local, not for end users)
 agent.md

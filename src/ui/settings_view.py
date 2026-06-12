@@ -262,23 +262,40 @@ class SettingsView(ctk.CTkFrame):
             command=self._on_detect_sqlcl,
         ).grid(row=6, column=2, padx=5, pady=2)
 
+        self.verify_savings_apply_var = ctk.BooleanVar(
+            value=bool(self.app.config.get("verify_savings_apply", False)),
+        )
+        ctk.CTkCheckBox(
+            wrap,
+            text=t("settings.general.verify_savings_apply"),
+            variable=self.verify_savings_apply_var,
+        ).grid(row=7, column=0, columnspan=3, sticky="w", padx=20, pady=(10, 2))
+        ctk.CTkLabel(
+            wrap,
+            text=t("settings.general.verify_savings_apply_help"),
+            anchor="w",
+            justify="left",
+            text_color=("gray40", "gray65"),
+            wraplength=760,
+        ).grid(row=8, column=0, columnspan=3, sticky="ew", padx=20, pady=(0, 4))
+
         # Test connection
         SectionLabel(wrap, text=t("settings.general.test_section")).grid(
-            row=7, column=0, columnspan=3, sticky="w", pady=(15, 4),
+            row=9, column=0, columnspan=3, sticky="w", pady=(15, 4),
         )
         self._test_options = self._collect_test_options()
         values = [opt[0] for opt in self._test_options] or [t("settings.general.test_no_creds")]
         self.test_db_select = ctk.CTkOptionMenu(wrap, values=values)
-        self.test_db_select.grid(row=8, column=0, columnspan=2, sticky="ew", padx=20, pady=2)
+        self.test_db_select.grid(row=10, column=0, columnspan=2, sticky="ew", padx=20, pady=2)
         ctk.CTkButton(
             wrap, text=t("settings.general.test"), width=100,
             command=self._on_test_connection,
-        ).grid(row=8, column=2, padx=5, pady=2)
+        ).grid(row=10, column=2, padx=5, pady=2)
         self.test_status_label = ctk.CTkLabel(
             wrap, text="", anchor="w", justify="left",
             font=ctk.CTkFont(family="Consolas", size=11),
         )
-        self.test_status_label.grid(row=9, column=0, columnspan=3, sticky="ew", padx=20, pady=(2, 4))
+        self.test_status_label.grid(row=11, column=0, columnspan=3, sticky="ew", padx=20, pady=(2, 4))
 
         wrap.grid_columnconfigure(0, weight=1)
         wrap.grid_columnconfigure(1, weight=1)
@@ -387,6 +404,7 @@ class SettingsView(ctk.CTkFrame):
 
     def _on_apply_general(self):
         self.app.config.set("sqlcl_path", self.sqlcl_entry.get().strip())
+        self.app.config.set("verify_savings_apply", bool(self.verify_savings_apply_var.get()))
         messagebox.showinfo(t("common.info"), t("settings.cred.saved"))
 
     # ── About tab ──

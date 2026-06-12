@@ -4,13 +4,14 @@ Passwords inside credential dicts are encrypted with DPAPI before being written
 to disk and decrypted on read. Encryption is per-Windows-user, so the file is
 unreadable by other accounts on the same machine.
 
-Config schema (v3):
+Config schema (v4):
 {
-  "version": 3,
+  "version": 4,
   "language": "en" | "es",
   "theme": "light" | "dark",
   "sqlcl_path": "<absolute path to sql.exe>",
   "spools_cl_output_dir": "<override; empty = use default in DATA_DIR>",
+  "verify_savings_apply": false,
   "credentials": {
       "chile": {
           "CHILE_QA_19C": {
@@ -35,11 +36,12 @@ from paths import CONFIG_DIR, CONFIG_FILE
 log = logging.getLogger(__name__)
 
 DEFAULTS: dict[str, Any] = {
-    "version": 3,
+    "version": 4,
     "language": "en",
     "theme": "light",
     "sqlcl_path": "",
     "spools_cl_output_dir": "",
+    "verify_savings_apply": False,
     "credentials": {
         "chile": {},
         "peru": {},
@@ -115,6 +117,7 @@ class ConfigManager:
 
     def _merge_defaults(self, loaded: dict[str, Any]) -> dict[str, Any]:
         """Deep-merge loaded config over DEFAULTS and migrate legacy credentials."""
+        loaded_version = int(loaded.get("version") or 0)
         merged = deepcopy(DEFAULTS)
         for k, v in loaded.items():
             if k == "credentials":
@@ -124,6 +127,8 @@ class ConfigManager:
                 merged[k] = {**merged[k], **v}
             else:
                 merged[k] = v
+        if loaded_version < 4:
+            merged["verify_savings_apply"] = False
         merged["version"] = DEFAULTS["version"]
         return merged
 

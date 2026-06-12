@@ -61,7 +61,18 @@ _PRIMARY_BUTTON_FG = ("#1F6FEB", "#1A5BBF")
 _PRIMARY_BUTTON_HOVER = ("#1A5BBF", "#154A9F")
 _CANCEL_BUTTON_FG = ("#D9534F", "#A8322C")
 _CANCEL_BUTTON_HOVER = ("#C9302C", "#8B1F1A")
-_TERMINAL_STATUSES = {SpoolSavingsStatus.OK, SpoolSavingsStatus.ERROR, SpoolSavingsStatus.CANCELLED}
+_TERMINAL_STATUSES = {
+    SpoolSavingsStatus.OK,
+    SpoolSavingsStatus.VERIFIED,
+    SpoolSavingsStatus.WARNING,
+    SpoolSavingsStatus.ERROR,
+    SpoolSavingsStatus.CANCELLED,
+}
+_APPLY_SUCCESS_STATUSES = {
+    SpoolSavingsStatus.OK,
+    SpoolSavingsStatus.VERIFIED,
+    SpoolSavingsStatus.WARNING,
+}
 _BULK_DIALOG_SIZE = (560, 430)
 
 
@@ -219,6 +230,7 @@ class SpoolsSavingsView(ctk.CTkFrame):
         self.extract_only_frame.grid(row=1, column=0, sticky="nsew", padx=(0, 6))
         self.inject_frame = ctk.CTkScrollableFrame(self.account_split, height=180)
         self.inject_frame.grid(row=1, column=1, sticky="nsew", padx=(6, 0))
+        self._bind_account_list_resize()
         self._render_pending_accounts()
 
         # ── actions ──
@@ -356,15 +368,17 @@ class SpoolsSavingsView(ctk.CTkFrame):
             self.account_split.grid_columnconfigure(0, weight=1, uniform="")
             self.account_split.grid_columnconfigure(1, weight=0, uniform="")
             self.extract_only_header.grid_configure(columnspan=2, padx=(0, 0))
-            self.extract_only_frame.grid_configure(columnspan=2, padx=(0, 0))
+            self.extract_only_frame.grid(row=1, column=0, columnspan=2, sticky="nsew", padx=(0, 0))
+            self.after_idle(self._sync_account_list_widths)
             return
 
         self.account_split.grid_columnconfigure(0, weight=1, uniform="savings_account_lists")
         self.account_split.grid_columnconfigure(1, weight=1, uniform="savings_account_lists")
         self.extract_only_header.grid_configure(columnspan=1, padx=(0, 6))
-        self.extract_only_frame.grid_configure(columnspan=1, padx=(0, 6))
+        self.extract_only_frame.grid(row=1, column=0, columnspan=1, sticky="nsew", padx=(0, 6))
         self.inject_header_bar.grid(row=0, column=1, sticky="ew", padx=(6, 0), pady=(0, 4))
         self.inject_frame.grid(row=1, column=1, sticky="nsew", padx=(6, 0))
+        self.after_idle(self._sync_account_list_widths)
 
     def _show_accounts_card(self) -> None:
         self.results_card.pack_forget()
@@ -618,6 +632,8 @@ class SpoolsSavingsView(ctk.CTkFrame):
         return [acc for acc in self._pending_accounts if self._inject_flags.get(acc, False)]
 
     def _render_pending_accounts(self) -> None:
+        for frame in (self.extract_only_frame, self.inject_frame):
+            setattr(frame, "_oracle_tasks_row_layout_state", None)
         for w in self.extract_only_frame.winfo_children():
             w.destroy()
         for w in self.inject_frame.winfo_children():
@@ -631,16 +647,63 @@ class SpoolsSavingsView(ctk.CTkFrame):
         for acc in inject_accounts:
             self._render_inject_row(self.inject_frame, acc)
         self._refresh_run_button()
+        self.after_idle(self._sync_account_list_widths)
+        self.after(50, self._sync_account_list_widths)
+
+    def _bind_account_list_resize(self) -> None:
+        for frame in (self.extract_only_frame, self.inject_frame):
+            canvas = getattr(frame, "_parent_canvas", None)
+            parent_frame = getattr(frame, "_parent_frame", None)
+            if canvas is not None:
+                canvas.bind(
+                    "<Configure>",
+                    lambda _event, f=frame: self.after_idle(lambda frame=f: self._sync_account_list_width(frame)),
+                    add="+",
+                )
+            if parent_frame is not None:
+                parent_frame.bind(
+                    "<Configure>",
+                    lambda _event, f=frame: self.after_idle(lambda frame=f: self._sync_account_list_width(frame)),
+                    add="+",
+                )
+
+    def _sync_account_list_widths(self) -> None:
+        for frame in (self.extract_only_frame, self.inject_frame):
+            self._sync_account_list_width(frame)
+
+    @staticmethod
+    def _sync_account_list_width(frame) -> None:
+        try:
+            canvas = getattr(frame, "_parent_canvas", None)
+            window_id = getattr(frame, "_create_window_id", None)
+            if canvas is None or window_id is None:
+                return
+            width = max(120, canvas.winfo_width())
+            children = frame.winfo_children()
+            layout_state = (width, len(children))
+            if getattr(frame, "_oracle_tasks_row_layout_state", None) == layout_state:
+                return
+            setattr(frame, "_oracle_tasks_row_layout_state", layout_state)
+            canvas.itemconfigure(window_id, width=width)
+            for child in children:
+                if isinstance(child, ctk.CTkFrame):
+                    child.configure(height=45)
+                    child.pack_configure(fill="x", padx=4, pady=2)
+                    child.pack_propagate(False)
+        except tk.TclError:
+            return
 
     def _render_extract_row(self, parent, account: str) -> None:
-        row = ctk.CTkFrame(parent, fg_color=("gray92", "gray18"), corner_radius=4)
+        row = ctk.CTkFrame(parent, fg_color=("gray92", "gray18"), corner_radius=4, height=45)
         row.pack(fill="x", padx=4, pady=2)
+        row.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(
             row,
             text=account,
             anchor="w",
             font=ctk.CTkFont(family="Consolas", size=12),
-        ).pack(side="left", padx=(10, 6), pady=4, fill="x", expand=True)
+        ).grid(row=0, column=0, padx=(10, 6), pady=4, sticky="ew")
+        button_col = 1
         ctk.CTkButton(
             row,
             text="x",
@@ -650,7 +713,8 @@ class SpoolsSavingsView(ctk.CTkFrame):
             hover_color=("#C9302C", "#8B1F1A"),
             text_color="white",
             command=lambda a=account: self._remove_pending(a),
-        ).pack(side="right", padx=(4, 8), pady=4)
+        ).grid(row=0, column=button_col, padx=(4, 8), pady=4, sticky="e")
+        button_col += 1
         if not self._is_extract_only_mode() and not self._inject_flags.get(account, False):
             ctk.CTkButton(
                 row,
@@ -658,17 +722,18 @@ class SpoolsSavingsView(ctk.CTkFrame):
                 width=90,
                 height=24,
                 command=lambda a=account: self._set_inject_flag(a, True),
-            ).pack(side="right", padx=4, pady=4)
+            ).grid(row=0, column=button_col, padx=4, pady=4, sticky="e")
 
     def _render_inject_row(self, parent, account: str) -> None:
-        row = ctk.CTkFrame(parent, fg_color=("gray92", "gray18"), corner_radius=4)
+        row = ctk.CTkFrame(parent, fg_color=("gray92", "gray18"), corner_radius=4, height=45)
         row.pack(fill="x", padx=4, pady=2)
+        row.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(
             row,
             text=account,
             anchor="w",
             font=ctk.CTkFont(family="Consolas", size=12),
-        ).pack(side="left", padx=(10, 6), pady=4, fill="x", expand=True)
+        ).grid(row=0, column=0, padx=(10, 6), pady=4, sticky="ew")
         ctk.CTkButton(
             row,
             text="x",
@@ -678,7 +743,7 @@ class SpoolsSavingsView(ctk.CTkFrame):
             hover_color=("#C9302C", "#8B1F1A"),
             text_color="white",
             command=lambda a=account: self._set_inject_flag(a, False),
-        ).pack(side="right", padx=(4, 8), pady=4)
+        ).grid(row=0, column=1, padx=(4, 8), pady=4, sticky="e")
 
     def _refresh_run_button(self) -> None:
         if not hasattr(self, "run_btn") or self._running:
@@ -816,6 +881,7 @@ class SpoolsSavingsView(ctk.CTkFrame):
         self.summary_label.configure(text=t("spools_savings.extracting", done=0, total=len(accounts)))
         extract_max_workers = MAX_PARALLEL_SAVINGS_ACCOUNTS
         inject_max_workers = 1 if self.serial_accounts_var.get() else MAX_PARALLEL_SAVINGS_ACCOUNTS
+        verify_after_apply = bool(self.app.config.get("verify_savings_apply", False))
 
         threading.Thread(
             target=self._do_run,
@@ -830,6 +896,7 @@ class SpoolsSavingsView(ctk.CTkFrame):
                 cancel_event,
                 extract_max_workers,
                 inject_max_workers,
+                verify_after_apply,
                 extract_archive_dir,
             ),
             daemon=True,
@@ -895,10 +962,11 @@ class SpoolsSavingsView(ctk.CTkFrame):
         self.result_detail_label.configure(text="")
         self._set_run_button_running(True)
         self.summary_label.configure(text=t("spools_savings.injecting", done=0, total=1))
+        verify_after_apply = bool(self.app.config.get("verify_savings_apply", False))
 
         threading.Thread(
             target=self._do_apply_existing,
-            args=(run_id, account, spool_path, dest_connection, sqlcl_path, cancel_event),
+            args=(run_id, account, spool_path, dest_connection, sqlcl_path, cancel_event, verify_after_apply),
             daemon=True,
         ).start()
 
@@ -949,6 +1017,7 @@ class SpoolsSavingsView(ctk.CTkFrame):
         cancel_event: threading.Event,
         extract_max_workers: int,
         inject_max_workers: int,
+        verify_after_apply: bool,
         extract_archive_dir: Path | None,
     ) -> None:
         engine = SpoolSavingsEngine(SqlclRunner(sqlcl_path))
@@ -1032,7 +1101,11 @@ class SpoolsSavingsView(ctk.CTkFrame):
                 if status == SpoolSavingsStatus.RUNNING:
                     display = t("spools_savings.status_injecting")
                 elif status == SpoolSavingsStatus.OK:
-                    display = t("spools_savings.status_injected")
+                    display = msg or t("spools_savings.status_injected")
+                elif status == SpoolSavingsStatus.VERIFIED:
+                    display = msg or t("spools_savings.status_verified")
+                elif status == SpoolSavingsStatus.WARNING:
+                    display = msg or t("spools_savings.status_injected_warning")
                 elif status == SpoolSavingsStatus.CANCELLED:
                     display = t("spools_savings.status_cancelled")
                 self._post_ui(
@@ -1046,8 +1119,9 @@ class SpoolsSavingsView(ctk.CTkFrame):
                 on_apply_status,
                 max_workers=inject_max_workers,
                 cancel_event=cancel_event,
+                verify_after_apply=verify_after_apply,
             )
-            inject_ok = sum(1 for result in apply_results if result.status == SpoolSavingsStatus.OK)
+            inject_ok = sum(1 for result in apply_results if result.status in _APPLY_SUCCESS_STATUSES)
             inject_err = len(apply_items) - inject_ok
             details = self._classify_extract_apply(accounts, results, apply_results)
             if not cancel_event.is_set():
@@ -1076,6 +1150,7 @@ class SpoolsSavingsView(ctk.CTkFrame):
         dest_connection: str,
         sqlcl_path: str,
         cancel_event: threading.Event,
+        verify_after_apply: bool,
     ) -> None:
         engine = SpoolSavingsEngine(SqlclRunner(sqlcl_path))
         log.info("Starting existing Savings apply: account=%s spool=%s", account, spool_path)
@@ -1085,7 +1160,11 @@ class SpoolsSavingsView(ctk.CTkFrame):
             if status == SpoolSavingsStatus.RUNNING:
                 display = t("spools_savings.status_injecting")
             elif status == SpoolSavingsStatus.OK:
-                display = t("spools_savings.status_injected")
+                display = msg or t("spools_savings.status_injected")
+            elif status == SpoolSavingsStatus.VERIFIED:
+                display = msg or t("spools_savings.status_verified")
+            elif status == SpoolSavingsStatus.WARNING:
+                display = msg or t("spools_savings.status_injected_warning")
             elif status == SpoolSavingsStatus.CANCELLED:
                 display = t("spools_savings.status_cancelled")
             self._post_ui(
@@ -1093,9 +1172,16 @@ class SpoolsSavingsView(ctk.CTkFrame):
                     self._apply_status(a, s, m, 1, "spools_savings.injecting", r, "apply_existing")
             )
 
-        result = engine.apply_one(account, dest_connection, spool_path, on_apply_status, cancel_event)
-        ok = 1 if result.status == SpoolSavingsStatus.OK else 0
-        err = 0 if result.status == SpoolSavingsStatus.OK else 1
+        result = engine.apply_one(
+            account,
+            dest_connection,
+            spool_path,
+            on_apply_status,
+            cancel_event,
+            verify_after_apply=verify_after_apply,
+        )
+        ok = 1 if result.status in _APPLY_SUCCESS_STATUSES else 0
+        err = 0 if result.status in _APPLY_SUCCESS_STATUSES else 1
         self._post_ui(
             lambda r=run_id, c=cancel_event.is_set(): self._finish_apply_existing(ok, err, r, result, c)
         )
@@ -1120,7 +1206,7 @@ class SpoolsSavingsView(ctk.CTkFrame):
                 continue
             dest = savings_output_path_for(country, result.account)
             dest.parent.mkdir(parents=True, exist_ok=True)
-            if result.status == SpoolSavingsStatus.OK and result.output_path.exists():
+            if result.status in _APPLY_SUCCESS_STATUSES and result.output_path.exists():
                 shutil.copy2(result.output_path, dest)
             log_path = result.output_path.with_name(f"{result.output_path.stem}_apply.log")
             if log_path.exists():
@@ -1154,7 +1240,11 @@ class SpoolsSavingsView(ctk.CTkFrame):
         apply_results: list[SavingsAccountResult],
     ) -> dict[str, list[str]]:
         extracted_ok = {result.account for result in extract_results if result.status == SpoolSavingsStatus.OK}
-        injected_ok = {result.account for result in apply_results if result.status == SpoolSavingsStatus.OK}
+        injected_ok = {
+            result.account
+            for result in apply_results
+            if result.status in _APPLY_SUCCESS_STATUSES
+        }
         return {
             "injected": [acc for acc in accounts if acc in injected_ok],
             "only_extracted": [acc for acc in accounts if acc in extracted_ok and acc not in injected_ok],
@@ -1288,7 +1378,7 @@ class SpoolsSavingsView(ctk.CTkFrame):
         self._active_summary_phase = None
         self._cancel_event = None
         self._set_run_button_running(False)
-        self._show_apply_existing_details(result.account, result.status == SpoolSavingsStatus.OK)
+        self._show_apply_existing_details(result.account, result.status in _APPLY_SUCCESS_STATUSES)
         if cancelled:
             self.summary_label.configure(text=t("spools_savings.summary_apply_existing_cancelled"))
             return

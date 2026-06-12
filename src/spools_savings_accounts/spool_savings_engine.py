@@ -30,8 +30,10 @@ class SpoolSavingsStatus(str, Enum):
     PENDING = "pending"
     RUNNING = "running"
     OK = "ok"
+    VERIFIED = "verified"
     ERROR = "error"
     CANCELLED = "cancelled"
+    WARNING = "warning"
 
 
 @dataclass
@@ -367,7 +369,7 @@ select max(branch_code)
         connection: str,
         spool_path: Path,
         cancel_event: threading.Event | None = None,
-    ) -> tuple[bool, str]:
+    ) -> tuple[str, str]:
         expected, branch = _inspect_spool(spool_path)
         selects: list[str] = []
         for label, table, account_col, branch_col in _VERIFY_TABLE_SPECS:
@@ -383,13 +385,13 @@ select max(branch_code)
             cancel_event=cancel_event,
         )
         if result.exit_code == 130 or _is_cancelled(cancel_event):
-            return False, "verification cancelled"
+            return "unavailable", "verification cancelled"
         if not result.ok:
-            return False, f"verification query failed: {_tail_error(result)}"
+            return "unavailable", f"verification query failed: {_tail_error(result)}"
 
         critical = _critical_sqlcl_error(result)
         if critical:
-            return False, f"verification query failed: {critical}"
+            return "unavailable", f"verification query failed: {critical}"
 
         actual: dict[str, int] = {}
         for line in (result.stdout or "").splitlines():
@@ -414,14 +416,14 @@ select max(branch_code)
 
         if failures:
             suffix = f" for branch {branch}" if branch else ""
-            return False, "post-apply verification failed" + suffix + ": " + "; ".join(failures[:8])
+            return "failed", "post-apply verification failed" + suffix + ": " + "; ".join(failures[:8])
 
         compared = ", ".join(
             f"{table}={expected[table]}"
             for table in _VERIFY_TABLES
             if expected.get(table, 0) > 0
         )
-        return True, f"verified key tables{(' for branch ' + branch) if branch else ''}: {compared or 'existence checks only'}"
+        return "ok", f"verified key tables{(' for branch ' + branch) if branch else ''}: {compared or 'existence checks only'}"
 
     def extract_one(
         self,
@@ -430,6 +432,7 @@ select max(branch_code)
         connection: str,
         on_status: SavingsStatusCallback | None = None,
         cancel_event: threading.Event | None = None,
+        output_dir: Path | None = None,
     ) -> SavingsAccountResult:
         if _is_cancelled(cancel_event):
             r = _cancelled_result(account)
@@ -532,6 +535,7 @@ select max(branch_code)
         on_status: SavingsStatusCallback | None = None,
         max_workers: int = MAX_PARALLEL_SAVINGS_ACCOUNTS,
         cancel_event: threading.Event | None = None,
+        output_dir: Path | None = None,
     ) -> list[SavingsAccountResult]:
         account_list = list(accounts)
         workers = worker_count_for(len(account_list), max_workers)
@@ -599,6 +603,7 @@ select max(branch_code)
         spool_path: Path,
         on_status: SavingsStatusCallback | None = None,
         cancel_event: threading.Event | None = None,
+        verify_after_apply: bool = True,
     ) -> SavingsAccountResult:
         if _is_cancelled(cancel_event):
             r = _cancelled_result(account, spool_path)
@@ -645,19 +650,11 @@ select max(branch_code)
                 on_status(account, r.status, r.error)
             return r
 
-        if on_status:
-            on_status(account, SpoolSavingsStatus.RUNNING, "verifying...")
-        verified, verification_message = self._verify_account_apply(
-            account,
-            connection,
-            spool_path,
-            cancel_event,
-        )
         final_marker_seen, progress_message = _db_progress(result)
         requires_final_marker = _requires_final_db_marker(spool_path)
 
         if not result.ok:
-            error = f"{_tail_error(result)}. {progress_message}.{log_hint} {verification_message}".strip()
+            error = f"{_tail_error(result)}. {progress_message}.{log_hint}".strip()
             r = SavingsAccountResult(account, SpoolSavingsStatus.ERROR, output_path=spool_path, error=error)
             if on_status:
                 on_status(account, r.status, r.error)
@@ -665,27 +662,50 @@ select max(branch_code)
 
         critical = _critical_sqlcl_error(result)
         if critical:
-            error = f"{critical}. {progress_message}.{log_hint} {verification_message}".strip()
+            error = f"{critical}. {progress_message}.{log_hint}".strip()
             r = SavingsAccountResult(account, SpoolSavingsStatus.ERROR, output_path=spool_path, error=error)
             if on_status:
                 on_status(account, r.status, r.error)
             return r
 
         if requires_final_marker and not final_marker_seen:
-            error = f"Apply did not reach final DB marker. {progress_message}.{log_hint} {verification_message}".strip()
+            error = f"Apply did not reach final DB marker. {progress_message}.{log_hint}".strip()
             r = SavingsAccountResult(account, SpoolSavingsStatus.ERROR, output_path=spool_path, error=error)
             if on_status:
                 on_status(account, r.status, r.error)
             return r
 
-        if not verified:
+        if not verify_after_apply:
+            message = f"injected; post-apply verification disabled.{log_hint}".strip()
+            r = SavingsAccountResult(account, SpoolSavingsStatus.OK, output_path=spool_path)
+            if on_status:
+                on_status(account, r.status, message)
+            return r
+
+        if on_status:
+            on_status(account, SpoolSavingsStatus.RUNNING, "verifying...")
+        verify_status, verification_message = self._verify_account_apply(
+            account,
+            connection,
+            spool_path,
+            cancel_event,
+        )
+
+        if verify_status == "failed":
             error = f"{verification_message}. {progress_message}.{log_hint}".strip()
             r = SavingsAccountResult(account, SpoolSavingsStatus.ERROR, output_path=spool_path, error=error)
             if on_status:
                 on_status(account, r.status, r.error)
             return r
 
-        r = SavingsAccountResult(account, SpoolSavingsStatus.OK, output_path=spool_path)
+        if verify_status == "unavailable":
+            warning = f"Warning: apply finished, but verification could not run. {verification_message}.{log_hint}".strip()
+            r = SavingsAccountResult(account, SpoolSavingsStatus.WARNING, output_path=spool_path, error=warning)
+            if on_status:
+                on_status(account, r.status, warning)
+            return r
+
+        r = SavingsAccountResult(account, SpoolSavingsStatus.VERIFIED, output_path=spool_path)
         if on_status:
             on_status(account, r.status, verification_message)
         return r
@@ -697,6 +717,7 @@ select max(branch_code)
         on_status: SavingsStatusCallback | None = None,
         max_workers: int = MAX_PARALLEL_SAVINGS_ACCOUNTS,
         cancel_event: threading.Event | None = None,
+        verify_after_apply: bool = True,
     ) -> list[SavingsAccountResult]:
         item_list = list(items)
         workers = worker_count_for(len(item_list), max_workers)
@@ -704,7 +725,14 @@ select max(branch_code)
             return []
         if workers == 1:
             return [
-                self.apply_one(account, connection, spool_path, on_status, cancel_event)
+                self.apply_one(
+                    account,
+                    connection,
+                    spool_path,
+                    on_status,
+                    cancel_event,
+                    verify_after_apply,
+                )
                 for account, spool_path in item_list
             ]
 
@@ -725,6 +753,7 @@ select max(branch_code)
                     spool_path,
                     on_status,
                     cancel_event,
+                    verify_after_apply,
                 )
                 pending.add(future)
                 future_to_index[future] = idx
