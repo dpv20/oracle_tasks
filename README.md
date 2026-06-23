@@ -81,6 +81,10 @@ In **Apply existing**, choose **Consumer Lending** or **CMR** when Chile is
 selected, then browse one or more existing `.SQL` files and apply them to the
 destination DB in one batch.
 
+Savings apply always injects one account at a time. Savings inserts ignore
+duplicate-key rows (`DUP_VAL_ON_INDEX`) so reapplying into QA does not fail on
+shared setup data that already exists; other SQL errors still surface.
+
 The resulting `.SQL` files land in:
 `%LOCALAPPDATA%\OracleTasksChile\spools_CL_out\<Country>\CL_Acc_Spool_<account>.SQL`
 
