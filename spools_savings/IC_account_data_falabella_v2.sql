@@ -303,8 +303,13 @@ declare
         p_count in pls_integer
     ) is
     begin
+        put_line('BEGIN');
         emit_token_list('INSERT INTO ' || upper(p_table) || '(', p_cols, p_count, ')');
         emit_token_list(' VALUES (', p_vals, p_count, ');');
+        put_line('EXCEPTION');
+        put_line('  WHEN DUP_VAL_ON_INDEX THEN NULL;');
+        put_line('END;');
+        put_line('/');
         put_line(null);
         note_dml('insert ' || upper(p_table));
     end emit_insert;

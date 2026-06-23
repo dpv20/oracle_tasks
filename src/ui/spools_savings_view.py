@@ -92,7 +92,7 @@ class SpoolsSavingsView(ctk.CTkFrame):
         self._dest_db_lookup: dict[str, dict] = {}
         self._country_lookup: dict[str, str] = {}
         self._existing_spool_path: Path | None = None
-        self.serial_accounts_var = tk.BooleanVar(value=False)
+        self.serial_accounts_var = tk.BooleanVar(value=True)
 
         # ── header ──
         header = ctk.CTkFrame(self, fg_color="transparent")
@@ -223,6 +223,7 @@ class SpoolsSavingsView(ctk.CTkFrame):
             text=t("spools_savings.serial_accounts"),
             variable=self.serial_accounts_var,
             width=150,
+            state="disabled",
         )
         self.serial_accounts_check.pack(side="right", padx=(8, 0))
 
@@ -770,7 +771,7 @@ class SpoolsSavingsView(ctk.CTkFrame):
             )
             return
         if hasattr(self, "serial_accounts_check"):
-            self.serial_accounts_check.configure(state="normal")
+            self.serial_accounts_check.configure(state="disabled")
         self.run_btn.configure(
             command=self._on_run,
             state="normal",
@@ -880,7 +881,7 @@ class SpoolsSavingsView(ctk.CTkFrame):
         self._set_run_button_running(True)
         self.summary_label.configure(text=t("spools_savings.extracting", done=0, total=len(accounts)))
         extract_max_workers = MAX_PARALLEL_SAVINGS_ACCOUNTS
-        inject_max_workers = 1 if self.serial_accounts_var.get() else MAX_PARALLEL_SAVINGS_ACCOUNTS
+        inject_max_workers = 1
         verify_after_apply = bool(self.app.config.get("verify_savings_apply", False))
 
         threading.Thread(

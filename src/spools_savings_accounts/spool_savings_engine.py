@@ -159,6 +159,34 @@ def _with_exit(sql_text: str) -> str:
     return sql_text.rstrip() + "\nexit;\n"
 
 
+def _ignore_duplicate_inserts(sql_text: str) -> str:
+    if "DUP_VAL_ON_INDEX" in sql_text:
+        return sql_text
+
+    lines = sql_text.splitlines()
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if (
+            re.match(r"^\s*INSERT\s+INTO\b", line, re.IGNORECASE)
+            and i + 1 < len(lines)
+            and re.match(r"^\s*VALUES\b", lines[i + 1], re.IGNORECASE)
+        ):
+            out.append("BEGIN")
+            out.append(line)
+            out.append(lines[i + 1])
+            out.append("EXCEPTION")
+            out.append("  WHEN DUP_VAL_ON_INDEX THEN NULL;")
+            out.append("END;")
+            out.append("/")
+            i += 2
+            continue
+        out.append(line)
+        i += 1
+    return "\n".join(out) + ("\n" if sql_text.endswith("\n") else "")
+
+
 def _is_cancelled(cancel_event: threading.Event | None) -> bool:
     return cancel_event is not None and cancel_event.is_set()
 
@@ -359,6 +387,7 @@ select max(branch_code)
 
     def _render_existing_spool(self, spool_path: Path) -> Path:
         text = spool_path.read_text(encoding="utf-8", errors="replace")
+        text = _ignore_duplicate_inserts(text)
         out = Path(tempfile.gettempdir()) / f"oracle_tasks_savings_apply_{uuid.uuid4().hex[:8]}.sql"
         out.write_text(_with_exit(text), encoding="utf-8")
         return out
