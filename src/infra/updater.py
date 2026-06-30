@@ -26,6 +26,7 @@ from version import __version__
 log = logging.getLogger(__name__)
 
 _CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+_CREATE_NEW_CONSOLE = getattr(subprocess, "CREATE_NEW_CONSOLE", 0x00000010)
 # src/infra/updater.py → repo root is two parents up
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
@@ -93,3 +94,19 @@ def check_for_update(on_update_available: Callable[[str], None]) -> None:
         except Exception as e:
             log.info("Update check: unexpected error: %s", e)
     threading.Thread(target=_worker, daemon=True).start()
+
+
+def launch_update(updater: Path, python_executable: str) -> subprocess.Popen:
+    """Launch update.bat in a new console without cmd.exe path splitting."""
+    return subprocess.Popen(
+        [
+            "cmd.exe",
+            "/d",
+            "/c",
+            "call",
+            str(updater),
+            str(python_executable),
+        ],
+        cwd=str(updater.parent),
+        creationflags=_CREATE_NEW_CONSOLE,
+    )

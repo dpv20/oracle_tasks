@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import logging
 import os
-import subprocess
 import sys
 import webbrowser
 from tkinter import messagebox
@@ -13,7 +12,7 @@ import customtkinter as ctk
 from app_identity import APP_DISPLAY_NAME, APP_USER_MODEL_ID
 from settings.config import ConfigManager
 from i18n import set_language, t
-from infra.updater import check_for_update
+from infra.updater import check_for_update, launch_update
 from paths import ASSETS_DIR, REPO_ROOT
 from version import __version__
 
@@ -262,17 +261,8 @@ class OracleTasksApp:
         if not updater.exists():
             webbrowser.open("https://github.com/dpv20/oracle_tasks/releases/latest")
             return
-        pythonw = sys.executable
-        if pythonw.lower().endswith("python.exe"):
-            candidate = pythonw[: -len("python.exe")] + "pythonw.exe"
-            if os.path.isfile(candidate):
-                pythonw = candidate
         try:
-            subprocess.Popen(
-                ["cmd", "/c", "start", "", str(updater), pythonw],
-                cwd=str(REPO_ROOT),
-                creationflags=0x00000010,  # CREATE_NEW_CONSOLE
-            )
+            launch_update(updater, sys.executable)
         except OSError as e:
             log.error("Failed to launch update.bat: %s", e)
             return

@@ -4,15 +4,32 @@ title Oracle Tasks Chile - Updating
 
 :: update.bat — lives at repo root (%LOCALAPPDATA%\OracleTasksChile\app\update.bat)
 :: Called by the running app on "update available" click.
-:: Arg 1: full path to pythonw.exe of the Python that runs the app.
+:: Arg 1: optional path to python.exe/pythonw.exe used by the running app.
+:: It may be absent or stale, so always resolve it for the current Windows user.
 
-set "PYTHONW=%~1"
-if not defined PYTHONW set "PYTHONW=%LOCALAPPDATA%\Programs\Python\Python312\pythonw.exe"
-if not exist "!PYTHONW!" (
-    echo [ERROR] pythonw.exe not found: !PYTHONW!
+set "PY_CANDIDATE=%~1"
+set "PY_INFO=%TEMP%\otc_update_python_!RANDOM!!RANDOM!.txt"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0tools\find_update_python.ps1" -Candidate "!PY_CANDIDATE!" > "!PY_INFO!" 2>nul
+if not errorlevel 1 (
+    for /f "usebackq tokens=1,* delims==" %%a in ("!PY_INFO!") do (
+        if /i "%%a"=="PY" set "PY=%%b"
+        if /i "%%a"=="PYTHONW" set "PYTHONW=%%b"
+    )
+)
+del /f /q "!PY_INFO!" >nul 2>&1
+
+if not defined PY (
+    echo [ERROR] Could not find a working Python installation for this user.
+    echo Run install.bat once to repair Python and the application shortcuts.
     pause & exit /b 1
 )
-set "PY=!PYTHONW:pythonw.exe=python.exe!"
+if not exist "!PY!" (
+    echo [ERROR] python.exe not found: !PY!
+    pause & exit /b 1
+)
+if not defined PYTHONW set "PYTHONW=!PY!"
+if not exist "!PYTHONW!" set "PYTHONW=!PY!"
+echo [OK] Using Python: !PY!
 
 :: Give the calling app time to exit, then force-kill anything left over.
 timeout /t 2 /nobreak >nul
