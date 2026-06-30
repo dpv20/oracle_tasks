@@ -53,13 +53,9 @@ class HomeView(ctk.CTkFrame):
             branch_desc = "Create and maintain Falabella branch records using standardized business fields."
             branch_btn = "Coming Soon"
 
-        branch_title = "FBBatchSetup"
-        branch_desc = (
-            "Genera PDFs de EOD Batch Event y Batch Report desde los procesos Java existentes."
-            if lang == "es"
-            else "Generate EOD Batch Event and Batch Report PDFs from the existing Java tools."
-        )
-        branch_btn = "Abrir FBBatchSetup" if lang == "es" else "Open FBBatchSetup"
+        branch_title = "☾  " + t("fbbatch.title")
+        branch_desc = t("fbbatch.home.desc")
+        branch_btn = t("fbbatch.home.open")
 
         self.welcome_lbl = ctk.CTkLabel(
             self.header_frame,

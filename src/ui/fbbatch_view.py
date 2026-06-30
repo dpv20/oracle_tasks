@@ -47,7 +47,6 @@ TIME_FIELDS = {
     "PROCESS_END_TIME",
 }
 MONTH_ABBR = ("JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC")
-DEFAULT_ORACLE_EMAIL = "diego.pavez@oracle.com"
 DEFAULT_MAIL_TO = (
     '"Michell Zambrano" <michell.zambrano@oracle.com>; '
     '"Adarsh Kumar" <adarsh.kumar@oracle.com>; '
@@ -112,7 +111,9 @@ class FBBatchSetupView(ctk.CTkFrame):
         self._event_html: Path | None = None
         self._report_html: Path | None = None
         self._report_images_dir: Path | None = None
-        self._mail_backup_path: Path | None = None
+        self._full_output_dir: Path | None = None
+        self._event_output_dir: Path | None = None
+        self._report_output_dir: Path | None = None
         self._active_progress = "event"
 
         header = ctk.CTkFrame(self, fg_color="transparent")
@@ -122,7 +123,7 @@ class FBBatchSetupView(ctk.CTkFrame):
             command=lambda: app.show_view("home"),
         ).pack(side="left")
         ctk.CTkLabel(
-            header, text=t("fbbatch.title"),
+            header, text="☾  " + t("fbbatch.title"),
             font=ctk.CTkFont(size=18, weight="bold"),
         ).pack(side="left", padx=15)
 
@@ -199,39 +200,15 @@ class FBBatchSetupView(ctk.CTkFrame):
             command=self._open_mail_settings,
         ).grid(row=0, column=1, padx=(12, 0))
         self.full_output_row = ctk.CTkFrame(inner, fg_color="transparent")
-        self.full_output_row.grid(row=4, column=0, columnspan=5, sticky="e", pady=(10, 0))
-        self.full_open_mail_btn = ctk.CTkButton(
+        self.full_output_row.grid(row=7, column=0, columnspan=5, sticky="e", pady=(10, 0))
+        self.full_open_location_btn = ctk.CTkButton(
             self.full_output_row,
-            text=t("fbbatch.open_mail"),
-            width=140,
+            text=t("fbbatch.open_location"),
+            width=170,
             state="disabled",
-            command=self._open_mail_result,
+            command=lambda: self._open_path(self._full_output_dir),
         )
-        self.full_open_mail_btn.pack(side="right", padx=5)
-        self.full_open_images_btn = ctk.CTkButton(
-            self.full_output_row,
-            text=t("fbbatch.open_images"),
-            width=140,
-            state="disabled",
-            command=lambda: self._open_path(self._report_images_dir),
-        )
-        self.full_open_images_btn.pack(side="right", padx=5)
-        self.full_open_html_btn = ctk.CTkButton(
-            self.full_output_row,
-            text=t("fbbatch.open_html"),
-            width=140,
-            state="disabled",
-            command=lambda: self._open_path(self._report_html),
-        )
-        self.full_open_html_btn.pack(side="right", padx=5)
-        self.full_open_pdf_btn = ctk.CTkButton(
-            self.full_output_row,
-            text=t("fbbatch.open_pdf"),
-            width=140,
-            state="disabled",
-            command=lambda: self._open_path(self._event_pdf),
-        )
-        self.full_open_pdf_btn.pack(side="right", padx=5)
+        self.full_open_location_btn.pack(side="right", padx=5)
         self.full_progress_bar = ctk.CTkProgressBar(inner)
         self.full_progress_bar.set(0)
         self.full_progress_bar.grid(row=5, column=0, columnspan=5, sticky="ew", pady=(14, 2))
@@ -281,14 +258,14 @@ class FBBatchSetupView(ctk.CTkFrame):
         self.event_progress_label.grid(row=4, column=0, columnspan=3, sticky="ew")
         self.event_output_row = ctk.CTkFrame(inner, fg_color="transparent")
         self.event_output_row.grid(row=5, column=0, columnspan=3, sticky="e", pady=(10, 0))
-        self.event_open_pdf_btn = ctk.CTkButton(
+        self.event_open_location_btn = ctk.CTkButton(
             self.event_output_row,
-            text=t("fbbatch.open_pdf"),
-            width=140,
+            text=t("fbbatch.open_location"),
+            width=170,
             state="disabled",
-            command=lambda: self._open_path(self._event_pdf),
+            command=lambda: self._open_path(self._event_output_dir),
         )
-        self.event_open_pdf_btn.pack(side="right", padx=5)
+        self.event_open_location_btn.pack(side="right", padx=5)
         self._hide_progress("event")
         inner.grid_columnconfigure(1, weight=1)
 
@@ -381,22 +358,14 @@ class FBBatchSetupView(ctk.CTkFrame):
         self.report_progress_label.grid(row=6, column=0, columnspan=4, sticky="ew")
         self.report_output_row = ctk.CTkFrame(inner, fg_color="transparent")
         self.report_output_row.grid(row=7, column=0, columnspan=4, sticky="e", pady=(10, 0))
-        self.report_open_images_btn = ctk.CTkButton(
+        self.report_open_location_btn = ctk.CTkButton(
             self.report_output_row,
-            text=t("fbbatch.open_images"),
-            width=140,
+            text=t("fbbatch.open_location"),
+            width=170,
             state="disabled",
-            command=lambda: self._open_path(self._report_images_dir),
+            command=lambda: self._open_path(self._report_output_dir),
         )
-        self.report_open_images_btn.pack(side="right", padx=5)
-        self.report_open_html_btn = ctk.CTkButton(
-            self.report_output_row,
-            text=t("fbbatch.open_html"),
-            width=140,
-            state="disabled",
-            command=lambda: self._open_path(self._report_html),
-        )
-        self.report_open_html_btn.pack(side="right", padx=5)
+        self.report_open_location_btn.pack(side="right", padx=5)
         self._hide_progress("report")
 
         inner.grid_columnconfigure(1, weight=1)
@@ -438,13 +407,17 @@ class FBBatchSetupView(ctk.CTkFrame):
 
     def _refresh_mail_summary(self) -> None:
         values = self._mail_values_for_current_date()
-        from_text = values["from_account"] or DEFAULT_ORACLE_EMAIL
+        from_account = values["from_account"]
+        summary = t(
+            "fbbatch.mail.summary",
+            subject=values["subject"],
+            sender=from_account or t("fbbatch.mail.not_configured"),
+        )
+        if not from_account:
+            summary += "\n⚠ " + t("fbbatch.mail.from_missing")
         self.mail_summary.configure(
-            text=t(
-                "fbbatch.mail.summary",
-                subject=values["subject"],
-                sender=from_text,
-            )
+            text=summary,
+            text_color=("#a16207", "#fbbf24") if not from_account else ("gray40", "gray65"),
         )
 
     def _open_mail_settings(self) -> None:
@@ -545,6 +518,15 @@ class FBBatchSetupView(ctk.CTkFrame):
         )
 
     def _on_generate_full_report(self) -> None:
+        mail_values = self._mail_values_for_current_date()
+        if not mail_values["from_account"]:
+            messagebox.showwarning(
+                t("fbbatch.mail.from_missing_title"),
+                t("fbbatch.mail.from_missing"),
+                parent=self,
+            )
+            self._open_mail_settings()
+            return
         env = self.full_env.get()
         vpn_ok, vpn_message = check_falabella_vpn()
         if not vpn_ok:
@@ -561,7 +543,6 @@ class FBBatchSetupView(ctk.CTkFrame):
         if issues:
             write_issue_properties(issues, root)
 
-        mail_values = self._mail_values_for_current_date()
         subject_template = mail_values["subject_template"]
         from_account = mail_values["from_account"]
         to = mail_values["to"]
@@ -652,7 +633,7 @@ class FBBatchSetupView(ctk.CTkFrame):
         subject = render_mail_template(subject_template, report_date, include_event=include_event)
         body = render_mail_template(body_template, report_date, include_event=include_event)
         attachments = [event_pdf] if include_event and event_pdf else []
-        draft_result = create_outlook_draft(
+        create_outlook_draft(
             subject=subject,
             from_account=from_account,
             to=to,
@@ -669,7 +650,7 @@ class FBBatchSetupView(ctk.CTkFrame):
             pdf_path=event_pdf,
             image_paths=report_result.image_paths,
             images_dir=report_result.images_dir,
-            mail_backup_path=draft_result.backup_path,
+            output_dir=report_result.output_dir,
             event_skipped=not bool(event_pdf),
         )
 
@@ -742,25 +723,24 @@ class FBBatchSetupView(ctk.CTkFrame):
         if self._active_progress == "event":
             self._event_pdf = None
             self._event_html = None
-            self.event_open_pdf_btn.configure(state="disabled")
+            self._event_output_dir = None
+            self.event_open_location_btn.configure(state="disabled")
         elif self._active_progress == "report":
             self._report_html = None
             self._report_images_dir = None
-            self.report_open_html_btn.configure(state="disabled")
-            self.report_open_images_btn.configure(state="disabled")
+            self._report_output_dir = None
+            self.report_open_location_btn.configure(state="disabled")
         else:
             self._event_pdf = None
             self._event_html = None
             self._report_html = None
             self._report_images_dir = None
-            self._mail_backup_path = None
-            self.full_open_pdf_btn.configure(state="disabled")
-            self.full_open_html_btn.configure(state="disabled")
-            self.full_open_images_btn.configure(state="disabled")
-            self.full_open_mail_btn.configure(state="disabled")
-            self.event_open_pdf_btn.configure(state="disabled")
-            self.report_open_html_btn.configure(state="disabled")
-            self.report_open_images_btn.configure(state="disabled")
+            self._full_output_dir = None
+            self._event_output_dir = None
+            self._report_output_dir = None
+            self.full_open_location_btn.configure(state="disabled")
+            self.event_open_location_btn.configure(state="disabled")
+            self.report_open_location_btn.configure(state="disabled")
         self._show_progress(self._active_progress)
         self._progress_widgets()[0].set(0)
         self._progress_widgets()[1].configure(text=t("fbbatch.progress.starting"))
@@ -828,40 +808,39 @@ class FBBatchSetupView(ctk.CTkFrame):
         if self._active_progress == "event":
             self._event_pdf = result.pdf_path
             self._event_html = result.html_path
-            if self._event_pdf and self._event_pdf.exists():
-                self.event_open_pdf_btn.configure(state="normal")
+            self._event_output_dir = result.output_dir
+            if self._event_output_dir and self._event_output_dir.exists():
+                self.event_open_location_btn.configure(state="normal")
         elif self._active_progress == "report":
             self._report_html = result.html_path
             self._report_images_dir = result.images_dir
-            if self._report_html and self._report_html.exists():
-                self.report_open_html_btn.configure(state="normal")
-            if self._report_images_dir and self._report_images_dir.exists():
-                self.report_open_images_btn.configure(state="normal")
+            self._report_output_dir = result.output_dir
+            if self._report_output_dir and self._report_output_dir.exists():
+                self.report_open_location_btn.configure(state="normal")
         else:
             self._event_pdf = result.pdf_path
             self._report_html = result.html_path
             self._report_images_dir = result.images_dir
-            self._mail_backup_path = result.mail_backup_path
+            self._full_output_dir = result.output_dir
+            self._report_output_dir = result.output_dir
             if self._event_pdf and self._event_pdf.exists():
-                self.event_open_pdf_btn.configure(state="normal")
-                self.full_open_pdf_btn.configure(state="normal")
-            if self._report_html and self._report_html.exists():
-                self.report_open_html_btn.configure(state="normal")
-                self.full_open_html_btn.configure(state="normal")
-            if self._report_images_dir and self._report_images_dir.exists():
-                self.report_open_images_btn.configure(state="normal")
-                self.full_open_images_btn.configure(state="normal")
-            if self._mail_backup_path and self._mail_backup_path.exists():
-                self.full_open_mail_btn.configure(state="normal")
+                self._event_output_dir = result.output_dir
+                self.event_open_location_btn.configure(state="normal")
+            if self._report_output_dir and self._report_output_dir.exists():
+                self.report_open_location_btn.configure(state="normal")
+            if self._full_output_dir and self._full_output_dir.exists():
+                self.full_open_location_btn.configure(state="normal")
+            if result.ok:
+                messagebox.showinfo(
+                    t("fbbatch.mail.ready_title"),
+                    t("fbbatch.mail.opened"),
+                    parent=self,
+                )
 
     @staticmethod
     def _open_path(path: Path | None) -> None:
         if path and path.exists():
             os.startfile(str(path))
-
-    def _open_mail_result(self) -> None:
-        self._open_path(self._mail_backup_path)
-
 
 class MailSettingsDialog(ctk.CTkToplevel):
     def __init__(self, master, *, values: dict[str, str], on_saved):
@@ -887,7 +866,7 @@ class MailSettingsDialog(ctk.CTkToplevel):
 
         self.subject = ctk.CTkEntry(wrap)
         self.subject.insert(0, values["subject_template"])
-        self.from_account = ctk.CTkEntry(wrap, placeholder_text=DEFAULT_ORACLE_EMAIL)
+        self.from_account = ctk.CTkEntry(wrap, placeholder_text="name@oracle.com")
         self.from_account.insert(0, values["from_account"])
         self.to = ctk.CTkEntry(wrap)
         self.to.insert(0, values["to"])
@@ -912,6 +891,16 @@ class MailSettingsDialog(ctk.CTkToplevel):
         actions.grid(row=6, column=0, columnspan=2, sticky="e", pady=(16, 0))
         ctk.CTkButton(actions, text=t("common.cancel"), width=130, fg_color="transparent", border_width=1, text_color=("gray10", "gray90"), command=self.destroy).pack(side="right", padx=(8, 0))
         ctk.CTkButton(actions, text=t("settings.general.apply"), width=160, command=self._save).pack(side="right")
+        self.after(50, self._center_on_screen)
+
+    def _center_on_screen(self) -> None:
+        self.update_idletasks()
+        width, height = self.winfo_width(), self.winfo_height()
+        screen_width = self.winfo_screenwidth()
+        screen_height = self.winfo_screenheight()
+        x = max(0, (screen_width - width) // 2)
+        y = max(0, (screen_height - height) // 2)
+        self.geometry(f"+{x}+{y}")
 
     def _save(self) -> None:
         body_text = self.body.get("1.0", "end").strip()

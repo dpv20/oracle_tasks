@@ -134,7 +134,7 @@ class OracleTasksApp:
             "spools_savings": "💵  " + t("home.savings_button"),
             "settings": "⚙️  " + t("settings.title"),
         }
-        menu_labels["fbbatch"] = "FB  " + t("fbbatch.nav")
+        menu_labels["fbbatch"] = "☾  " + t("fbbatch.nav")
         for view_name, label in menu_labels.items():
             if view_name in self._menu_buttons:
                 self._menu_buttons[view_name].configure(text=label)

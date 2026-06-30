@@ -21,7 +21,7 @@ log = logging.getLogger(__name__)
 DEFAULT_FBBATCH_ROOT = REPO_ROOT / "FBBatchSetup"
 SAVED_ISSUES_FILE = DATA_DIR / "fbbatch_saved_issues.json"
 FBBATCH_OUTPUT_DIR = REPO_ROOT / "outputs" / "fbbatch"
-MAIL_BACKUP_DIR = FBBATCH_OUTPUT_DIR / "mail"
+OUTLOOK_DRAFT_SETTLE_SECONDS = 12.0
 ProgressCallback = Callable[[int, str], None]
 SPANISH_MONTHS = (
     "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
@@ -38,7 +38,7 @@ class BatchResult:
     image_path: Path | None = None
     image_paths: list[Path] | None = None
     images_dir: Path | None = None
-    mail_backup_path: Path | None = None
+    output_dir: Path | None = None
     exit_code: int | None = None
     event_skipped: bool = False
 
@@ -47,7 +47,6 @@ class BatchResult:
 class OutlookDraftResult:
     entry_id: str
     folder_name: str
-    backup_path: Path | None = None
 
 
 ISSUE_FIELDS = (
@@ -329,10 +328,17 @@ def find_event_pdf_for_report_date(report_date: str) -> Path | None:
         parsed.strftime("%d_%m_%Y"),
         parsed.strftime("%d%m%Y"),
     }
-    event_dir = FBBATCH_OUTPUT_DIR / "event"
-    if not event_dir.exists():
+    if not FBBATCH_OUTPUT_DIR.exists():
         return None
-    candidates = sorted(event_dir.glob("*.pdf"), key=lambda path: path.stat().st_mtime, reverse=True)
+    candidates = sorted(
+        (
+            path
+            for path in FBBATCH_OUTPUT_DIR.rglob("*.pdf")
+            if "event" in path.stem.lower()
+        ),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
     for candidate in candidates:
         normalized = candidate.stem.replace(" ", "_")
         if any(token in normalized for token in date_tokens):
@@ -414,7 +420,6 @@ def create_outlook_draft(
             lambda: drafts_folder.Items.Add("IPM.Note"),
             attempts=3,
         )
-        expected_store_id = _outlook_attr(drafts_folder, "StoreID")
         log.info(
             "outlook_draft: mail item created directly in %s",
             _outlook_folder_label(drafts_folder),
@@ -444,46 +449,41 @@ def create_outlook_draft(
                 )
                 log.info("outlook_draft: attachment added path=%s", attachment)
 
+        inline_image_html = _attach_inline_images(mail, inline_images)
         body_html = "<br>".join(html.escape(line).replace(" ", "&nbsp;") for line in body_text.splitlines())
         mail.HTMLBody = (
             "<html><body>"
             "<p>Confidential - Oracle Restricted \\Including External Recipients</p>"
             f"<div>{body_html}</div><br>"
+            f"{inline_image_html}"
             + "</body></html>"
         )
-        _outlook_call("save before image insert", mail.Save)
+        _outlook_call("save draft with inline images", mail.Save)
         log.info(
-            "outlook_draft: saved before image insert saved=%r entry_id=%r parent=%r",
+            "outlook_draft: saved without opening inspector saved=%r entry_id=%r parent=%r",
             _outlook_attr(mail, "Saved"),
             _outlook_attr(mail, "EntryID"),
             _outlook_parent_label(mail),
         )
-        _outlook_call("display inspector", lambda: mail.Display(False))
-        log.info("outlook_draft: displayed inspector non-modal for WordEditor")
-        _insert_images_with_word_editor(mail, inline_images)
-        _outlook_call("save after image insert", mail.Save)
-        log.info(
-            "outlook_draft: saved after image insert saved=%r entry_id=%r parent=%r",
-            _outlook_attr(mail, "Saved"),
-            _outlook_attr(mail, "EntryID"),
-            _outlook_parent_label(mail),
+        _settle_outlook_draft(mail, OUTLOOK_DRAFT_SETTLE_SECONDS)
+        _outlook_call("final draft save", mail.Save, attempts=3, delay=0.8)
+        draft_state = OutlookDraftResult(
+            entry_id=_outlook_attr(mail, "EntryID"),
+            folder_name=_outlook_attr(drafts_folder, "Name") or "Drafts",
         )
-        draft_state = _ensure_saved_as_draft(mail, expected_store_id=expected_store_id)
-        backup_path = _save_msg_backup(mail, subject)
-        inspector = _outlook_call("get inspector", lambda: mail.GetInspector, attempts=3)
-        _outlook_call("activate inspector", inspector.Activate, attempts=3)
-        _outlook_call("final save with inspector open", mail.Save, attempts=3)
-        log.info("outlook_draft: inspector activated and left open for user action")
         log.info(
-            "outlook_draft: completed entry_id=%r folder=%r backup=%s inspector_open=True",
+            "outlook_draft: final Save succeeded; treating item as saved in %s entry_id=%r",
+            _outlook_folder_label(drafts_folder),
+            draft_state.entry_id,
+        )
+        log.info(
+            "outlook_draft: completed entry_id=%r folder=%r inspector_created=False",
             draft_state.entry_id,
             draft_state.folder_name,
-            backup_path,
         )
         return OutlookDraftResult(
             entry_id=draft_state.entry_id,
             folder_name=draft_state.folder_name,
-            backup_path=backup_path,
         )
     except Exception as exc:
         log.exception("outlook_draft: failed")
@@ -569,63 +569,22 @@ def _outlook_call(label: str, func, *, attempts: int = 5, delay: float = 0.6):
     raise last_exc or RuntimeError(f"Outlook call failed: {label}")
 
 
-def _ensure_saved_as_draft(mail, *, expected_store_id: str = "") -> OutlookDraftResult:
-    deadline = time.monotonic() + 12
-    attempt = 0
-    last_detail = "unknown"
+def _settle_outlook_draft(mail, seconds: float) -> None:
+    deadline = time.monotonic() + seconds
     while True:
-        attempt += 1
-        try:
-            _outlook_call("ensure draft save", mail.Save, attempts=2, delay=0.5)
-            parent = getattr(mail, "Parent", None)
-            parent_label = _outlook_folder_label(parent)
-            entry_id = _outlook_attr(mail, "EntryID")
-            folder_name = _outlook_attr(parent, "Name")
-            store_id = _outlook_attr(parent, "StoreID")
-            saved_state = _outlook_attr(mail, "Saved")
-            store_matches = not expected_store_id or store_id == expected_store_id
-            last_detail = (
-                f"saved={saved_state} entry_id={entry_id!r} "
-                f"parent={parent_label} expected_store_match={store_matches}"
-            )
-            log.info("outlook_draft: ensure draft attempt=%s %s", attempt, last_detail)
-            if entry_id and store_matches and _looks_like_drafts_folder(parent):
-                log.info("outlook_draft: saved in Drafts")
-                return OutlookDraftResult(entry_id=entry_id, folder_name=folder_name)
-        except Exception as exc:  # noqa: BLE001 - converted below into one actionable error.
-            last_detail = str(exc)
-            log.warning("outlook_draft: ensure draft attempt=%s failed: %s", attempt, exc)
-        if time.monotonic() >= deadline:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
             break
-        time.sleep(min(0.5 * attempt, 2.0))
-    raise RuntimeError(f"Outlook could not confirm the email in Drafts: {last_detail}")
-
-
-def _save_msg_backup(mail, subject: str) -> Path | None:
-    try:
-        MAIL_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-        filename = f"{time.strftime('%Y%m%d_%H%M%S')}_{_safe_filename(subject)}.msg"
-        target = MAIL_BACKUP_DIR / filename
-        _outlook_call("save .msg backup", lambda: mail.SaveAs(str(target), 9), attempts=3, delay=0.8)
-        if target.exists():
-            log.info("outlook_draft: .msg backup saved path=%s", target)
-            return target
-        log.warning("outlook_draft: .msg backup SaveAs returned but file was not found path=%s", target)
-    except Exception:
-        log.exception("outlook_draft: .msg backup failed")
-    return None
+        time.sleep(min(2.0, remaining))
+        try:
+            _outlook_call("save hidden draft while waiting", mail.Save, attempts=2, delay=0.5)
+        except Exception:
+            log.exception("outlook_draft: periodic hidden draft save failed")
 
 
 def _safe_filename(value: str) -> str:
     text = re.sub(r"[^A-Za-z0-9._ -]+", "_", value or "").strip(" ._")
     return (text[:80] or "mail")
-
-
-def _looks_like_drafts_folder(folder) -> bool:
-    if folder is None:
-        return False
-    name = _outlook_attr(folder, "Name").strip().lower()
-    return name in {"drafts", "borradores"}
 
 
 def _split_outlook_recipients(raw: str) -> list[str]:
@@ -639,26 +598,57 @@ def _split_outlook_recipients(raw: str) -> list[str]:
     return recipients
 
 
-def _insert_images_with_word_editor(mail, images: list[Path]) -> None:
+def _attach_inline_images(mail, images: list[Path]) -> str:
+    import html
+
     existing = [image for image in images if image.exists()]
     if not existing:
-        log.info("outlook_draft: no inline report images to insert")
-        return
-    try:
-        log.info("outlook_draft: inserting %s inline image(s) via WordEditor", len(existing))
-        doc = _outlook_call("get WordEditor", lambda: mail.GetInspector.WordEditor, attempts=3)
-        end_pos = max(0, doc.Content.End - 1)
-        cursor = doc.Range(end_pos, end_pos)
-        for image in existing:
-            cursor.InsertParagraphAfter()
-            cursor = doc.Range(max(0, doc.Content.End - 1), max(0, doc.Content.End - 1))
-            cursor.InlineShapes.AddPicture(str(image.resolve()), False, True)
-            log.info("outlook_draft: inline image inserted path=%s", image)
-            cursor.InsertParagraphAfter()
-            cursor = doc.Range(max(0, doc.Content.End - 1), max(0, doc.Content.End - 1))
-    except Exception as exc:
-        log.exception("outlook_draft: WordEditor image insertion failed")
-        raise RuntimeError(f"Outlook could not insert report images into the message body: {exc}") from exc
+        log.info("outlook_draft: no inline report images to attach")
+        return ""
+
+    chunks: list[str] = []
+    stamp = time.time_ns()
+    for index, image in enumerate(existing, start=1):
+        content_id = f"fbbatch-{stamp}-{index}@oracle-tasks"
+        attachment = _outlook_call(
+            "add inline image attachment",
+            lambda path=image: mail.Attachments.Add(str(path.resolve()), 1, 0, path.name),
+            attempts=3,
+        )
+        property_accessor = attachment.PropertyAccessor
+        _outlook_call(
+            "set inline image Content-ID",
+            lambda pa=property_accessor, cid=content_id: pa.SetProperty(
+                "http://schemas.microsoft.com/mapi/proptag/0x3712001F",
+                cid,
+            ),
+            attempts=3,
+        )
+        optional_properties = (
+            ("0x370E001F", "image/png"),
+            ("0x7FFE000B", True),
+            ("0x37140003", 4),
+        )
+        for property_tag, value in optional_properties:
+            try:
+                property_accessor.SetProperty(
+                    f"http://schemas.microsoft.com/mapi/proptag/{property_tag}",
+                    value,
+                )
+            except Exception:
+                log.warning(
+                    "outlook_draft: optional inline image property failed tag=%s path=%s",
+                    property_tag,
+                    image,
+                    exc_info=True,
+                )
+        escaped_id = html.escape(content_id, quote=True)
+        chunks.append(
+            f'<div style="margin:16px 0;"><img src="cid:{escaped_id}" '
+            'style="display:block;max-width:100%;height:auto;"></div>'
+        )
+        log.info("outlook_draft: inline CID image attached path=%s cid=%s", image, content_id)
+    return "".join(chunks)
 
 
 def issues_for_date(issue_date: str) -> list[dict[str, str]]:
@@ -791,11 +781,18 @@ def _with_pdf(result: BatchResult, html_path: Path | None, output_kind: str, def
         _emit_progress(progress, 93, "Copying HTML output")
         local_html = _copy_to_project_output(html_path, output_kind, default_stem)
         result.html_path = local_html
+        result.output_dir = local_html.parent
         pdf_path = local_html.with_suffix(".pdf")
         _emit_progress(progress, 96, "Creating PDF")
         pdf_ok, pdf_msg = html_to_pdf(local_html, pdf_path)
         if pdf_ok:
             result.pdf_path = pdf_path
+            try:
+                local_html.unlink()
+                result.html_path = None
+                log.info("fbbatch_event: removed local HTML after PDF creation path=%s", local_html)
+            except OSError:
+                log.exception("fbbatch_event: could not remove local HTML path=%s", local_html)
             _emit_progress(progress, 100, "Report ready")
         elif result.ok:
             result.message = f"HTML generated, but PDF conversion failed: {pdf_msg}"
@@ -806,7 +803,7 @@ def _with_pdf(result: BatchResult, html_path: Path | None, output_kind: str, def
 
 
 def _copy_to_project_output(html_path: Path, output_kind: str, default_stem: str) -> Path:
-    target_dir = FBBATCH_OUTPUT_DIR / output_kind
+    target_dir = _night_shift_output_dir(html_path, output_kind, default_stem)
     target_dir.mkdir(parents=True, exist_ok=True)
     name = html_path.name or f"{default_stem}.html"
     target = target_dir / name
@@ -815,12 +812,23 @@ def _copy_to_project_output(html_path: Path, output_kind: str, default_stem: str
     return target
 
 
+def _night_shift_output_dir(html_path: Path, output_kind: str, default_stem: str) -> Path:
+    date_match = re.search(r"(?<!\d)(\d{2}-\d{2}-\d{4})(?!\d)", html_path.stem)
+    if date_match:
+        folder_name = f"NightShift_{date_match.group(1)}"
+    else:
+        fallback = _safe_filename(html_path.stem or default_stem).replace(" ", "_")
+        folder_name = f"NightShift_{fallback or output_kind}"
+    return FBBATCH_OUTPUT_DIR / folder_name
+
+
 def _with_report_images(result: BatchResult, html_path: Path | None, output_kind: str, default_stem: str, progress: ProgressCallback | None = None) -> BatchResult:
     if html_path and html_path.exists():
         _emit_progress(progress, 93, "Copying HTML output")
         local_html = _copy_to_project_output(html_path, output_kind, default_stem)
         result.html_path = local_html
-        images_dir = local_html.with_name(f"{local_html.stem}_images")
+        result.output_dir = local_html.parent
+        images_dir = local_html.parent
         _emit_progress(progress, 96, "Creating image segments")
         image_paths, image_msg = report_html_to_segment_images(local_html, images_dir)
         result.images_dir = images_dir
@@ -868,9 +876,10 @@ def report_html_to_segment_images(html_path: Path, images_dir: Path) -> tuple[li
     segments = _build_report_segment_html(text)
     if not segments:
         return [], "HTML generated, but no report segments were found."
-    if images_dir.exists():
-        shutil.rmtree(images_dir)
     images_dir.mkdir(parents=True, exist_ok=True)
+    for pattern in ("summary.html", "summary.png", "incident_*.html", "incident_*.png"):
+        for stale_path in images_dir.glob(pattern):
+            stale_path.unlink(missing_ok=True)
     image_paths: list[Path] = []
     failures: list[str] = []
     for name, segment_html in segments:
@@ -878,8 +887,7 @@ def report_html_to_segment_images(html_path: Path, images_dir: Path) -> tuple[li
         image_path = images_dir / f"{name}.png"
         segment_path.write_text(segment_html, encoding="utf-8")
         try:
-            _render_segment_png(name, text, image_path)
-            ok, msg = image_path.exists(), "Image created."
+            ok, msg = html_to_cropped_png(segment_path, image_path)
         except Exception as exc:  # noqa: BLE001 - keep report generation resilient.
             ok, msg = False, str(exc)
         if ok:
@@ -1246,36 +1254,106 @@ def html_to_pdf(html_path: Path, pdf_path: Path) -> tuple[bool, str]:
     return (pdf_path.exists(), "PDF created." if pdf_path.exists() else "PDF was not created.")
 
 
-def html_to_png(html_path: Path, image_path: Path, *, window_size: str = "1100,1600") -> tuple[bool, str]:
+def html_to_cropped_png(html_path: Path, image_path: Path) -> tuple[bool, str]:
+    ok, message = html_to_png(
+        html_path,
+        image_path,
+        window_size="1400,5000",
+        device_scale_factor=1.5,
+    )
+    if not ok:
+        return False, message
+    try:
+        _crop_png_to_content(image_path)
+    except (OSError, ValueError) as exc:
+        return False, f"Image created, but cropping failed: {exc}"
+    return True, "Image created from its HTML segment."
+
+
+def _crop_png_to_content(image_path: Path, *, padding: int = 24) -> None:
+    from PIL import Image, ImageChops
+
+    with Image.open(image_path) as source:
+        image = source.convert("RGB")
+    background = Image.new("RGB", image.size, "white")
+    bounds = ImageChops.difference(image, background).getbbox()
+    if bounds is None:
+        raise ValueError("the browser capture is blank")
+    left, top, right, bottom = bounds
+    crop_box = (
+        max(0, left - padding),
+        max(0, top - padding),
+        min(image.width, right + padding),
+        min(image.height, bottom + padding),
+    )
+    image.crop(crop_box).save(image_path)
+
+
+def html_to_png(
+    html_path: Path,
+    image_path: Path,
+    *,
+    window_size: str = "1100,1600",
+    device_scale_factor: float | None = None,
+) -> tuple[bool, str]:
     browser = _find_browser()
     if not browser:
         return False, "Edge/Chrome was not found."
-    with tempfile.TemporaryDirectory(prefix="fbbatch_browser_") as profile_dir:
-        args = [
-            str(browser),
-            "--headless",
-            "--disable-gpu",
-            "--disable-gpu-compositing",
-            "--disable-software-rasterizer",
-            "--disable-accelerated-2d-canvas",
-            "--disable-features=UseSkiaRenderer,VizDisplayCompositor",
-            "--hide-scrollbars",
-            f"--user-data-dir={profile_dir}",
-            f"--window-size={window_size}",
-            f"--screenshot={image_path.resolve()}",
-            html_path.resolve().as_uri(),
-        ]
+    image_path.parent.mkdir(parents=True, exist_ok=True)
+    last_error = "The browser did not create an image."
+    for attempt in range(1, 4):
+        image_path.unlink(missing_ok=True)
+        with tempfile.TemporaryDirectory(prefix="fbbatch_browser_") as profile_dir:
+            args = [
+                str(browser),
+                "--headless=new",
+                "--disable-gpu",
+                "--disable-dev-shm-usage",
+                "--hide-scrollbars",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--run-all-compositor-stages-before-draw",
+                "--virtual-time-budget=1000",
+                f"--user-data-dir={profile_dir}",
+                f"--window-size={window_size}",
+                f"--screenshot={image_path.resolve()}",
+                html_path.resolve().as_uri(),
+            ]
+            if device_scale_factor is not None:
+                args.insert(-1, f"--force-device-scale-factor={device_scale_factor}")
+            try:
+                subprocess.run(
+                    args,
+                    check=True,
+                    capture_output=True,
+                    timeout=120,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+            except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+                last_error = _browser_error(exc)
+                log.warning("Browser PNG attempt %s failed: %s", attempt, last_error)
+                continue
+            if not _wait_for_valid_png(image_path):
+                last_error = "The browser finished, but did not create a valid image."
+                log.warning("Browser PNG attempt %s failed: %s", attempt, last_error)
+                continue
+            return True, "Image created."
+    image_path.unlink(missing_ok=True)
+    return False, f"{last_error} (3 attempts)."
+
+
+def _wait_for_valid_png(image_path: Path, *, timeout: float = 10.0) -> bool:
+    from PIL import Image
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
         try:
-            subprocess.run(
-                args,
-                check=True,
-                capture_output=True,
-                timeout=120,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-            return False, _browser_error(exc)
-    return (image_path.exists(), "Image created." if image_path.exists() else "Image was not created.")
+            with Image.open(image_path) as image:
+                image.verify()
+            return True
+        except (FileNotFoundError, OSError):
+            time.sleep(0.1)
+    return False
 
 
 def _browser_error(exc: BaseException) -> str:
@@ -1341,10 +1419,10 @@ def _find_browser() -> Path | None:
         if found:
             return Path(found)
     candidates = [
-        Path(os.environ.get("ProgramFiles", "")) / "Microsoft" / "Edge" / "Application" / "msedge.exe",
-        Path(os.environ.get("ProgramFiles(x86)", "")) / "Microsoft" / "Edge" / "Application" / "msedge.exe",
         Path(os.environ.get("ProgramFiles", "")) / "Google" / "Chrome" / "Application" / "chrome.exe",
         Path(os.environ.get("ProgramFiles(x86)", "")) / "Google" / "Chrome" / "Application" / "chrome.exe",
+        Path(os.environ.get("ProgramFiles", "")) / "Microsoft" / "Edge" / "Application" / "msedge.exe",
+        Path(os.environ.get("ProgramFiles(x86)", "")) / "Microsoft" / "Edge" / "Application" / "msedge.exe",
     ]
     return next((p for p in candidates if p.exists()), None)
 
