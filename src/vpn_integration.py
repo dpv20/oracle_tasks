@@ -10,6 +10,8 @@ import sys
 import threading
 import time
 import winreg
+import warnings
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -24,6 +26,12 @@ FORTI = "forti"
 GPROT = "globalprotect"
 NONE = "disconnected"
 VPN_TARGETS = (CISCO, FORTI, GPROT, NONE)
+
+_FORTI_RETRY_ERRORS = (
+    "window did not appear",
+    "could not find connect",
+    "did not open the sign-in window",
+)
 
 VPN_SWITCHER_INSTALL_URL = (
     "https://raw.githubusercontent.com/dpv20/oracle_vpn/main/install.bat"
@@ -116,9 +124,10 @@ class VPNSwitcherBridge:
         return self.available
 
     def get_status(self) -> str:
-        controller = self._get_controller()
-        self._reload_controller_config(controller)
-        return _read_controller_status(controller)
+        with _com_apartment():
+            controller = self._get_controller()
+            self._reload_controller_config(controller)
+            return _read_controller_status(controller)
 
     def switch_to(
         self,
@@ -128,41 +137,55 @@ class VPNSwitcherBridge:
         if target not in VPN_TARGETS:
             return VPNResult(False, f"Unsupported VPN target: {target}")
         with self._operation_lock:
-            controller = self._get_controller()
-            self._reload_controller_config(controller)
-            self.ensure_background_running()
-            self._clear_autofill_cancel()
+            with _com_apartment():
+                return self._switch_to(target, progress)
 
-            current = self._safe_status(controller)
-            if target == NONE:
-                return self._disconnect_everything(controller, progress)
-            if current == target:
-                return VPNResult(True, "VPN is already connected.", current)
+    def _switch_to(
+        self,
+        target: str,
+        progress: ProgressCallback | None,
+    ) -> VPNResult:
+        controller = self._get_controller()
+        self._reload_controller_config(controller)
+        self.ensure_background_running()
+        self._clear_autofill_cancel()
 
-            if current != NONE:
-                _emit(progress, f"Disconnecting {status_display_name(current)}...")
-                ok, message = self._disconnect(controller, current)
-                if not ok:
-                    return VPNResult(False, message, self._safe_status(controller))
-                time.sleep(1)
-                remaining = self._safe_status(controller)
-                if remaining not in (NONE, target):
-                    return VPNResult(
-                        False,
-                        f"Could not disconnect {status_display_name(remaining)}.",
-                        remaining,
-                    )
+        current = self._safe_status(controller)
+        if target == NONE:
+            return self._disconnect_everything(controller, progress)
+        if current == target:
+            return VPNResult(True, "VPN is already connected.", current)
 
-            _emit(progress, f"Connecting {status_display_name(target)}...")
-            ok, message = self._connect(controller, target)
-            if message == "__WRONG_PASSWORD__":
+        if current != NONE:
+            _emit(progress, f"Disconnecting {status_display_name(current)}...")
+            ok, message = self._disconnect(controller, current)
+            if not ok:
+                return VPNResult(False, message, self._safe_status(controller))
+            time.sleep(1)
+            remaining = self._safe_status(controller)
+            if remaining not in (NONE, target):
                 return VPNResult(
                     False,
-                    "FortiClient rejected the saved password. Update it in VPN Switcher Settings.",
-                    self._safe_status(controller),
+                    f"Could not disconnect {status_display_name(remaining)}.",
+                    remaining,
                 )
-            time.sleep(3)
-            return VPNResult(ok, message, self._safe_status(controller))
+
+        _emit(progress, f"Connecting {status_display_name(target)}...")
+        ok, message = self._connect(controller, target)
+        if target == FORTI and not ok and _is_recoverable_forti_error(message):
+            log.warning("Transient FortiClient failure; retrying once: %s", message)
+            _emit(progress, "FortiClient is still starting. Retrying...")
+            time.sleep(2)
+            self._clear_autofill_cancel()
+            ok, message = self._connect(controller, target)
+        if message == "__WRONG_PASSWORD__":
+            return VPNResult(
+                False,
+                "FortiClient rejected the saved password. Update it in VPN Switcher Settings.",
+                self._safe_status(controller),
+            )
+        time.sleep(3)
+        return VPNResult(ok, message, self._safe_status(controller))
 
     def ensure_background_running(self) -> tuple[bool, str]:
         if not self.available:
@@ -349,6 +372,52 @@ def _read_controller_status(controller, attempts: int = 3) -> str:
         if attempt + 1 < attempts:
             time.sleep(0.2)
     return NONE
+
+
+def _is_recoverable_forti_error(message: str) -> bool:
+    normalized = (message or "").lower()
+    return any(fragment in normalized for fragment in _FORTI_RETRY_ERRORS)
+
+
+@contextmanager
+def _com_apartment():
+    """Initialize COM for the worker thread used by pywinauto UIA."""
+    initialized = False
+    try:
+        # pythoncom initializes COM as part of its import, so select MTA first.
+        if not hasattr(sys, "coinit_flags"):
+            sys.coinit_flags = 0
+        import pythoncom
+
+        coinit_mta = getattr(pythoncom, "COINIT_MULTITHREADED", 0)
+        try:
+            pythoncom.CoInitializeEx(coinit_mta)
+            initialized = True
+        except Exception:
+            # A host may already have initialized this thread as STA.
+            pythoncom.CoInitialize()
+            initialized = True
+    except Exception:
+        log.exception("Could not initialize COM for VPN automation")
+
+    try:
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=(
+                    "Revert to STA COM threading mode|"
+                    "Apply externally defined coinit_flags:.*"
+                ),
+                category=UserWarning,
+                module="pywinauto",
+            )
+            yield
+    finally:
+        if initialized:
+            try:
+                pythoncom.CoUninitialize()
+            except Exception:
+                log.exception("Could not uninitialize COM for VPN automation")
 
 
 def _load_installed_module(name: str, path: Path):

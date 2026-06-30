@@ -3,7 +3,8 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 
 SRC_DIR = Path(__file__).resolve().parents[1] / "src"
@@ -14,6 +15,7 @@ from vpn_integration import (  # noqa: E402
     FORTI,
     NONE,
     VPNSwitcherBridge,
+    _com_apartment,
     _read_controller_status,
 )
 
@@ -68,6 +70,20 @@ class _FakeController:
         return True, "GlobalProtect connected"
 
 
+class _TransientFortiController(_FakeController):
+    def __init__(self) -> None:
+        super().__init__(NONE)
+        self.attempts = 0
+
+    def connect_forti(self):
+        self.calls.append("connect_forti")
+        self.attempts += 1
+        if self.attempts == 1:
+            return False, "FortiClient launched but window did not appear. Try again."
+        self.status = FORTI
+        return True, "Forti connected"
+
+
 def _bridge(controller: _FakeController) -> VPNSwitcherBridge:
     bridge = VPNSwitcherBridge()
     bridge._controller = controller
@@ -78,6 +94,22 @@ def _bridge(controller: _FakeController) -> VPNSwitcherBridge:
 
 
 class VPNSwitcherBridgeTests(unittest.TestCase):
+    def test_com_is_initialized_for_worker_thread(self) -> None:
+        pythoncom = SimpleNamespace(
+            COINIT_MULTITHREADED=0,
+            CoInitializeEx=Mock(),
+            CoInitialize=Mock(),
+            CoUninitialize=Mock(),
+        )
+
+        with patch.dict(sys.modules, {"pythoncom": pythoncom}):
+            with _com_apartment():
+                pass
+
+        pythoncom.CoInitializeEx.assert_called_once_with(0)
+        pythoncom.CoInitialize.assert_not_called()
+        pythoncom.CoUninitialize.assert_called_once_with()
+
     @patch("vpn_integration.time.sleep", return_value=None)
     def test_status_retries_after_transient_disconnected_read(self, _sleep) -> None:
         statuses = iter((NONE, FORTI))
@@ -111,6 +143,18 @@ class VPNSwitcherBridgeTests(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertEqual(result.status, NONE)
         self.assertEqual(controller.calls, ["disconnect_forti"])
+
+    @patch("vpn_integration.time.sleep", return_value=None)
+    def test_transient_forti_window_failure_is_retried_once(self, _sleep) -> None:
+        controller = _TransientFortiController()
+        messages: list[str] = []
+
+        result = _bridge(controller).switch_to(FORTI, messages.append)
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.status, FORTI)
+        self.assertEqual(controller.calls, ["connect_forti", "connect_forti"])
+        self.assertIn("FortiClient is still starting. Retrying...", messages)
 
 
 if __name__ == "__main__":
