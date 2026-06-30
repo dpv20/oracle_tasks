@@ -221,8 +221,8 @@ class SettingsView(ctk.CTkFrame):
 
     # ── General tab ──
     def _build_general_tab(self, parent):
-        wrap = ctk.CTkFrame(parent, fg_color="transparent")
-        wrap.pack(fill="x", padx=10, pady=10)
+        wrap = ctk.CTkScrollableFrame(parent, fg_color="transparent")
+        wrap.pack(fill="both", expand=True, padx=10, pady=10)
 
         # Language
         SectionLabel(wrap, text=t("settings.general.language")).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 4))
@@ -262,6 +262,35 @@ class SettingsView(ctk.CTkFrame):
             command=self._on_detect_sqlcl,
         ).grid(row=6, column=2, padx=5, pady=2)
 
+        SectionLabel(wrap, text=t("settings.general.emails")).grid(row=7, column=0, columnspan=3, sticky="w", pady=(15, 4))
+        ctk.CTkLabel(wrap, text=t("settings.general.oracle_email"), anchor="w").grid(
+            row=8, column=0, sticky="w", padx=20, pady=(2, 0)
+        )
+        self.oracle_email_entry = ctk.CTkEntry(wrap, placeholder_text="diego.pavez@oracle.com")
+        self.oracle_email_entry.insert(0, self.app.config.get("oracle_email") or "")
+        self.oracle_email_entry.grid(row=9, column=0, columnspan=3, sticky="ew", padx=20, pady=(0, 4))
+        ctk.CTkLabel(wrap, text=t("settings.general.falabella_email"), anchor="w").grid(
+            row=10, column=0, sticky="w", padx=20, pady=(2, 0)
+        )
+        self.falabella_email_entry = ctk.CTkEntry(wrap, placeholder_text="diego.pavez@falabella.cl")
+        self.falabella_email_entry.insert(0, self.app.config.get("falabella_email") or "")
+        self.falabella_email_entry.grid(row=11, column=0, columnspan=3, sticky="ew", padx=20, pady=(0, 4))
+        ctk.CTkButton(
+            wrap,
+            text=t("settings.general.save_emails"),
+            width=140,
+            command=self._on_save_email_accounts,
+        ).grid(row=12, column=2, sticky="e", padx=5, pady=(4, 0))
+
+        SectionLabel(wrap, text=t("settings.general.fbbatch_root")).grid(row=13, column=0, columnspan=3, sticky="w", pady=(15, 4))
+        self.fbbatch_root_entry = ctk.CTkEntry(wrap)
+        self.fbbatch_root_entry.insert(0, self.app.config.get("fbbatch_root") or "")
+        self.fbbatch_root_entry.grid(row=14, column=0, columnspan=2, sticky="ew", padx=20, pady=2)
+        ctk.CTkButton(
+            wrap, text=t("settings.general.browse"), width=100,
+            command=self._on_browse_fbbatch_root,
+        ).grid(row=14, column=2, padx=5, pady=2)
+
         self.verify_savings_apply_var = ctk.BooleanVar(
             value=bool(self.app.config.get("verify_savings_apply", False)),
         )
@@ -269,7 +298,7 @@ class SettingsView(ctk.CTkFrame):
             wrap,
             text=t("settings.general.verify_savings_apply"),
             variable=self.verify_savings_apply_var,
-        ).grid(row=7, column=0, columnspan=3, sticky="w", padx=20, pady=(10, 2))
+        ).grid(row=15, column=0, columnspan=3, sticky="w", padx=20, pady=(10, 2))
         ctk.CTkLabel(
             wrap,
             text=t("settings.general.verify_savings_apply_help"),
@@ -277,25 +306,25 @@ class SettingsView(ctk.CTkFrame):
             justify="left",
             text_color=("gray40", "gray65"),
             wraplength=760,
-        ).grid(row=8, column=0, columnspan=3, sticky="ew", padx=20, pady=(0, 4))
+        ).grid(row=16, column=0, columnspan=3, sticky="ew", padx=20, pady=(0, 4))
 
         # Test connection
         SectionLabel(wrap, text=t("settings.general.test_section")).grid(
-            row=9, column=0, columnspan=3, sticky="w", pady=(15, 4),
+            row=17, column=0, columnspan=3, sticky="w", pady=(15, 4),
         )
         self._test_options = self._collect_test_options()
         values = [opt[0] for opt in self._test_options] or [t("settings.general.test_no_creds")]
         self.test_db_select = ctk.CTkOptionMenu(wrap, values=values)
-        self.test_db_select.grid(row=10, column=0, columnspan=2, sticky="ew", padx=20, pady=2)
+        self.test_db_select.grid(row=18, column=0, columnspan=2, sticky="ew", padx=20, pady=2)
         ctk.CTkButton(
             wrap, text=t("settings.general.test"), width=100,
             command=self._on_test_connection,
-        ).grid(row=10, column=2, padx=5, pady=2)
+        ).grid(row=18, column=2, padx=5, pady=2)
         self.test_status_label = ctk.CTkLabel(
             wrap, text="", anchor="w", justify="left",
             font=ctk.CTkFont(family="Consolas", size=11),
         )
-        self.test_status_label.grid(row=11, column=0, columnspan=3, sticky="ew", padx=20, pady=(2, 4))
+        self.test_status_label.grid(row=19, column=0, columnspan=3, sticky="ew", padx=20, pady=(2, 4))
 
         wrap.grid_columnconfigure(0, weight=1)
         wrap.grid_columnconfigure(1, weight=1)
@@ -402,8 +431,22 @@ class SettingsView(ctk.CTkFrame):
         else:
             messagebox.showwarning(t("common.warning"), t("settings.general.sqlcl_not_found"))
 
+    def _on_browse_fbbatch_root(self):
+        folder = filedialog.askdirectory(title=t("settings.general.fbbatch_root"))
+        if folder:
+            self.fbbatch_root_entry.delete(0, "end")
+            self.fbbatch_root_entry.insert(0, folder)
+
+    def _on_save_email_accounts(self):
+        self.app.config.set("oracle_email", self.oracle_email_entry.get().strip())
+        self.app.config.set("falabella_email", self.falabella_email_entry.get().strip())
+        messagebox.showinfo(t("common.info"), t("settings.cred.saved"))
+
     def _on_apply_general(self):
         self.app.config.set("sqlcl_path", self.sqlcl_entry.get().strip())
+        self.app.config.set("oracle_email", self.oracle_email_entry.get().strip())
+        self.app.config.set("falabella_email", self.falabella_email_entry.get().strip())
+        self.app.config.set("fbbatch_root", self.fbbatch_root_entry.get().strip())
         self.app.config.set("verify_savings_apply", bool(self.verify_savings_apply_var.get()))
         messagebox.showinfo(t("common.info"), t("settings.cred.saved"))
 

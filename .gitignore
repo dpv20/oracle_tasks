@@ -39,8 +39,12 @@ sqlcl-latest.zip
 
 # Local temp folders
 tmp*/
+shift/
 temp_savings/
 outputs/
+
+# Local FBBatchSetup runtime (contains environment configuration and credentials)
+FBBatchSetup/
 
 
 

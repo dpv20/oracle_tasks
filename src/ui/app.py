@@ -18,6 +18,7 @@ from paths import ASSETS_DIR, REPO_ROOT
 from version import __version__
 
 from .home_view import HomeView
+from .fbbatch_view import FBBatchSetupView
 from .settings_view import SettingsView
 from .spools_cl_view import SpoolsCLView
 from .spools_savings_view import SpoolsSavingsView
@@ -62,7 +63,7 @@ class OracleTasksApp:
         self._menu_buttons: dict[str, ctk.CTkButton] = {}
 
         # Quick initialization, actual localized text labels will be loaded dynamically
-        for view_name in ["home", "spools_cl", "spools_savings", "settings"]:
+        for view_name in ["home", "spools_cl", "spools_savings", "fbbatch", "settings"]:
             btn = ctk.CTkButton(
                 self.sidebar,
                 text="",
@@ -133,6 +134,7 @@ class OracleTasksApp:
             "spools_savings": "💵  " + t("home.savings_button"),
             "settings": "⚙️  " + t("settings.title"),
         }
+        menu_labels["fbbatch"] = "FB  " + t("fbbatch.nav")
         for view_name, label in menu_labels.items():
             if view_name in self._menu_buttons:
                 self._menu_buttons[view_name].configure(text=label)
@@ -217,6 +219,8 @@ class OracleTasksApp:
             return SpoolsCLView(self.container, app=self)
         if name == "spools_savings":
             return SpoolsSavingsView(self.container, app=self)
+        if name == "fbbatch":
+            return FBBatchSetupView(self.container, app=self)
         raise ValueError(f"Unknown view: {name}")
 
     def rebuild_views(self) -> None:

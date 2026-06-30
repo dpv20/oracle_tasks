@@ -53,6 +53,14 @@ class HomeView(ctk.CTkFrame):
             branch_desc = "Create and maintain Falabella branch records using standardized business fields."
             branch_btn = "Coming Soon"
 
+        branch_title = "FBBatchSetup"
+        branch_desc = (
+            "Genera PDFs de EOD Batch Event y Batch Report desde los procesos Java existentes."
+            if lang == "es"
+            else "Generate EOD Batch Event and Batch Report PDFs from the existing Java tools."
+        )
+        branch_btn = "Abrir FBBatchSetup" if lang == "es" else "Open FBBatchSetup"
+
         self.welcome_lbl = ctk.CTkLabel(
             self.header_frame,
             text=welcome_title,
@@ -118,8 +126,7 @@ class HomeView(ctk.CTkFrame):
             title=branch_title,
             description=branch_desc,
             btn_text=branch_btn,
-            command=self._on_create_branch,
-            disabled=True
+            command=self._on_fbbatch
         )
 
     def _build_card_content(self, card: CardFrame, title: str, description: str, btn_text: str, command: callable, disabled: bool = False) -> None:
@@ -182,6 +189,5 @@ class HomeView(ctk.CTkFrame):
     def _on_cmr_chile(self) -> None:
         self.app.show_cmr_chile()
 
-    def _on_create_branch(self) -> None:
-        from tkinter import messagebox
-        messagebox.showinfo(t("common.info"), t("home.create_branch_coming_soon"), parent=self)
+    def _on_fbbatch(self) -> None:
+        self.app.show_view("fbbatch")

@@ -4,12 +4,20 @@ Passwords inside credential dicts are encrypted with DPAPI before being written
 to disk and decrypted on read. Encryption is per-Windows-user, so the file is
 unreadable by other accounts on the same machine.
 
-Config schema (v4):
+Config schema (v5):
 {
-  "version": 4,
+  "version": 5,
   "language": "en" | "es",
   "theme": "light" | "dark",
   "sqlcl_path": "<absolute path to sql.exe>",
+  "fbbatch_root": "<absolute path to FBBatchSetup folder; empty = repo/FBBatchSetup>",
+  "oracle_email": "",
+  "falabella_email": "",
+  "fbbatch_mail_subject": "NSSR : {MONTH_UPPER} {DAY} {YEAR}",
+  "fbbatch_mail_from": "",
+  "fbbatch_mail_to": "",
+  "fbbatch_mail_cc": "",
+  "fbbatch_mail_body": "<template>",
   "spools_cl_output_dir": "<override; empty = use default in DATA_DIR>",
   "verify_savings_apply": false,
   "credentials": {
@@ -28,6 +36,7 @@ Config schema (v4):
 import base64
 import json
 import logging
+import re
 from copy import deepcopy
 from typing import Any
 
@@ -36,10 +45,18 @@ from paths import CONFIG_DIR, CONFIG_FILE
 log = logging.getLogger(__name__)
 
 DEFAULTS: dict[str, Any] = {
-    "version": 4,
+    "version": 5,
     "language": "en",
     "theme": "light",
     "sqlcl_path": "",
+    "oracle_email": "",
+    "falabella_email": "",
+    "fbbatch_root": "",
+    "fbbatch_mail_subject": "NSSR : {MONTH_UPPER} {DAY} {YEAR}",
+    "fbbatch_mail_from": "",
+    "fbbatch_mail_to": '"Michell Zambrano" <michell.zambrano@oracle.com>; "Adarsh Kumar" <adarsh.kumar@oracle.com>; "Jackeline R Diaz Junco" <jroxadiazj@falabella.cl>; "Batch Support Flex FIF" <batchsoporteflexfif@falabella.cl>; "Ricardo Campos Barraza" <riccamposb@falabella.cl>; "Marco Aurelio Luna" <maluna@falabella.cl>; "aechacinm@Falabella.cl" <aechacinm@Falabella.cl>',
+    "fbbatch_mail_cc": '"KANNAN MUTHUSAMY" <kannan.m@oracle.com>; "Sharath Pattabiraman" <sharath.pattabiraman@oracle.com>; "Ashwin M" <ashwin.m@oracle.com>; "Diego Pavez" <diego.pavez@oracle.com>',
+    "fbbatch_mail_body": "",
     "spools_cl_output_dir": "",
     "verify_savings_apply": False,
     "credentials": {
@@ -52,6 +69,14 @@ DEFAULTS: dict[str, Any] = {
 
 CRED_BUCKETS = ("shared_prod", "user_qa", "user_dev", "user_bup_qa", "user_bup_prod")
 CRED_COUNTRIES = ("chile", "peru", "colombia", "mexico")
+DIEGO_CC_RECIPIENT = '"Diego Pavez" <diego.pavez@oracle.com>'
+
+
+def _ensure_mail_recipient(raw: str, recipient: str, email: str) -> str:
+    if re.search(re.escape(email), raw or "", flags=re.IGNORECASE):
+        return raw
+    raw = (raw or "").strip()
+    return f"{raw}; {recipient}" if raw else recipient
 
 
 # ── DPAPI password encryption ────────────────────────────────────────────────
@@ -129,6 +154,12 @@ class ConfigManager:
                 merged[k] = v
         if loaded_version < 4:
             merged["verify_savings_apply"] = False
+        if loaded_version < 5:
+            merged["fbbatch_mail_cc"] = _ensure_mail_recipient(
+                str(merged.get("fbbatch_mail_cc") or ""),
+                DIEGO_CC_RECIPIENT,
+                "diego.pavez@oracle.com",
+            )
         merged["version"] = DEFAULTS["version"]
         return merged
 
