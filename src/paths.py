@@ -27,6 +27,7 @@ SPOOLS_CMR_OUT_DIR = DATA_DIR / "spools_CMR"
 SPOOLS_SAVINGS_OUT_DIR = DATA_DIR / "spools_savings_out"
 SQLCL_DIR = DATA_DIR / "sqlcl"
 LOG_FILE = DATA_DIR / "app.log"
+SHOW_FLAG_PATH = DATA_DIR / "show.flag"
 
 
 def ensure_dirs() -> None:

@@ -12,6 +12,8 @@ T: dict[str, dict[str, str]] = {
     "en": {
         # Window
         "app.title": "Oracle Tasks Chile",
+        "tray.open": "Open",
+        "tray.exit": "Exit",
 
         # Home view
         "home.spools_cl_button": "Consumer Lending",
@@ -348,6 +350,10 @@ T: dict[str, dict[str, str]] = {
         "vpn.nav": "VPN",
         "vpn.title": "VPN connections",
         "vpn.refresh": "Refresh status",
+        "vpn.settings": "VPN settings",
+        "vpn.settings.opening": "Opening VPN Switcher settings...",
+        "vpn.settings.opened": "VPN Switcher settings opened.",
+        "vpn.show_bice": "Show BICE",
         "vpn.checking": "Checking VPN status...",
         "vpn.connected": "Connected",
         "vpn.disconnected": "Disconnected",
@@ -388,6 +394,8 @@ T: dict[str, dict[str, str]] = {
     "es": {
         # Window
         "app.title": "Oracle Tasks Chile",
+        "tray.open": "Abrir",
+        "tray.exit": "Salir",
 
         # Home view
         "home.spools_cl_button": "Consumer Lending",
@@ -721,6 +729,10 @@ T: dict[str, dict[str, str]] = {
         "vpn.nav": "VPN",
         "vpn.title": "Conexiones VPN",
         "vpn.refresh": "Actualizar estado",
+        "vpn.settings": "Configuracion VPN",
+        "vpn.settings.opening": "Abriendo la configuracion de VPN Switcher...",
+        "vpn.settings.opened": "Configuracion de VPN Switcher abierta.",
+        "vpn.show_bice": "Mostrar BICE",
         "vpn.checking": "Revisando estado de VPN...",
         "vpn.connected": "Conectado",
         "vpn.disconnected": "Desconectado",

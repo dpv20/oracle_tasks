@@ -261,6 +261,26 @@ class VPNSwitcherBridge:
             log.exception("Could not launch VPN Switcher installer")
             return False, f"Could not launch the VPN Switcher installer: {exc}"
 
+    def open_settings(self) -> tuple[bool, str]:
+        """Open the native settings dialog in the running VPN Switcher instance."""
+        if not self.rediscover():
+            return False, "VPN Switcher is not installed."
+        with self._operation_lock:
+            background_ok, background_message = self.ensure_background_running()
+            if not background_ok:
+                return False, background_message
+            try:
+                show_flag = self.installation.root.parent / "show.flag"
+                show_flag.write_text("show", encoding="utf-8")
+            except OSError as exc:
+                log.exception("Could not signal VPN Switcher window")
+                return False, f"Could not open VPN Switcher: {exc}"
+
+            with _com_apartment():
+                if _click_vpn_switcher_settings():
+                    return True, "VPN Switcher settings opened."
+            return False, "VPN Switcher opened, but its Settings button was not found."
+
     def _get_controller(self):
         if not self.available:
             raise RuntimeError("VPN Switcher is not installed.")
@@ -377,6 +397,72 @@ def _read_controller_status(controller, attempts: int = 3) -> str:
 def _is_recoverable_forti_error(message: str) -> bool:
     normalized = (message or "").lower()
     return any(fragment in normalized for fragment in _FORTI_RETRY_ERRORS)
+
+
+def _click_vpn_switcher_settings(timeout: float = 8.0) -> bool:
+    """Restore VPN Switcher and click its bottom-right native Settings button."""
+    try:
+        from pywinauto import Desktop
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            windows = [
+                window
+                for window in Desktop(backend="win32").windows()
+                if window.window_text().startswith("VPN Switcher")
+            ]
+            for window in windows:
+                if "settings" in window.window_text().lower():
+                    try:
+                        window.set_focus()
+                    except Exception:
+                        pass
+                    return True
+            main_window = next(
+                (window for window in windows if window.window_text() == "VPN Switcher"),
+                None,
+            )
+            if main_window is not None:
+                try:
+                    main_window.set_focus()
+                    buttons = [
+                        control
+                        for control in main_window.descendants()
+                        if control.friendly_class_name() == "Button"
+                    ]
+                    positions = [
+                        (index, control.rectangle().left, control.rectangle().top)
+                        for index, control in enumerate(buttons)
+                    ]
+                    button_index = _select_bottom_right_button(positions)
+                    if button_index < 0:
+                        time.sleep(0.25)
+                        continue
+                    buttons[button_index].click_input()
+                    confirmation_deadline = min(deadline, time.monotonic() + 3)
+                    while time.monotonic() < confirmation_deadline:
+                        for settings_window in Desktop(backend="win32").windows():
+                            title = settings_window.window_text()
+                            if title.startswith("VPN Switcher") and "settings" in title.lower():
+                                try:
+                                    settings_window.set_focus()
+                                except Exception:
+                                    pass
+                                return True
+                        time.sleep(0.1)
+                except Exception:
+                    pass
+            time.sleep(0.25)
+    except Exception:
+        log.exception("Could not automate the VPN Switcher Settings button")
+    return False
+
+
+def _select_bottom_right_button(buttons: list[tuple[int, int, int]]) -> int:
+    """Return the identifier of the lowest, then rightmost, Tk button."""
+    if not buttons:
+        return -1
+    return max(buttons, key=lambda item: (item[2], item[1]))[0]
 
 
 @contextmanager

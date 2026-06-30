@@ -15,8 +15,13 @@ account spool extraction (PROD → QA/DEV) for Chile, Peru, Colombia and Mexico.
    - Detect **SQLcl** (PATH → common locations → menu prompt if not found).
    - Install Python dependencies.
    - Create desktop and Start Menu shortcuts **"Oracle Tasks Chile"**.
+   - Register the app to start hidden with the current Windows user.
 3. Launch the app from that shortcut.
 4. To pin it, pin **Oracle Tasks Chile** from the Start Menu shortcut.
+
+The installed app stays available in the Windows notification area. Closing
+the main window hides it without interrupting active work. Use **Open** from
+the tray icon to restore it, or **Exit** to stop it completely.
 
 > The app updates itself: when a new version lands on `main`, a banner appears
 > at the top of the home screen — click it and the app installs the update.

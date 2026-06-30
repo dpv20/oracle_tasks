@@ -25,6 +25,9 @@ taskkill /F /IM pythonw.exe /FI "WINDOWTITLE eq Oracle Tasks Chile" >nul 2>&1
 taskkill /F /IM python.exe  /FI "WINDOWTITLE eq Oracle Tasks Chile" >nul 2>&1
 timeout /t 1 /nobreak >nul
 
+:: Remove Windows startup registration
+reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v OracleTasksChile /f >nul 2>&1
+
 :: Remove app + data
 if exist "%LOCALAPPDATA%\OracleTasksChile" (
     rmdir /s /q "%LOCALAPPDATA%\OracleTasksChile"

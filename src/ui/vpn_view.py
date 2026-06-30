@@ -70,6 +70,24 @@ class VPNView(ctk.CTkFrame):
             command=self.refresh_status,
         )
         self.refresh_button.pack(side="right")
+        self.settings_button = IconButton(
+            header,
+            text=f"\u2699  {t('vpn.settings')}",
+            width=145,
+            height=36,
+            command=self._open_vpn_settings,
+        )
+        self.settings_button.pack(side="right", padx=(0, 10))
+        self.show_bice_var = ctk.BooleanVar(
+            value=bool(self.app.config.get("vpn_show_bice", False))
+        )
+        self.show_bice_checkbox = ctk.CTkCheckBox(
+            header,
+            text=t("vpn.show_bice"),
+            variable=self.show_bice_var,
+            command=self._toggle_bice,
+        )
+        self.show_bice_checkbox.pack(side="right", padx=(0, 16))
 
         self.status_band = ctk.CTkFrame(
             self.body,
@@ -142,12 +160,12 @@ class VPNView(ctk.CTkFrame):
         )
         self.install_button.pack(side="right", padx=18, pady=14)
 
-        controls = ctk.CTkFrame(self.body, fg_color="transparent")
-        controls.pack(fill="x", pady=(0, 14))
-        controls.grid_columnconfigure((0, 1), weight=1, uniform="vpn_cards")
-        controls.grid_rowconfigure((0, 1), minsize=145)
+        self.controls = ctk.CTkFrame(self.body, fg_color="transparent")
+        self.controls.pack(fill="x", pady=(0, 14))
+        self.controls.grid_columnconfigure((0, 1), weight=1, uniform="vpn_cards")
+        self.controls.grid_rowconfigure((0, 1), minsize=145)
         for index, (target, title_key, subtitle_key) in enumerate(self._CARD_DATA):
-            card = CardFrame(controls, corner_radius=8)
+            card = CardFrame(self.controls, corner_radius=8)
             card.grid(
                 row=index // 2,
                 column=index % 2,
@@ -178,6 +196,7 @@ class VPNView(ctk.CTkFrame):
             button.grid(row=2, column=0, sticky="e", padx=18, pady=(12, 17))
             self._cards[target] = card
             self._buttons[target] = button
+        self._apply_bice_visibility()
 
         footer = ctk.CTkFrame(self.body, fg_color="transparent")
         footer.pack(fill="x")
@@ -218,6 +237,7 @@ class VPNView(ctk.CTkFrame):
             return
         self._refreshing = True
         self.refresh_button.configure(state="disabled")
+        self.settings_button.configure(state="disabled")
         self.message_label.configure(text=t("vpn.checking"))
 
         def worker() -> None:
@@ -288,6 +308,76 @@ class VPNView(ctk.CTkFrame):
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _open_vpn_settings(self) -> None:
+        if self._running or self._refreshing:
+            return
+        if not self.bridge.available:
+            self._show_unavailable()
+            return
+        self._running = True
+        self._cancel_poll()
+        self._set_controls_enabled(False)
+        self.refresh_button.configure(state="disabled")
+        self.settings_button.configure(state="disabled")
+        self.progress.start()
+        self.message_label.configure(text=t("vpn.settings.opening"))
+
+        def worker() -> None:
+            ok, message = self.bridge.open_settings()
+            self._ui(lambda: self._finish_open_settings(ok, message))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_open_settings(self, ok: bool, message: str) -> None:
+        self._running = False
+        self.progress.stop()
+        self.progress.set(0)
+        self.refresh_button.configure(state="normal")
+        self.settings_button.configure(state="normal")
+        self.message_label.configure(
+            text=t("vpn.settings.opened") if ok else message,
+            text_color=("#475569", "#94a3b8") if ok else ("#b91c1c", "#fca5a5"),
+        )
+        self._set_controls_enabled(self.bridge.configured)
+        if not ok:
+            messagebox.showerror(t("common.error"), message, parent=self)
+        self._schedule_poll()
+
+    def _toggle_bice(self) -> None:
+        self.app.config.set("vpn_show_bice", bool(self.show_bice_var.get()))
+        self._apply_bice_visibility()
+
+    def _apply_bice_visibility(self) -> None:
+        bice_card = self._cards.get(GPROT)
+        none_card = self._cards.get(NONE)
+        if bice_card is None or none_card is None:
+            return
+        if self.show_bice_var.get():
+            bice_card.grid()
+            bice_card.grid_configure(
+                row=1,
+                column=0,
+                columnspan=1,
+                padx=(0, 7),
+                pady=(7, 0),
+            )
+            none_card.grid_configure(
+                row=1,
+                column=1,
+                columnspan=1,
+                padx=(7, 0),
+                pady=(7, 0),
+            )
+        else:
+            bice_card.grid_remove()
+            none_card.grid_configure(
+                row=1,
+                column=0,
+                columnspan=2,
+                padx=0,
+                pady=(7, 0),
+            )
+
     def _finish_install(self, ok: bool, message: str) -> None:
         self._running = False
         self.install_button.configure(state="normal")
@@ -353,6 +443,7 @@ class VPNView(ctk.CTkFrame):
     def _finish_refresh(self) -> None:
         self._refreshing = False
         self.refresh_button.configure(state="normal")
+        self.settings_button.configure(state="normal")
         self._schedule_poll()
 
     def _style_cards(self) -> None:

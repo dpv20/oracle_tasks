@@ -12,6 +12,7 @@ import sys
 sys.path.insert(0, os.path.dirname(__file__))
 
 from app_identity import APP_USER_MODEL_ID
+from paths import SHOW_FLAG_PATH
 
 
 def _set_dpi_aware() -> None:
@@ -33,13 +34,6 @@ def _set_app_user_model_id() -> None:
         pass
 
 
-SHOW_FLAG_PATH = os.path.join(
-    os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
-    "OracleTasksChile",
-    "show.flag",
-)
-
-
 def _single_instance_guard() -> None:
     """If another instance is running, drop a flag file it'll see and exit silently."""
     try:
@@ -47,12 +41,16 @@ def _single_instance_guard() -> None:
         ctypes.windll.kernel32.CreateMutexW(None, False, "OracleTasksChile_SingleInstance")
         if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
             try:
-                os.makedirs(os.path.dirname(SHOW_FLAG_PATH), exist_ok=True)
-                with open(SHOW_FLAG_PATH, "w", encoding="utf-8") as f:
+                SHOW_FLAG_PATH.parent.mkdir(parents=True, exist_ok=True)
+                with SHOW_FLAG_PATH.open("w", encoding="utf-8") as f:
                     f.write("show")
             except Exception:
                 pass
             sys.exit(0)
+        try:
+            SHOW_FLAG_PATH.unlink(missing_ok=True)
+        except OSError:
+            pass
     except Exception:
         pass
 
@@ -68,8 +66,11 @@ def main() -> None:
     from infra.logger import setup_logger
     setup_logger()
 
+    from infra.startup import ensure_startup_registration
+    ensure_startup_registration()
+
     from ui.app import OracleTasksApp
-    OracleTasksApp().run()
+    OracleTasksApp(start_hidden="--background" in sys.argv[1:]).run()
 
 
 if __name__ == "__main__":

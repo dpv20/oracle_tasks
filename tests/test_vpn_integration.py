@@ -16,6 +16,7 @@ from vpn_integration import (  # noqa: E402
     NONE,
     VPNSwitcherBridge,
     _com_apartment,
+    _select_bottom_right_button,
     _read_controller_status,
 )
 
@@ -94,6 +95,15 @@ def _bridge(controller: _FakeController) -> VPNSwitcherBridge:
 
 
 class VPNSwitcherBridgeTests(unittest.TestCase):
+    def test_vpn_settings_selects_bottom_right_button(self) -> None:
+        buttons = [
+            (101, 200, 700),
+            (202, 800, 700),
+            (303, 900, 100),
+        ]
+
+        self.assertEqual(_select_bottom_right_button(buttons), 202)
+
     def test_com_is_initialized_for_worker_thread(self) -> None:
         pythoncom = SimpleNamespace(
             COINIT_MULTITHREADED=0,

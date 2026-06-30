@@ -5,6 +5,7 @@ import logging
 import os
 import sys
 import webbrowser
+from queue import Empty, SimpleQueue
 from tkinter import messagebox
 
 import customtkinter as ctk
@@ -12,8 +13,9 @@ import customtkinter as ctk
 from app_identity import APP_DISPLAY_NAME, APP_USER_MODEL_ID
 from settings.config import ConfigManager
 from i18n import set_language, t
+from infra.tray import TrayController
 from infra.updater import check_for_update, launch_update
-from paths import ASSETS_DIR, REPO_ROOT
+from paths import ASSETS_DIR, REPO_ROOT, SHOW_FLAG_PATH
 from version import __version__
 
 from .home_view import HomeView
@@ -28,7 +30,10 @@ log = logging.getLogger(__name__)
 
 
 class OracleTasksApp:
-    def __init__(self) -> None:
+    def __init__(self, start_hidden: bool = False) -> None:
+        self._start_hidden = start_hidden
+        self._background_requests: SimpleQueue[str] = SimpleQueue()
+        self._shutting_down = False
         self.config = ConfigManager()
 
         # Apply persisted language + theme BEFORE creating widgets
@@ -37,12 +42,15 @@ class OracleTasksApp:
         ctk.set_default_color_theme("blue")
 
         self.root = ctk.CTk()
+        if start_hidden:
+            self.root.withdraw()
         self.root.title(t("app.title"))
         # Optimized window sizing for a professional side navigation layout
         self.root.geometry("1100x720")
         self.root.minsize(850, 600)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
-        self.root.after(0, self._maximize)
+        if not start_hidden:
+            self.root.after(0, self._maximize)
         self._set_window_icon()
 
         # Left Sidebar Navigation Frame
@@ -124,6 +132,17 @@ class OracleTasksApp:
 
         self._views: dict[str, ctk.CTkFrame] = {}
         self.show_view("home")
+
+        self._tray = TrayController(
+            on_open=lambda: self._background_requests.put("open"),
+            on_exit=lambda: self._background_requests.put("exit"),
+            open_label=t("tray.open"),
+            exit_label=t("tray.exit"),
+        )
+        tray_started = self._tray.start()
+        if start_hidden and not tray_started:
+            self.root.after(0, self._show_window)
+        self.root.after(250, self._poll_background_requests)
 
     # ── sidebar helpers ──
     def _update_sidebar_labels(self) -> None:
@@ -267,13 +286,62 @@ class OracleTasksApp:
             log.error("Failed to launch update.bat: %s", e)
             return
         self.banner.configure(text=t("update.installing"))
-        self.root.after(500, self.root.destroy)
+        self.root.after(500, self._shutdown)
 
     def _on_close(self) -> None:
+        self._hide_window()
+
+    def _hide_window(self) -> None:
+        """Hide the UI while allowing active tasks to continue."""
+        self.root.withdraw()
+
+    def _show_window(self) -> None:
+        if self._shutting_down:
+            return
+        self.root.deiconify()
+        self._maximize()
+        self.root.lift()
+        self.root.focus_force()
+
+    def _exit_application(self) -> None:
         if self._has_running_work():
+            self._show_window()
             self._warn_running_work()
             return
+        self._shutdown()
+
+    def _shutdown(self) -> None:
+        if self._shutting_down:
+            return
+        self._shutting_down = True
+        self._tray.stop()
         self.root.destroy()
+
+    def _poll_background_requests(self) -> None:
+        """Handle tray commands and requests from a second app launch on Tk's thread."""
+        if self._shutting_down:
+            return
+
+        try:
+            while True:
+                action = self._background_requests.get_nowait()
+                if action == "open":
+                    self._show_window()
+                elif action == "exit":
+                    self._exit_application()
+                    if self._shutting_down:
+                        return
+        except Empty:
+            pass
+
+        try:
+            if SHOW_FLAG_PATH.is_file():
+                SHOW_FLAG_PATH.unlink()
+                self._show_window()
+        except OSError as exc:
+            log.warning("Could not consume show request: %s", exc)
+
+        self.root.after(250, self._poll_background_requests)
 
     # ── theme/language switching ──
     def apply_language(self, lang: str) -> None:
