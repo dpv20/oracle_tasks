@@ -19,6 +19,7 @@ from version import __version__
 
 from .home_view import HomeView
 from .fbbatch_view import FBBatchSetupView
+from .vpn_view import VPNView
 from .settings_view import SettingsView
 from .spools_cl_view import SpoolsCLView
 from .spools_savings_view import SpoolsSavingsView
@@ -63,7 +64,7 @@ class OracleTasksApp:
         self._menu_buttons: dict[str, ctk.CTkButton] = {}
 
         # Quick initialization, actual localized text labels will be loaded dynamically
-        for view_name in ["home", "spools_cl", "spools_savings", "fbbatch", "settings"]:
+        for view_name in ["home", "spools_cl", "spools_savings", "fbbatch", "vpn", "settings"]:
             btn = ctk.CTkButton(
                 self.sidebar,
                 text="",
@@ -135,6 +136,7 @@ class OracleTasksApp:
             "settings": "⚙️  " + t("settings.title"),
         }
         menu_labels["fbbatch"] = "☾  " + t("fbbatch.nav")
+        menu_labels["vpn"] = "◉  " + t("vpn.nav")
         for view_name, label in menu_labels.items():
             if view_name in self._menu_buttons:
                 self._menu_buttons[view_name].configure(text=label)
@@ -170,10 +172,15 @@ class OracleTasksApp:
     # ── view router ──
     def show_view(self, name: str) -> None:
         for v in self._views.values():
+            if v.winfo_ismapped() and hasattr(v, "on_hide"):
+                v.on_hide()
             v.pack_forget()
         if name not in self._views:
             self._views[name] = self._build_view(name)
-        self._views[name].pack(fill="both", expand=True)
+        active_view = self._views[name]
+        active_view.pack(fill="both", expand=True)
+        if hasattr(active_view, "on_show"):
+            active_view.on_show()
 
         # Highlight active sidebar button
         for view_name, btn in self._menu_buttons.items():
@@ -221,6 +228,8 @@ class OracleTasksApp:
             return SpoolsSavingsView(self.container, app=self)
         if name == "fbbatch":
             return FBBatchSetupView(self.container, app=self)
+        if name == "vpn":
+            return VPNView(self.container, app=self)
         raise ValueError(f"Unknown view: {name}")
 
     def rebuild_views(self) -> None:

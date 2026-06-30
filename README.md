@@ -72,7 +72,21 @@ and Mexico. QA and DEV runs use the corresponding Chile credential.
 
 ---
 
-## 5. Use it — extract account spools
+## 5. VPN tab
+
+The VPN tab reuses the separately installed **VPN Switcher** controller and its
+per-user configuration. Its normal installation is
+`%LOCALAPPDATA%\VPNSwitcher\app`, while credentials and settings remain in
+`%APPDATA%\VPNSwitcher\config.json`.
+
+Opening the tab keeps the VPN Switcher tray process running in the background.
+Oracle Tasks can then connect Oracle/Cisco, Falabella/FortiClient, BICE/
+GlobalProtect, or disconnect every VPN without opening the VPN Switcher window.
+If the source installation is missing, the tab offers to install it.
+
+---
+
+## 6. Use it — extract account spools
 
 Home → **Consumer Lending**, **CMR Chile** or **Spools / Savings Accounts**.
 

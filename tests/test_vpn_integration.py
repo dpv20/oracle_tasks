@@ -1,0 +1,117 @@
+from __future__ import annotations
+
+import sys
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+
+SRC_DIR = Path(__file__).resolve().parents[1] / "src"
+sys.path.insert(0, str(SRC_DIR))
+
+from vpn_integration import (  # noqa: E402
+    CISCO,
+    FORTI,
+    NONE,
+    VPNSwitcherBridge,
+    _read_controller_status,
+)
+
+
+class _CancelFlag:
+    def clear(self) -> None:
+        pass
+
+
+class _ControllerModule:
+    _autofill_cancel = _CancelFlag()
+
+
+class _FakeController:
+    def __init__(self, status: str = CISCO, disconnect_ok: bool = True) -> None:
+        self.status = status
+        self.disconnect_ok = disconnect_ok
+        self.calls: list[str] = []
+        self.config = {}
+
+    def get_status(self) -> str:
+        return self.status
+
+    def disconnect_cisco(self):
+        self.calls.append("disconnect_cisco")
+        if self.disconnect_ok:
+            self.status = NONE
+        return self.disconnect_ok, "Cisco disconnected" if self.disconnect_ok else "failed"
+
+    def disconnect_forti(self):
+        self.calls.append("disconnect_forti")
+        self.status = NONE
+        return True, "Forti disconnected"
+
+    def disconnect_globalprotect(self):
+        self.calls.append("disconnect_globalprotect")
+        self.status = NONE
+        return True, "GlobalProtect disconnected"
+
+    def connect_cisco(self):
+        self.calls.append("connect_cisco")
+        self.status = CISCO
+        return True, "Cisco connected"
+
+    def connect_forti(self):
+        self.calls.append("connect_forti")
+        self.status = FORTI
+        return True, "Forti connected"
+
+    def connect_globalprotect(self):
+        self.calls.append("connect_globalprotect")
+        return True, "GlobalProtect connected"
+
+
+def _bridge(controller: _FakeController) -> VPNSwitcherBridge:
+    bridge = VPNSwitcherBridge()
+    bridge._controller = controller
+    bridge._controller_module = _ControllerModule()
+    bridge._reload_controller_config = lambda _controller: None
+    bridge.ensure_background_running = lambda: (True, "running")
+    return bridge
+
+
+class VPNSwitcherBridgeTests(unittest.TestCase):
+    @patch("vpn_integration.time.sleep", return_value=None)
+    def test_status_retries_after_transient_disconnected_read(self, _sleep) -> None:
+        statuses = iter((NONE, FORTI))
+        controller = type("StatusController", (), {"get_status": lambda self: next(statuses)})()
+
+        self.assertEqual(_read_controller_status(controller), FORTI)
+
+    @patch("vpn_integration.time.sleep", return_value=None)
+    def test_switch_disconnects_current_vpn_before_connecting_target(self, _sleep) -> None:
+        controller = _FakeController(CISCO)
+        result = _bridge(controller).switch_to(FORTI)
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.status, FORTI)
+        self.assertEqual(controller.calls, ["disconnect_cisco", "connect_forti"])
+
+    @patch("vpn_integration.time.sleep", return_value=None)
+    def test_switch_stops_when_current_vpn_cannot_disconnect(self, _sleep) -> None:
+        controller = _FakeController(CISCO, disconnect_ok=False)
+        result = _bridge(controller).switch_to(FORTI)
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.status, CISCO)
+        self.assertEqual(controller.calls, ["disconnect_cisco"])
+
+    @patch("vpn_integration.time.sleep", return_value=None)
+    def test_no_vpn_disconnects_active_connection(self, _sleep) -> None:
+        controller = _FakeController(FORTI)
+        result = _bridge(controller).switch_to(NONE)
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.status, NONE)
+        self.assertEqual(controller.calls, ["disconnect_forti"])
+
+
+if __name__ == "__main__":
+    unittest.main()

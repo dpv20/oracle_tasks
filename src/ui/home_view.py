@@ -1,16 +1,29 @@
 """Home view — welcome dashboard with feature shortcut cards."""
 from __future__ import annotations
 
-import customtkinter as ctk
-from i18n import t
+import threading
 
+import customtkinter as ctk
+from PIL import Image
+
+from i18n import t
+from paths import ASSETS_DIR
+from vpn_integration import CISCO, FORTI, GPROT, NONE, VPNSwitcherBridge
+
+from .vpn_colors import VPN_COLORS
 from .widgets import CardFrame, IconButton
 
 
 class HomeView(ctk.CTkFrame):
+    VPN_POLL_MS = 5_000
+
     def __init__(self, master, app):
         super().__init__(master, fg_color="transparent")
         self.app = app
+        self._vpn_bridge = VPNSwitcherBridge()
+        self._vpn_poll_id = None
+        self._vpn_refreshing = False
+        self._visible = False
 
         # Main scrollable container to support all screen resolutions gracefully
         self.scroll_container = ctk.CTkScrollableFrame(self, fg_color="transparent")
@@ -57,8 +70,11 @@ class HomeView(ctk.CTkFrame):
         branch_desc = t("fbbatch.home.desc")
         branch_btn = t("fbbatch.home.open")
 
+        header_copy = ctk.CTkFrame(self.header_frame, fg_color="transparent")
+        header_copy.pack(side="left", fill="x", expand=True, anchor="w")
+
         self.welcome_lbl = ctk.CTkLabel(
-            self.header_frame,
+            header_copy,
             text=welcome_title,
             font=ctk.CTkFont(size=26, weight="bold"),
             text_color=("#0f172a", "#ffffff"),
@@ -67,13 +83,38 @@ class HomeView(ctk.CTkFrame):
         self.welcome_lbl.pack(anchor="w")
 
         self.subtitle_lbl = ctk.CTkLabel(
-            self.header_frame,
+            header_copy,
             text=welcome_subtitle,
             font=ctk.CTkFont(size=14),
             text_color=("gray45", "gray55"),
             anchor="w"
         )
         self.subtitle_lbl.pack(anchor="w", pady=(5, 0))
+
+        icon_path = ASSETS_DIR / "vpn_switcher.png"
+        self._vpn_icon = ctk.CTkImage(
+            light_image=Image.open(icon_path),
+            dark_image=Image.open(icon_path),
+            size=(48, 48),
+        )
+        self.vpn_status_button = ctk.CTkButton(
+            self.header_frame,
+            text=f"{t('vpn.nav')}\n{t('vpn.checking')}",
+            image=self._vpn_icon,
+            compound="left",
+            anchor="w",
+            width=280,
+            height=72,
+            corner_radius=8,
+            border_width=2,
+            border_color=VPN_COLORS[NONE],
+            fg_color=("#ffffff", "#111827"),
+            hover_color=("#f1f5f9", "#1e293b"),
+            text_color=("#0f172a", "#f8fafc"),
+            font=ctk.CTkFont(size=13, weight="bold"),
+            command=lambda: self.app.show_view("vpn"),
+        )
+        self.vpn_status_button.pack(side="right", padx=(20, 0))
 
         # Cards Grid Layout Frame
         self.cards_frame = ctk.CTkFrame(self.scroll_container, fg_color="transparent")
@@ -187,3 +228,75 @@ class HomeView(ctk.CTkFrame):
 
     def _on_fbbatch(self) -> None:
         self.app.show_view("fbbatch")
+
+    def on_show(self) -> None:
+        self._visible = True
+        self._vpn_poll_id = self.after(100, self._refresh_vpn_status)
+
+    def on_hide(self) -> None:
+        self._visible = False
+        self._cancel_vpn_poll()
+
+    def _refresh_vpn_status(self) -> None:
+        self._cancel_vpn_poll()
+        if self._vpn_refreshing:
+            self._schedule_vpn_poll()
+            return
+        self._vpn_refreshing = True
+
+        def worker() -> None:
+            status = NONE
+            available = False
+            try:
+                available = self._vpn_bridge.rediscover()
+                if available:
+                    status = self._vpn_bridge.get_status()
+            except Exception:
+                available = False
+            finally:
+                self._ui(lambda: self._finish_vpn_refresh(status, available))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_vpn_refresh(self, status: str, available: bool) -> None:
+        self._vpn_refreshing = False
+        if available:
+            provider_key = {
+                CISCO: "vpn.oracle",
+                FORTI: "vpn.falabella",
+                GPROT: "vpn.bice",
+                NONE: "vpn.none",
+            }.get(status, "vpn.none")
+            state = t("vpn.connected") if status != NONE else t("vpn.disconnected")
+            text = f"{t('vpn.nav')}\n{t(provider_key)} - {state}"
+            color = VPN_COLORS.get(status, VPN_COLORS[NONE])
+        else:
+            text = f"{t('vpn.nav')}\n{t('vpn.unavailable')}"
+            color = VPN_COLORS[NONE]
+        self.vpn_status_button.configure(text=text, border_color=color)
+        self._schedule_vpn_poll()
+
+    def _schedule_vpn_poll(self) -> None:
+        self._cancel_vpn_poll()
+        if self._visible and self.winfo_exists():
+            self._vpn_poll_id = self.after(self.VPN_POLL_MS, self._refresh_vpn_status)
+
+    def _cancel_vpn_poll(self) -> None:
+        if self._vpn_poll_id is not None:
+            try:
+                self.after_cancel(self._vpn_poll_id)
+            except Exception:
+                pass
+            self._vpn_poll_id = None
+
+    def _ui(self, callback) -> None:
+        try:
+            if self.winfo_exists():
+                self.after(0, callback)
+        except Exception:
+            pass
+
+    def destroy(self) -> None:
+        self._visible = False
+        self._cancel_vpn_poll()
+        super().destroy()
