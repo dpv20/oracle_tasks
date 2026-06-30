@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Callable
 
 from paths import DATA_DIR, LOG_FILE, REPO_ROOT
+from settings.config import decrypt_password
 
 
 log = logging.getLogger(__name__)
@@ -23,6 +24,25 @@ SAVED_ISSUES_FILE = DATA_DIR / "fbbatch_saved_issues.json"
 FBBATCH_OUTPUT_DIR = REPO_ROOT / "outputs" / "fbbatch"
 OUTLOOK_DRAFT_SETTLE_SECONDS = 12.0
 ProgressCallback = Callable[[int, str], None]
+_ENV_CREDENTIAL_BUCKET = {
+    "PROD": "shared_prod",
+    "QA": "user_qa",
+    "DEV": "user_dev",
+}
+_PRIMARY_TNS = {
+    ("chile", "PROD"): "FXBFCL_19C_PROD_OCI",
+    ("chile", "QA"): "CHILE_QA_19C",
+    ("chile", "DEV"): "CHILE_DEV",
+    ("peru", "PROD"): "PERU_OCI_PROD",
+    ("colombia", "PROD"): "BFCO_POCISANTIAGO",
+    ("mexico", "PROD"): "MX_PROD_OCI",
+}
+_COUNTRY_PROPERTY_PREFIX = {
+    "chile": "CL",
+    "peru": "PE",
+    "colombia": "COL",
+    "mexico": "MX",
+}
 SPANISH_MONTHS = (
     "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
     "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre",
@@ -82,9 +102,14 @@ def _candidate_fbbatch_roots(root: Path) -> list[Path]:
 def validate_fbbatch_root(configured_root: str | Path | None = None) -> tuple[bool, str, Path]:
     root = resolve_fbbatch_root(configured_root)
     required = (
-        Path("CHILE") / "lib",
-        Path("CommonBatches") / "lib",
-        Path("CommonBatches") / "upload" / "EODBATCH",
+        Path("CHILE") / "lib" / "FalabellaChileCustom.jar",
+        Path("CHILE") / "config" / "configuration.template.properties",
+        Path("CHILE") / "config" / "EODBatchEvent" / "EODBatchEvent.properties",
+        Path("CHILE") / "upload" / "EODBatchEvent" / "Template" / "EODBatchEvent.sql",
+        Path("CommonBatches") / "lib" / "FalabellaCommonBatches.jar",
+        Path("CommonBatches") / "config" / "configuration.template.properties",
+        Path("CommonBatches") / "config" / "EODBATCH" / "FBEODBatches.properties",
+        Path("CommonBatches") / "upload" / "EODBATCH" / "Template" / "EODBatch.sql",
     )
     best_root = root
     missing = list(required)
@@ -98,6 +123,140 @@ def validate_fbbatch_root(configured_root: str | Path | None = None) -> tuple[bo
     if missing:
         return False, "Invalid FBBatchSetup folder. Missing: " + ", ".join(str(p) for p in missing), best_root
     return True, "", best_root
+
+
+def materialize_fbbatch_credentials(
+    configured_root: str | Path,
+    env: str,
+    credentials: dict,
+    *,
+    include_common: bool,
+) -> list[Path]:
+    """Create ignored Java property files from the current user's saved credentials."""
+    ok, msg, root = validate_fbbatch_root(configured_root)
+    if not ok:
+        raise ValueError(msg)
+
+    environment = env.strip().upper()
+    bucket = _ENV_CREDENTIAL_BUCKET.get(environment)
+    if bucket is None:
+        raise ValueError(f"Unsupported Night Shift environment: {env}")
+
+    required_countries = ["chile"]
+    if include_common and environment == "PROD":
+        required_countries.extend(("peru", "colombia", "mexico"))
+
+    selected: dict[str, dict[str, str]] = {}
+    for country in required_countries:
+        selected[country] = _select_fbbatch_credential(
+            credentials,
+            country,
+            bucket,
+            _PRIMARY_TNS.get((country, environment), ""),
+            environment,
+        )
+
+    generated: list[Path] = []
+    try:
+        chile_replacements = _credential_property_values(
+            "CL_PROD" if environment == "PROD" else "CL_DEV",
+            selected["chile"],
+        )
+        generated.append(
+            _write_runtime_configuration(
+                root / "CHILE" / "config" / "configuration.template.properties",
+                root / "CHILE" / "config" / "configuration.properties",
+                chile_replacements,
+            )
+        )
+
+        if include_common:
+            common_replacements = dict(chile_replacements)
+            if environment == "PROD":
+                for country in ("peru", "colombia", "mexico"):
+                    prefix = f"{_COUNTRY_PROPERTY_PREFIX[country]}_PROD"
+                    common_replacements.update(_credential_property_values(prefix, selected[country]))
+            generated.append(
+                _write_runtime_configuration(
+                    root / "CommonBatches" / "config" / "configuration.template.properties",
+                    root / "CommonBatches" / "config" / "configuration.properties",
+                    common_replacements,
+                )
+            )
+        return generated
+    except Exception:
+        remove_materialized_fbbatch_credentials(generated)
+        raise
+
+
+def remove_materialized_fbbatch_credentials(paths: list[Path]) -> None:
+    for path in paths:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            log.exception("Could not remove temporary FBBatch credential file path=%s", path)
+
+
+def _select_fbbatch_credential(
+    credentials: dict,
+    country: str,
+    bucket: str,
+    preferred_tns: str,
+    environment: str,
+) -> dict[str, str]:
+    candidates: list[dict[str, str]] = []
+    for by_login in credentials.get(country, {}).values():
+        if not isinstance(by_login, dict):
+            continue
+        for credential in by_login.values():
+            if isinstance(credential, dict) and credential.get("bucket") == bucket:
+                candidates.append(credential)
+
+    if not candidates:
+        label = country.capitalize()
+        raise ValueError(
+            f"Missing {environment} credential for {label}. Add it in Settings > Credentials."
+        )
+
+    preferred = preferred_tns.upper()
+    candidates.sort(
+        key=lambda item: (
+            0 if str(item.get("tns", "")).upper() == preferred else 1,
+            1 if "DR" in str(item.get("tns", "")).upper() else 0,
+            str(item.get("tns", "")).upper(),
+            str(item.get("user", "")).upper(),
+        )
+    )
+    credential = candidates[0]
+    password = decrypt_password(str(credential.get("password_enc", "")))
+    user = str(credential.get("user", "")).strip()
+    schema = str(credential.get("schema", "")).strip()
+    if not user or not password:
+        label = country.capitalize()
+        raise ValueError(
+            f"The saved {environment} credential for {label} is incomplete. Update it in Settings > Credentials."
+        )
+    return {"user": f"{user}[{schema}]" if schema else user, "password": password}
+
+
+def _credential_property_values(prefix: str, credential: dict[str, str]) -> dict[str, str]:
+    return {
+        f"{prefix}_DB_USER": credential["user"],
+        f"{prefix}_DB_PASSWORD": credential["password"],
+    }
+
+
+def _write_runtime_configuration(template: Path, target: Path, replacements: dict[str, str]) -> Path:
+    text = template.read_text(encoding="utf-8")
+    for key, value in replacements.items():
+        escaped_value = value.replace("\\", "\\\\").replace("\r", "").replace("\n", "")
+        pattern = rf"(?m)^(\s*{re.escape(key)}\s*[=:]\s*).*$"
+        text, count = re.subn(pattern, lambda match: match.group(1) + escaped_value, text)
+        if count != 1:
+            raise ValueError(f"Missing property {key} in {template}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(text, encoding="utf-8")
+    return target
 
 
 def check_falabella_vpn() -> tuple[bool, str]:
@@ -177,52 +336,87 @@ def _is_falabella_vpn_adapter(haystack: str) -> bool:
     )
 
 
-def run_eod_batch_event(env: str, fbbatch_root: str | Path | None = None, progress: ProgressCallback | None = None) -> BatchResult:
+def run_eod_batch_event(
+    env: str,
+    fbbatch_root: str | Path | None = None,
+    progress: ProgressCallback | None = None,
+    *,
+    credentials: dict | None = None,
+) -> BatchResult:
     ok, msg, base_root = validate_fbbatch_root(fbbatch_root)
     if not ok:
         return BatchResult(False, msg)
-    root = base_root / "CHILE"
-    output_dir = root / "output" / "EODBatchEvent"
-    output_dir.mkdir(parents=True, exist_ok=True)
-    before = _latest_html(output_dir)
-    _emit_progress(progress, 1, "Starting EOD Batch Event")
-    result = _run_java(
-        root,
-        "com.fellabela.custom.chile.eodevent.FBCLEODBatchEventApplication",
-        f"{env}\n",
-        progress=progress,
-        progress_kind="event",
-    )
-    html_path = _newest_after(output_dir, before)
-    return _with_pdf(result, html_path, "event", "EODBatchEvent", progress)
+    generated_configs: list[Path] = []
+    try:
+        if credentials is not None:
+            generated_configs = materialize_fbbatch_credentials(
+                base_root, env, credentials, include_common=False
+            )
+        root = base_root / "CHILE"
+        output_dir = root / "output" / "EODBatchEvent"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        before = _latest_html(output_dir)
+        _emit_progress(progress, 1, "Starting EOD Batch Event")
+        result = _run_java(
+            root,
+            "com.fellabela.custom.chile.eodevent.FBCLEODBatchEventApplication",
+            f"{env}\n",
+            progress=progress,
+            progress_kind="event",
+        )
+        html_path = _newest_after(output_dir, before)
+        return _with_pdf(result, html_path, "event", "EODBatchEvent", progress)
+    except (OSError, ValueError) as exc:
+        return BatchResult(False, str(exc))
+    finally:
+        remove_materialized_fbbatch_credentials(generated_configs)
 
 
-def run_batch_report(env: str, latest: bool, report_date: str, has_issue: bool, fbbatch_root: str | Path | None = None, progress: ProgressCallback | None = None) -> BatchResult:
+def run_batch_report(
+    env: str,
+    latest: bool,
+    report_date: str,
+    has_issue: bool,
+    fbbatch_root: str | Path | None = None,
+    progress: ProgressCallback | None = None,
+    *,
+    credentials: dict | None = None,
+) -> BatchResult:
     ok, msg, base_root = validate_fbbatch_root(fbbatch_root)
     if not ok:
         return BatchResult(False, msg)
-    root = base_root / "CommonBatches"
-    output_dir = root / "output" / "EODBATCH"
-    output_dir.mkdir(parents=True, exist_ok=True)
-    before = _latest_html(output_dir)
-    _emit_progress(progress, 1, "Starting EOD Batch Report")
-    latest_answer = "Y" if latest else "N"
-    issue_answer = "Y" if has_issue else "N"
-    lines = [env, latest_answer]
-    if not latest:
-        lines.append(report_date)
-    lines.append(issue_answer)
-    if not has_issue:
-        lines.append("N")
-    result = _run_java(
-        root,
-        "com.fellabela.custom.common.eodbatch.FBEODBatchTimingApp",
-        "\n".join(lines) + "\n",
-        progress=progress,
-        progress_kind="report_issue" if has_issue else "report_no_issue",
-    )
-    html_path = _newest_after(output_dir, before)
-    return _with_report_images(result, html_path, "report", "BatchReport", progress)
+    generated_configs: list[Path] = []
+    try:
+        if credentials is not None:
+            generated_configs = materialize_fbbatch_credentials(
+                base_root, env, credentials, include_common=True
+            )
+        root = base_root / "CommonBatches"
+        output_dir = root / "output" / "EODBATCH"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        before = _latest_html(output_dir)
+        _emit_progress(progress, 1, "Starting EOD Batch Report")
+        latest_answer = "Y" if latest else "N"
+        issue_answer = "Y" if has_issue else "N"
+        lines = [env, latest_answer]
+        if not latest:
+            lines.append(report_date)
+        lines.append(issue_answer)
+        if not has_issue:
+            lines.append("N")
+        result = _run_java(
+            root,
+            "com.fellabela.custom.common.eodbatch.FBEODBatchTimingApp",
+            "\n".join(lines) + "\n",
+            progress=progress,
+            progress_kind="report_issue" if has_issue else "report_no_issue",
+        )
+        html_path = _newest_after(output_dir, before)
+        return _with_report_images(result, html_path, "report", "BatchReport", progress)
+    except (OSError, ValueError) as exc:
+        return BatchResult(False, str(exc))
+    finally:
+        remove_materialized_fbbatch_credentials(generated_configs)
 
 
 def write_issue_properties(issues: list[dict[str, str]], fbbatch_root: str | Path | None = None) -> Path:
@@ -239,6 +433,7 @@ def write_issue_properties(issues: list[dict[str, str]], fbbatch_root: str | Pat
             value = (issue.get(field) or "").replace("\r\n", " ").replace("\n", " ").strip()
             lines.append(f"{idx}_{field}={value}")
         lines.append("")
+    issue_path.parent.mkdir(parents=True, exist_ok=True)
     issue_path.write_text("\n".join(lines), encoding="utf-8")
     return issue_path
 

@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <title>Informe de evento</title>
+     <style>
+        body {
+            font-family: "Segoe UI", Arial, sans-serif;
+            background: #f6f8fa;
+            margin: 0;
+            padding: 20px;
+        }
+        .container {
+            max-width: 860px;
+            margin: 1px auto;
+            background: #fff;
+            border-radius: 12px;
+            box-shadow: 0 4px 20px rgba(0, 40, 120, 0.07);
+            padding: 36px 32px 24px 32px;
+            position: relative; /* To position the logo absolutely */
+        }
+        .top-right-logo {
+            position: absolute;
+            top: 30px;
+            right: 36px;
+            width: 160px;
+            height: auto;
+        }
+        h1 {
+            color: #1b325b;
+            font-size: 1.5em;
+            margin-bottom: 6px;
+            letter-spacing: 0.03em;
+        }
+        .subtitle {
+            color: #395b87;
+            font-size: 1.08em;
+            margin-bottom: 22px;
+        }
+        table {
+            border-collapse: collapse;
+            width: 100%;
+            background: #fafdff;
+            margin-top: 7px;
+            box-shadow: 0 1px 4px rgba(40,60,120,0.04);
+        }
+        th, td {
+            border: 1px solid #dee6ee;
+            padding: 4px 20px;
+            text-align: center;
+            font-size: 0.97em;
+        }
+        th {
+            background-color: #174888;
+            color: #fff;
+            font-weight: bold;
+        }
+        td {
+            color: #212c39;
+        }
+        tr:nth-child(even) td {
+            background: #f6fafd;
+        }
+        .section-header {
+            background-color: #185b96;
+            color: #fff;
+            font-size: 1.13em;
+            font-weight: 600;
+            text-align: left;
+            border-radius: 5px;
+            letter-spacing: 0.02em;
+        }
+        .sub-header {
+            background-color: #ebf2fa;
+            color: #174888;
+            font-weight: bold;
+            text-align: left;
+            font-size: 1.01em;
+        }
+        .sub-total {
+            background-color: #ebf2fa;
+
+            font-weight: bold;
+            text-align: center;
+            font-size: 1.01em;
+        }
+        td:first-child {
+            text-align: left;
+        }
+        caption {
+            caption-side: top;
+            font-weight: bold;
+            font-size: 1.15em;
+            color: #003366;
+            padding-bottom: 9px;
+        }
+        @media (max-width: 900px) {
+            .container {
+                padding: 10px;
+            }
+            table, tbody, th, td, tr {
+                font-size: 14px;
+            }
+            .top-right-logo {
+                top: 10px;
+                right: 10px;
+                width: 80px;
+            }
+        }
+    </style>
+</head>
+<body>
+%EOD_BOD_EVENT_DATA%
+</body>
+</html>

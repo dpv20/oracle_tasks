@@ -60,7 +60,19 @@ Windows user on this machine.
 
 ---
 
-## 4. Use it — extract account spools
+## 4. Night Shift credentials
+
+Night Shift includes its Java runtime in the installation. It does not ship or
+use hardcoded database users or passwords. Before each run, it reads the
+credentials saved under Settings -> **Credentials**, creates local Java
+configuration files for that run, and removes them when the process finishes.
+
+PROD reports require one **PROD (shared)** credential for Chile, Peru, Colombia
+and Mexico. QA and DEV runs use the corresponding Chile credential.
+
+---
+
+## 5. Use it — extract account spools
 
 Home → **Consumer Lending**, **CMR Chile** or **Spools / Savings Accounts**.
 

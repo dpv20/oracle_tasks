@@ -43,8 +43,27 @@ shift/
 temp_savings/
 outputs/
 
-# Local FBBatchSetup runtime (contains environment configuration and credentials)
-FBBatchSetup/
+# Night Shift Java runtime. Runtime credentials, logs and generated files stay local.
+FBBatchSetup/CHILE/config/configuration.properties
+FBBatchSetup/CommonBatches/config/configuration.properties
+FBBatchSetup/CHILE/log/
+FBBatchSetup/CHILE/output/
+FBBatchSetup/CommonBatches/log/
+FBBatchSetup/CommonBatches/output/
+FBBatchSetup/CommonBatches/upload/EODBATCH/EODBatchIssue*.properties
+FBBatchSetup/CHILE/config/EODBatchEvent/EODBatchEvent_BKP
+FBBatchSetup/CHILE/lib/*.old
+FBBatchSetup/CommonBatches/lib/*BKP*
+
+# FBBatchSetup tools unrelated to the Night Shift workflow.
+FBBatchSetup/CHILE/bat/
+FBBatchSetup/CHILE/config/BUPCL/
+FBBatchSetup/CHILE/config/Chisalca/
+FBBatchSetup/CHILE/config/Volumetric/
+FBBatchSetup/CHILE/upload/BUPCL/
+FBBatchSetup/CHILE/upload/Chisalca/
+FBBatchSetup/CHILE/upload/Volumetric/
+FBBatchSetup/CommonBatches/bat/
 
 
 

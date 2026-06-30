@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>NIGHT SHIFT STATUS REPORT: BANCO FALABELLA</title>
+<style>
+body {
+	font-family: "Segoe UI", Arial, sans-serif;
+	background: #f6f8fa;
+	margin: 0;
+	padding: 40px;
+}
+
+.container {
+	max-width: 860px;
+	margin: 24px auto;
+	background: #fff;
+	border-radius: 12px;
+	box-shadow: 0 4px 20px rgba(0, 40, 120, 0.07);
+	padding: 36px 32px 24px 32px;
+	position: relative;
+}
+
+.top-right-logo {
+	position: absolute;
+	top: 55px;
+	right: 36px;
+	width: 150px;
+	height: auto;
+}
+
+h1 {
+	color: #1b325b;
+	font-size: 1.6em;
+	margin-bottom: 6px;
+	letter-spacing: 0.03em;
+}
+
+.subtitle {
+	color: #395b87;
+	font-size: 1.08em;
+	margin-bottom: 22px;
+}
+
+.status {
+	margin: 12px 0 30px 0;
+	font-size: 1.08em;
+	color: #003c18;
+	background: #e6fbe9;
+	padding: 8px 18px;
+	border-left: 6px solid #2ead69;
+	border-radius: 4px;
+	max-width: 480px;
+}
+
+.issuestatus {
+	margin: 12px 0 30px 0;
+	font-size: 1.08em;
+	color: #c0392b;
+	background: #fffbe6;
+	padding: 8px 18px;
+	border-left: 6px solid #c0392b;
+	border-radius: 4px;
+	max-width: 480px;
+}
+
+table {
+	border-collapse: collapse;
+	width: 100%;
+	background: #fafdff;
+	margin-top: 7px;
+	box-shadow: 0 1px 4px rgba(40, 60, 120, 0.04);
+}
+
+th, td {
+	border: 1px solid #dee6ee;
+	padding: 11px 10px;
+	text-align: center;
+	font-size: 0.97em;
+}
+
+th {
+	background-color: #174888;
+	color: #fff;
+	font-weight: bold;
+}
+
+td {
+	color: #212c39;
+}
+
+.country {
+	font-weight: 600;
+	color: #18557a;
+	background: #f1f7fc;
+}
+
+tr:nth-child(even) td {
+	background: #f6fafd;
+}
+
+caption {
+	caption-side: top;
+	font-weight: bold;
+	font-size: 1.15em;
+	color: #003366;
+}
+
+@media ( max-width : 900px) {
+	.container {
+		padding: 10px;
+	}
+	table, tbody, th, td, tr {
+		font-size: 14px;
+	}
+	.top-right-logo {
+		top: 10px;
+		right: 10px;
+		width: 80px;
+	}
+}
+
+.issueLeft {
+	text-align: left;
+}
+</style>
+</head>
+<body>
+	<div class="container">
+		<img src="https://www.oracle.com/a/ocom/img/oracle-logo.svg"
+			alt="Oracle Logo" class="top-right-logo">
+		<h1>NIGHT SHIFT STATUS REPORT : BANCO FALABELLA</h1>
+		<div class="subtitle">
+			Fecha de EOD: <b>%EOD_DATE%</b>
+		</div>
+		<div class="%ISSUE_STATUS_FONT%">
+			Esatdo de Batch: <b>Finalizado %EOD_ISSUE_STATUS% Problemas.</b>
+		</div>
+		<table>
+			<caption>Tiempos de Ejecucion de Batch</caption>
+			<thead>
+				<tr>
+					<th>PAIS</th>
+					<th>PROCESO</th>
+					<th>HORA INICO</th>
+					<th>HORA FIN</th>
+					<th>TIEMPO TOTAL</th>
+				</tr>
+			</thead>
+			<tbody>%EOD_PROCESS_TIMING%
+			</tbody>
+		</table>
+
+		<table style="margin-top: 32px;">%EOD_ISSUE_DETAILS%
+		</table>
+	</div>
+</body>
+</html>

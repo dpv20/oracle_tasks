@@ -540,8 +540,7 @@ class FBBatchSetupView(ctk.CTkFrame):
         report_date = self._current_full_report_date()
         issue_date = report_date_to_issue_date(report_date)
         issues = issues_for_date(issue_date)
-        if issues:
-            write_issue_properties(issues, root)
+        write_issue_properties(issues, root)
 
         subject_template = mail_values["subject_template"]
         from_account = mail_values["from_account"]
@@ -563,6 +562,7 @@ class FBBatchSetupView(ctk.CTkFrame):
                 to=to,
                 cc=cc,
                 body_template=body_template,
+                credentials=self.app.config.all_credentials(),
                 progress=progress,
             )
         )
@@ -580,6 +580,7 @@ class FBBatchSetupView(ctk.CTkFrame):
         to: str,
         cc: str,
         body_template: str,
+        credentials: dict,
         progress,
     ) -> BatchResult:
         report_day = datetime.strptime(report_date, "%d%m%Y").date()
@@ -593,6 +594,7 @@ class FBBatchSetupView(ctk.CTkFrame):
             has_issue,
             root,
             lambda percent, message: progress(1 + int(percent * 0.50), f"Report: {message}"),
+            credentials=credentials,
         )
         if not report_result.ok:
             return report_result
@@ -610,6 +612,7 @@ class FBBatchSetupView(ctk.CTkFrame):
                     env,
                     root,
                     lambda percent, message: progress(53 + int(percent * 0.35), f"Event: {message}"),
+                    credentials=credentials,
                 )
                 if not event_result.ok:
                     return event_result
@@ -662,7 +665,12 @@ class FBBatchSetupView(ctk.CTkFrame):
         if root is None:
             return
         self._active_progress = "event"
-        self._run_background(lambda progress: run_eod_batch_event(env, root, progress))
+        credentials = self.app.config.all_credentials()
+        self._run_background(
+            lambda progress: run_eod_batch_event(
+                env, root, progress, credentials=credentials
+            )
+        )
 
     def _on_run_report(self) -> None:
         env = self.report_env.get()
@@ -679,10 +687,20 @@ class FBBatchSetupView(ctk.CTkFrame):
         root = self._ensure_fbbatch_root()
         if root is None:
             return
-        if has_issue:
-            write_issue_properties(issues, root)
+        write_issue_properties(issues, root)
+        credentials = self.app.config.all_credentials()
         self._active_progress = "report"
-        self._run_background(lambda progress: run_batch_report(env, latest, report_date, has_issue, root, progress))
+        self._run_background(
+            lambda progress: run_batch_report(
+                env,
+                latest,
+                report_date,
+                has_issue,
+                root,
+                progress,
+                credentials=credentials,
+            )
+        )
 
     def _ensure_fbbatch_root(self) -> str | None:
         configured = (self.app.config.get("fbbatch_root") or "").strip()
