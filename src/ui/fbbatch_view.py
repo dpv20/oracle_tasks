@@ -80,6 +80,14 @@ EXAMPLE_ISSUE = {
 }
 
 
+def _scale_phase_progress(percent: int, start: int, end: int) -> int:
+    percent = max(0, min(100, int(percent)))
+    if percent == 0:
+        return start
+    width = max(0, end - start)
+    return min(end, start + max(1, (percent * width) // 100))
+
+
 def _issue_labels() -> dict[str, str]:
     return {
         "DATE": t("fbbatch.issue.date"),
@@ -593,7 +601,9 @@ class FBBatchSetupView(ctk.CTkFrame):
             report_date,
             has_issue,
             root,
-            lambda percent, message: progress(1 + int(percent * 0.50), f"Report: {message}"),
+            lambda percent, message: progress(
+                _scale_phase_progress(percent, 0, 50), f"Report: {message}"
+            ),
             credentials=credentials,
         )
         if not report_result.ok:
@@ -604,14 +614,17 @@ class FBBatchSetupView(ctk.CTkFrame):
         chile_batch_skipped = report_indicates_chile_batch_skipped(report_result.html_path)
         if chile_batch_skipped:
             include_event = False
-            progress(56, t("fbbatch.mail.event_skipped_chile"))
+            progress(90, t("fbbatch.mail.event_skipped_chile"))
 
         if include_event:
             if latest:
+                progress(50, "Event: Starting EOD Batch Event")
                 event_result = run_eod_batch_event(
                     env,
                     root,
-                    lambda percent, message: progress(53 + int(percent * 0.35), f"Event: {message}"),
+                    lambda percent, message: progress(
+                        _scale_phase_progress(percent, 50, 90), f"Event: {message}"
+                    ),
                     credentials=credentials,
                 )
                 if not event_result.ok:
@@ -619,6 +632,7 @@ class FBBatchSetupView(ctk.CTkFrame):
                 event_pdf = event_result.pdf_path
                 if not event_pdf or not event_pdf.exists():
                     return BatchResult(False, "Event PDF was not created.")
+                progress(90, t("fbbatch.event.pdf_ready"))
             else:
                 event_pdf = find_event_pdf_for_report_date(report_date)
                 if event_pdf is None:
@@ -627,15 +641,16 @@ class FBBatchSetupView(ctk.CTkFrame):
                         False,
                         f"No Event PDF found for {issue_date}. The Event process only generates the latest event, so this flow will not attach a PDF from another date.",
                     )
-                progress(88, f"Using existing Event PDF: {event_pdf.name}")
+                progress(90, f"Using existing Event PDF: {event_pdf.name}")
         else:
             if not chile_batch_skipped:
-                progress(56, t("fbbatch.mail.event_skipped"))
+                progress(90, t("fbbatch.mail.event_skipped"))
 
-        progress(92, t("fbbatch.mail.creating"))
+        progress(91, t("fbbatch.mail.opening_outlook"))
         subject = render_mail_template(subject_template, report_date, include_event=include_event)
         body = render_mail_template(body_template, report_date, include_event=include_event)
         attachments = [event_pdf] if include_event and event_pdf else []
+        progress(94, t("fbbatch.mail.creating"))
         create_outlook_draft(
             subject=subject,
             from_account=from_account,

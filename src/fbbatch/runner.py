@@ -23,6 +23,7 @@ DEFAULT_FBBATCH_ROOT = REPO_ROOT / "FBBatchSetup"
 SAVED_ISSUES_FILE = DATA_DIR / "fbbatch_saved_issues.json"
 FBBATCH_OUTPUT_DIR = REPO_ROOT / "outputs" / "fbbatch"
 OUTLOOK_DRAFT_SETTLE_SECONDS = 12.0
+OUTLOOK_START_TIMEOUT_SECONDS = 30.0
 ProgressCallback = Callable[[int, str], None]
 _ENV_CREDENTIAL_BUCKET = {
     "PROD": "shared_prod",
@@ -570,12 +571,7 @@ def create_outlook_draft(
     pythoncom.CoInitialize()
     try:
         try:
-            try:
-                outlook = win32com.client.GetActiveObject("Outlook.Application")
-                log.info("outlook_draft: using active Outlook.Application")
-            except Exception:
-                outlook = win32com.client.Dispatch("Outlook.Application")
-                log.info("outlook_draft: dispatched Outlook.Application")
+            outlook = _start_outlook_application(win32com.client)
             namespace = outlook.GetNamespace("MAPI")
             log.info("outlook_draft: got MAPI namespace")
             try:
@@ -585,6 +581,7 @@ def create_outlook_draft(
                 log.exception("outlook_draft: namespace logon profile=Exchange failed; trying default profile")
                 namespace.Logon("", "", False, False)
                 log.info("outlook_draft: namespace logon default profile ok")
+            _ensure_outlook_window(outlook, namespace)
         except Exception as exc:
             raise RuntimeError("Outlook is not installed or could not be opened.") from exc
 
@@ -685,6 +682,87 @@ def create_outlook_draft(
         raise RuntimeError(f"{exc}\nLog: {LOG_FILE}") from exc
     finally:
         pythoncom.CoUninitialize()
+
+
+def _start_outlook_application(client, timeout: float = OUTLOOK_START_TIMEOUT_SECONDS):
+    try:
+        outlook = client.GetActiveObject("Outlook.Application")
+        log.info("outlook_draft: using active Outlook.Application")
+        return outlook
+    except Exception:
+        pass
+
+    executable = _find_outlook_executable()
+    dispatched = None
+    if executable is not None:
+        log.info("outlook_draft: starting visible Outlook path=%s", executable)
+        subprocess.Popen([str(executable)], cwd=str(executable.parent))
+    else:
+        log.info("outlook_draft: OUTLOOK.EXE not found; starting through COM")
+        dispatched = client.Dispatch("Outlook.Application")
+
+    deadline = time.monotonic() + max(0.0, timeout)
+    while time.monotonic() < deadline:
+        try:
+            outlook = client.GetActiveObject("Outlook.Application")
+            log.info("outlook_draft: Outlook.Application became active")
+            return outlook
+        except Exception:
+            time.sleep(0.5)
+
+    if dispatched is not None:
+        return dispatched
+    log.warning("outlook_draft: active Outlook wait timed out; falling back to COM Dispatch")
+    return client.Dispatch("Outlook.Application")
+
+
+def _find_outlook_executable() -> Path | None:
+    found = shutil.which("OUTLOOK.EXE")
+    if found:
+        return Path(found)
+
+    candidates: list[Path] = []
+    for variable in ("ProgramFiles", "ProgramFiles(x86)"):
+        base = os.environ.get(variable)
+        if base:
+            candidates.extend(
+                Path(base) / "Microsoft Office" / "root" / office / "OUTLOOK.EXE"
+                for office in ("Office16", "Office15")
+            )
+
+    try:
+        import winreg
+
+        registry_path = r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\OUTLOOK.EXE"
+        for root in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+            try:
+                with winreg.OpenKey(root, registry_path) as key:
+                    value = winreg.QueryValue(key, None)
+                    if value:
+                        candidates.insert(0, Path(value.strip('"')))
+            except OSError:
+                continue
+    except ImportError:
+        pass
+
+    return next((candidate for candidate in candidates if candidate.is_file()), None)
+
+
+def _ensure_outlook_window(outlook, namespace) -> None:
+    try:
+        if int(outlook.Explorers.Count) > 0:
+            log.info("outlook_draft: Outlook explorer window already open")
+            return
+    except Exception:
+        log.exception("outlook_draft: could not inspect Outlook explorer windows")
+
+    inbox = _outlook_call(
+        "get Outlook inbox for visible window",
+        lambda: namespace.GetDefaultFolder(6),
+        attempts=3,
+    )
+    _outlook_call("open visible Outlook window", inbox.Display, attempts=3)
+    log.info("outlook_draft: opened visible Outlook explorer before draft creation")
 
 
 def _add_recipients(mail, raw: str, recipient_type: int) -> None:
@@ -914,6 +992,7 @@ class _JavaProgress:
         self.kind = kind
         self.callback = callback
         self.events_seen: set[str] = set()
+        self.event_summaries_seen: set[str] = set()
         self.process_seen: set[str] = set()
         self.last_percent = 0
 
@@ -936,12 +1015,18 @@ class _JavaProgress:
         if match:
             event_name = match.group(1).strip()
             self.events_seen.add(event_name)
-            pct = min(89, 10 + int((len(self.events_seen) / self.EVENT_TOTAL) * 78))
+            pct = min(80, 8 + int((len(self.events_seen) / self.EVENT_TOTAL) * 72))
             self._emit(pct, f"Event {len(self.events_seen)}/{self.EVENT_TOTAL}: {event_name[:70]}")
             return
-        if "-->" in line:
-            pct = max(self.last_percent, 88)
-            self._emit(pct, "Building event report")
+        if len(self.events_seen) < self.EVENT_TOTAL:
+            return
+        summary = re.match(r"(.+?)-->\s*[\d.]+\s*$", line)
+        if summary:
+            event_name = summary.group(1).strip()
+            self.event_summaries_seen.add(event_name)
+            count = len(self.event_summaries_seen)
+            pct = min(89, 80 + int((count / self.EVENT_TOTAL) * 9))
+            self._emit(pct, f"Building event report {count}/{self.EVENT_TOTAL}")
 
     def _update_report(self, line: str) -> None:
         match = re.search(r"FBEODBatchProcessInfo\(country=(.*?),\s*process=(.*?),", line)
