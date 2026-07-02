@@ -326,6 +326,39 @@ class SettingsView(ctk.CTkFrame):
         )
         self.test_status_label.grid(row=19, column=0, columnspan=3, sticky="ew", padx=20, pady=(2, 4))
 
+        SectionLabel(wrap, text=t("settings.general.startup")).grid(
+            row=20, column=0, columnspan=3, sticky="w", pady=(15, 4)
+        )
+        self.start_with_windows_var = ctk.BooleanVar(
+            value=bool(self.app.config.get("start_with_windows", True))
+        )
+        ctk.CTkCheckBox(
+            wrap,
+            text=t("settings.general.start_with_windows"),
+            variable=self.start_with_windows_var,
+        ).grid(row=21, column=0, columnspan=3, sticky="w", padx=20, pady=4)
+
+        SectionLabel(wrap, text=t("settings.general.updates")).grid(
+            row=22, column=0, columnspan=3, sticky="w", pady=(15, 4)
+        )
+        self.update_check_button = ctk.CTkButton(
+            wrap,
+            text=t("settings.general.check_updates"),
+            width=150,
+            command=self._on_check_updates,
+        )
+        self.update_check_button.grid(row=23, column=0, sticky="w", padx=20, pady=2)
+        self.update_status_label = ctk.CTkLabel(
+            wrap,
+            text="",
+            anchor="w",
+            justify="left",
+            wraplength=600,
+        )
+        self.update_status_label.grid(
+            row=23, column=1, columnspan=2, sticky="ew", padx=8, pady=2
+        )
+
         wrap.grid_columnconfigure(0, weight=1)
         wrap.grid_columnconfigure(1, weight=1)
 
@@ -443,12 +476,60 @@ class SettingsView(ctk.CTkFrame):
         messagebox.showinfo(t("common.info"), t("settings.cred.saved"))
 
     def _on_apply_general(self):
-        self.app.config.set("sqlcl_path", self.sqlcl_entry.get().strip())
-        self.app.config.set("oracle_email", self.oracle_email_entry.get().strip())
-        self.app.config.set("falabella_email", self.falabella_email_entry.get().strip())
-        self.app.config.set("fbbatch_root", self.fbbatch_root_entry.get().strip())
-        self.app.config.set("verify_savings_apply", bool(self.verify_savings_apply_var.get()))
+        from infra.startup import sync_startup_registration
+
+        start_with_windows = bool(self.start_with_windows_var.get())
+        self.app.config.update({
+            "sqlcl_path": self.sqlcl_entry.get().strip(),
+            "oracle_email": self.oracle_email_entry.get().strip(),
+            "falabella_email": self.falabella_email_entry.get().strip(),
+            "fbbatch_root": self.fbbatch_root_entry.get().strip(),
+            "verify_savings_apply": bool(self.verify_savings_apply_var.get()),
+            "start_with_windows": start_with_windows,
+        })
+        sync_startup_registration(start_with_windows)
         messagebox.showinfo(t("common.info"), t("settings.cred.saved"))
+
+    def _on_check_updates(self):
+        import threading
+        from infra.updater import get_update_info
+
+        self.update_check_button.configure(
+            state="disabled", text=t("settings.general.checking_updates")
+        )
+        self.update_status_label.configure(text=t("settings.general.checking_updates"))
+
+        def worker():
+            info = get_update_info()
+            self.after(0, lambda: self._finish_update_check(info))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_update_check(self, info: dict):
+        self.update_check_button.configure(
+            state="normal", text=t("settings.general.check_updates")
+        )
+        if not info.get("ok"):
+            self.update_status_label.configure(
+                text=t("settings.general.update_failed", message=info.get("message", ""))
+            )
+            return
+        current = str(info.get("current", "?"))
+        latest = str(info.get("latest", "?"))
+        if not info.get("available"):
+            self.update_status_label.configure(
+                text=t("settings.general.up_to_date", version=current)
+            )
+            return
+        self.update_status_label.configure(
+            text=t("settings.general.update_available", latest=latest, current=current)
+        )
+        if messagebox.askyesno(
+            t("settings.general.updates"),
+            t("settings.general.install_update"),
+            parent=self,
+        ):
+            self.app._on_update_click()
 
     # ── About tab ──
     def _build_about_tab(self, parent):

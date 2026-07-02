@@ -27,6 +27,7 @@ timeout /t 1 /nobreak >nul
 
 :: Remove Windows startup registration
 reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v OracleTasksChile /f >nul 2>&1
+reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v VPNSwitcher /f >nul 2>&1
 
 :: Remove app + data
 if exist "%LOCALAPPDATA%\OracleTasksChile" (

@@ -96,6 +96,24 @@ def check_for_update(on_update_available: Callable[[str], None]) -> None:
     threading.Thread(target=_worker, daemon=True).start()
 
 
+def get_update_info() -> dict[str, object]:
+    """Return the current and remote versions for an explicit UI check."""
+    if not (_REPO_ROOT / ".git").is_dir():
+        return {"ok": False, "message": "Updates require the git installation."}
+    git = _find_git()
+    if not git:
+        return {"ok": False, "message": "Git was not found on this PC."}
+    remote = _query_remote_version(git, _REPO_ROOT)
+    if not remote:
+        return {"ok": False, "message": "Could not read the latest version."}
+    return {
+        "ok": True,
+        "available": _version_tuple(remote) > _version_tuple(__version__),
+        "current": __version__,
+        "latest": remote,
+    }
+
+
 def launch_update(updater: Path, python_executable: str) -> subprocess.Popen:
     """Launch update.bat in a new console without cmd.exe path splitting."""
     return subprocess.Popen(

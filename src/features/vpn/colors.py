@@ -1,6 +1,6 @@
 """Shared provider colors for VPN controls."""
 
-from vpn_integration import CISCO, FORTI, GPROT, NONE
+from features.vpn.service import CISCO, FORTI, GPROT, NONE
 
 
 VPN_COLORS = {

@@ -4,9 +4,9 @@ Passwords inside credential dicts are encrypted with DPAPI before being written
 to disk and decrypted on read. Encryption is per-Windows-user, so the file is
 unreadable by other accounts on the same machine.
 
-Config schema (v6):
+Config schema (v7):
 {
-  "version": 5,
+  "version": 7,
   "language": "en" | "es",
   "theme": "light" | "dark",
   "sqlcl_path": "<absolute path to sql.exe>",
@@ -20,6 +20,8 @@ Config schema (v6):
   "fbbatch_mail_body": "<template>",
   "spools_cl_output_dir": "<override; empty = use default in DATA_DIR>",
   "verify_savings_apply": false,
+  "start_with_windows": true,
+  "vpn_show_forti": true,
   "vpn_show_bice": false,
   "credentials": {
       "chile": {
@@ -46,7 +48,7 @@ from paths import CONFIG_DIR, CONFIG_FILE
 log = logging.getLogger(__name__)
 
 DEFAULTS: dict[str, Any] = {
-    "version": 6,
+    "version": 7,
     "language": "en",
     "theme": "light",
     "sqlcl_path": "",
@@ -60,7 +62,24 @@ DEFAULTS: dict[str, Any] = {
     "fbbatch_mail_body": "",
     "spools_cl_output_dir": "",
     "verify_savings_apply": False,
+    "start_with_windows": True,
+    "vpn_show_forti": True,
     "vpn_show_bice": False,
+    "cisco_cli_path": "",
+    "cisco_host": "",
+    "cisco_username": "",
+    "cisco_password_enc": "",
+    "forti_exe_path": "",
+    "forti_connect_cmd": "",
+    "forti_disconnect_cmd": "",
+    "forti_username": "",
+    "forti_password_enc": "",
+    "forti_flow_mode": "detect",
+    "forti_flow_steps": ["username", "password", "mfa"],
+    "gp_exe_path": "",
+    "gp_username": "",
+    "gp_password_enc": "",
+    "gp_portal_url": "ext.bice.cl",
     "credentials": {
         "chile": {},
         "peru": {},
@@ -72,6 +91,7 @@ DEFAULTS: dict[str, Any] = {
 CRED_BUCKETS = ("shared_prod", "user_qa", "user_dev", "user_bup_qa", "user_bup_prod")
 CRED_COUNTRIES = ("chile", "peru", "colombia", "mexico")
 DIEGO_CC_RECIPIENT = '"Diego Pavez" <diego.pavez@oracle.com>'
+LEGACY_VPN_CONFIG = CONFIG_DIR.parent / "VPNSwitcher" / "config.json"
 
 
 def _ensure_mail_recipient(raw: str, recipient: str, email: str) -> str:
@@ -122,6 +142,7 @@ class ConfigManager:
 
     def load(self) -> None:
         if not CONFIG_FILE.exists():
+            self._migrate_legacy_vpn_settings(self._data)
             self.save()
             return
         try:
@@ -164,8 +185,51 @@ class ConfigManager:
             )
         if loaded_version < 6:
             merged["vpn_show_bice"] = False
+        if loaded_version < 7:
+            self._migrate_legacy_vpn_settings(merged)
         merged["version"] = DEFAULTS["version"]
         return merged
+
+    @staticmethod
+    def _migrate_legacy_vpn_settings(merged: dict[str, Any]) -> None:
+        """Import the per-user VPN Switcher config once during schema v7 migration."""
+        try:
+            with LEGACY_VPN_CONFIG.open("r", encoding="utf-8") as handle:
+                legacy = json.load(handle)
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            return
+        if not isinstance(legacy, dict):
+            return
+
+        direct_keys = (
+            "cisco_cli_path",
+            "cisco_host",
+            "cisco_username",
+            "forti_exe_path",
+            "forti_connect_cmd",
+            "forti_disconnect_cmd",
+            "forti_username",
+            "forti_password_enc",
+            "forti_flow_mode",
+            "forti_flow_steps",
+            "gp_exe_path",
+            "gp_username",
+            "gp_password_enc",
+            "gp_portal_url",
+            "start_with_windows",
+        )
+        for key in direct_keys:
+            if key in legacy:
+                merged[key] = legacy[key]
+
+        plain_cisco_password = str(legacy.get("cisco_password") or "")
+        if plain_cisco_password:
+            merged["cisco_password_enc"] = encrypt_password(plain_cisco_password)
+        if "show_forti" in legacy:
+            merged["vpn_show_forti"] = bool(legacy["show_forti"])
+        if "show_gp" in legacy:
+            merged["vpn_show_bice"] = bool(legacy["show_gp"])
+        log.info("Migrated VPN settings from %s", LEGACY_VPN_CONFIG)
 
     def _normalize_credentials(self, value: Any) -> dict[str, dict[str, dict[str, dict[str, str]]]]:
         """Return credentials as country -> DB/TNS -> login -> credential.
@@ -249,6 +313,10 @@ class ConfigManager:
 
     def set(self, key: str, value: Any) -> None:
         self._data[key] = value
+        self.save()
+
+    def update(self, values: dict[str, Any]) -> None:
+        self._data.update(values)
         self.save()
 
     @property

@@ -79,15 +79,28 @@ and Mexico. QA and DEV runs use the corresponding Chile credential.
 
 ## 5. VPN tab
 
-The VPN tab reuses the separately installed **VPN Switcher** controller and its
-per-user configuration. Its normal installation is
-`%LOCALAPPDATA%\VPNSwitcher\app`, while credentials and settings remain in
-`%APPDATA%\VPNSwitcher\config.json`.
+VPN control is built directly into Oracle Tasks. The VPN tab and the system
+tray menu can connect Oracle/Cisco, Falabella/FortiClient, BICE/GlobalProtect,
+or disconnect every active VPN. Provider paths, sign-in accounts, encrypted
+passwords and FortiClient MFA flow are configured in the VPN settings tab.
 
-Opening the tab keeps the VPN Switcher tray process running in the background.
-Oracle Tasks can then connect Oracle/Cisco, Falabella/FortiClient, BICE/
-GlobalProtect, or disconnect every VPN without opening the VPN Switcher window.
-If the source installation is missing, the tab offers to install it.
+The global **Start Oracle Tasks with Windows** option is available under
+Settings -> **General**. A lightweight background monitor keeps the visual VPN
+status current, but skips checks while a VPN action is running and never
+connects or disconnects automatically after startup, reboot, or sleep.
+
+On the first v7 configuration migration, existing per-user settings are
+imported from `%APPDATA%\VPNSwitcher\config.json` when that file exists. The
+separate application is not required after migration.
+
+## Code organization
+
+Feature-specific code lives under `src/features/<feature>/`. The VPN feature
+owns its controller, service, view, provider settings, logging adapter, and
+colors under `src/features/vpn/`. Shared application infrastructure such as
+configuration persistence, startup registration, updates, logs, and the
+system tray stays under `src/settings/` and `src/infra/`. Views communicate
+with a feature through its service instead of importing another tab's UI.
 
 ---
 

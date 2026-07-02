@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import threading
 import webbrowser
 from queue import Empty, SimpleQueue
 from tkinter import messagebox
@@ -13,14 +14,16 @@ import customtkinter as ctk
 from app_identity import APP_DISPLAY_NAME, APP_USER_MODEL_ID
 from settings.config import ConfigManager
 from i18n import set_language, t
+from infra.startup import sync_startup_registration
 from infra.tray import TrayController
 from infra.updater import check_for_update, launch_update
 from paths import ASSETS_DIR, REPO_ROOT, SHOW_FLAG_PATH
 from version import __version__
+from features.vpn.service import VPNService
 
 from .home_view import HomeView
 from .fbbatch_view import FBBatchSetupView
-from .vpn_view import VPNView
+from features.vpn.view import VPNView
 from .settings_view import SettingsView
 from .spools_cl_view import SpoolsCLView
 from .spools_savings_view import SpoolsSavingsView
@@ -32,9 +35,11 @@ log = logging.getLogger(__name__)
 class OracleTasksApp:
     def __init__(self, start_hidden: bool = False) -> None:
         self._start_hidden = start_hidden
-        self._background_requests: SimpleQueue[str] = SimpleQueue()
+        self._background_requests: SimpleQueue[object] = SimpleQueue()
         self._shutting_down = False
         self.config = ConfigManager()
+        sync_startup_registration(bool(self.config.get("start_with_windows", True)))
+        self.vpn_service = VPNService(self.config)
 
         # Apply persisted language + theme BEFORE creating widgets
         set_language(self.config.get("language", "en"))
@@ -138,11 +143,25 @@ class OracleTasksApp:
             on_exit=lambda: self._background_requests.put("exit"),
             open_label=t("tray.open"),
             exit_label=t("tray.exit"),
+            on_settings=lambda: self._background_requests.put("settings"),
+            on_vpn=lambda target: self._background_requests.put(("vpn", target)),
+            labels={
+                "settings": t("tray.settings"),
+                "cisco": t("tray.oracle_vpn"),
+                "forti": t("tray.falabella_vpn"),
+                "globalprotect": t("tray.bice_vpn"),
+                "disconnected": t("tray.no_vpn"),
+            },
+            show_forti=lambda: bool(self.config.get("vpn_show_forti", True)),
+            show_bice=lambda: bool(self.config.get("vpn_show_bice", False)),
         )
         tray_started = self._tray.start()
         if start_hidden and not tray_started:
             self.root.after(0, self._show_window)
         self.root.after(250, self._poll_background_requests)
+        self.vpn_service.start_monitor(
+            lambda status: self._background_requests.put(("vpn_status", status))
+        )
 
     # ── sidebar helpers ──
     def _update_sidebar_labels(self) -> None:
@@ -314,6 +333,9 @@ class OracleTasksApp:
         if self._shutting_down:
             return
         self._shutting_down = True
+        vpn_service = getattr(self, "vpn_service", None)
+        if vpn_service is not None:
+            vpn_service.stop_monitor()
         self._tray.stop()
         self.root.destroy()
 
@@ -327,10 +349,19 @@ class OracleTasksApp:
                 action = self._background_requests.get_nowait()
                 if action == "open":
                     self._show_window()
+                elif action == "settings":
+                    self._show_window()
+                    self.show_vpn_settings()
                 elif action == "exit":
                     self._exit_application()
                     if self._shutting_down:
                         return
+                elif isinstance(action, tuple) and action[0] == "vpn":
+                    self._start_vpn_action(str(action[1]))
+                elif isinstance(action, tuple) and action[0] == "vpn_result":
+                    self._finish_vpn_action(action[1])
+                elif isinstance(action, tuple) and action[0] == "vpn_status":
+                    self._apply_vpn_status(str(action[1]))
         except Empty:
             pass
 
@@ -342,6 +373,34 @@ class OracleTasksApp:
             log.warning("Could not consume show request: %s", exc)
 
         self.root.after(250, self._poll_background_requests)
+
+    def _start_vpn_action(self, target: str) -> None:
+        if self.vpn_service.busy:
+            return
+
+        def worker() -> None:
+            result = self.vpn_service.switch_to(target)
+            self._background_requests.put(("vpn_result", result))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def show_vpn_settings(self) -> None:
+        self.show_view("vpn")
+        view = self._views.get("vpn")
+        if view is not None and hasattr(view, "show_settings"):
+            view.show_settings()
+
+    def _finish_vpn_action(self, result) -> None:
+        self._apply_vpn_status(result.status, result.message)
+        if not result.ok and result.error_code != "cancelled":
+            self._show_window()
+            messagebox.showerror(t("common.error"), result.message, parent=self.root)
+
+    def _apply_vpn_status(self, status: str, message: str = "") -> None:
+        self._tray.set_vpn_status(status)
+        view = self._views.get("vpn")
+        if view is not None and hasattr(view, "_apply_status"):
+            view._apply_status(status, message=message)
 
     # ── theme/language switching ──
     def apply_language(self, lang: str) -> None:

@@ -294,7 +294,7 @@ def check_falabella_vpn() -> tuple[bool, str]:
         return False, "Wrong VPN connected: " + ", ".join(sorted(set(other_active))) + ". Connect Falabella VPN - FortiClient first."
     if forti_matches:
         return False, "Falabella VPN was detected but is not connected (" + "; ".join(forti_matches) + ")."
-    return False, "Falabella VPN adapter was not detected. Open VPN Switcher and connect Falabella VPN - FortiClient."
+    return False, "Falabella VPN adapter was not detected. Open the VPN tab and connect Falabella - FortiClient."
 
 
 def _network_adapter_statuses() -> list[dict[str, str]]:

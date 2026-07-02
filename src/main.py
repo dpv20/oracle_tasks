@@ -66,9 +66,6 @@ def main() -> None:
     from infra.logger import setup_logger
     setup_logger()
 
-    from infra.startup import ensure_startup_registration
-    ensure_startup_registration()
-
     from ui.app import OracleTasksApp
     OracleTasksApp(start_hidden="--background" in sys.argv[1:]).run()
 

@@ -13,6 +13,7 @@ log = logging.getLogger(__name__)
 
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 RUN_VALUE_NAME = "OracleTasksChile"
+LEGACY_RUN_VALUE_NAME = "VPNSwitcher"
 
 
 def _pythonw_executable(executable: str | Path | None = None) -> Path:
@@ -40,8 +41,8 @@ def _is_installed_copy(repo_root: Path = REPO_ROOT, data_dir: Path = DATA_DIR) -
     )
 
 
-def ensure_startup_registration() -> bool:
-    """Register the installed copy to start hidden for the current user."""
+def sync_startup_registration(enabled: bool = True) -> bool:
+    """Apply the current-user startup preference for the installed app."""
     if os.name != "nt" or not _is_installed_copy():
         return False
 
@@ -55,9 +56,17 @@ def ensure_startup_registration() -> bool:
                 current = winreg.QueryValueEx(key, RUN_VALUE_NAME)[0]
             except FileNotFoundError:
                 current = None
-            if current != command:
+            if enabled and current != command:
                 winreg.SetValueEx(key, RUN_VALUE_NAME, 0, winreg.REG_SZ, command)
                 log.info("Registered Windows startup command: %s", command)
+            elif not enabled and current is not None:
+                winreg.DeleteValue(key, RUN_VALUE_NAME)
+                log.info("Removed Windows startup registration")
+            try:
+                winreg.DeleteValue(key, LEGACY_RUN_VALUE_NAME)
+                log.info("Removed legacy VPN Switcher startup registration")
+            except FileNotFoundError:
+                pass
         return True
     except OSError as exc:
         log.warning("Could not register Windows startup: %s", exc)
