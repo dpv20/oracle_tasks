@@ -206,6 +206,15 @@ class VPNServiceTests(unittest.TestCase):
         self.assertIsNone(status)
         self.assertEqual(controller.status_reads, 0)
 
+    def test_quick_status_updates_the_cached_status(self) -> None:
+        controller = _CountingController()
+        service = _bridge(controller)
+
+        status = service.try_get_status()
+
+        self.assertEqual(status, NONE)
+        self.assertEqual(service.last_status, NONE)
+
 
 if __name__ == "__main__":
     unittest.main()

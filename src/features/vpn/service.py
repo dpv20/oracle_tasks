@@ -50,17 +50,24 @@ class VPNService:
         self._operation_lock = threading.Lock()
         self._monitor_stop = threading.Event()
         self._monitor_thread: threading.Thread | None = None
+        self._last_status: str | None = None
 
     @property
     def busy(self) -> bool:
         return self._operation_lock.locked()
+
+    @property
+    def last_status(self) -> str | None:
+        return self._last_status
 
     def get_status(self) -> str:
         with self._operation_lock:
             with _com_apartment():
                 controller = self._get_controller()
                 self._reload_controller_config(controller)
-                return _read_controller_status(controller)
+                status = _read_controller_status(controller)
+                self._last_status = status
+                return status
 
     def try_get_status(self) -> str | None:
         """Return one quick status sample, or skip if a VPN operation is active."""
@@ -70,7 +77,9 @@ class VPNService:
             with _com_apartment():
                 controller = self._get_controller()
                 self._reload_controller_config(controller)
-                return _read_controller_status(controller, attempts=1)
+                status = _read_controller_status(controller, attempts=1)
+                self._last_status = status
+                return status
         finally:
             self._operation_lock.release()
 
@@ -83,7 +92,9 @@ class VPNService:
             return VPNResult(False, f"Unsupported VPN target: {target}")
         with self._operation_lock:
             with _com_apartment():
-                return self._switch_to(target, progress)
+                result = self._switch_to(target, progress)
+                self._last_status = result.status
+                return result
 
     def _switch_to(
         self,
@@ -145,14 +156,18 @@ class VPNService:
                 self._clear_autofill_cancel()
                 ok, message = controller.retry_forti_credentials()
                 if message == "__WRONG_PASSWORD__":
-                    return VPNResult(
+                    result = VPNResult(
                         False,
                         "FortiClient rejected the saved password.",
                         self._safe_status(controller),
                         "wrong_password",
                     )
+                    self._last_status = result.status
+                    return result
                 time.sleep(2)
-                return VPNResult(ok, message, self._safe_status(controller))
+                result = VPNResult(ok, message, self._safe_status(controller))
+                self._last_status = result.status
+                return result
 
     def start_monitor(self, on_status: StatusCallback) -> None:
         """Keep visual VPN status current without changing any connection."""

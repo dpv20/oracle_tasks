@@ -21,7 +21,6 @@ from ui.widgets import CardFrame, IconButton
 from .colors import VPN_COLORS, VPN_HOVER_COLORS
 from .settings_panel import VPNSettingsPanel
 class VPNView(ctk.CTkFrame):
-    POLL_MS = 5_000
     _CARD_DATA = (
         (CISCO, "vpn.oracle", "vpn.oracle.subtitle"),
         (FORTI, "vpn.falabella", "vpn.falabella.subtitle"),
@@ -36,8 +35,6 @@ class VPNView(ctk.CTkFrame):
         self._running = False
         self._refreshing = False
         self._status = NONE
-        self._poll_id = None
-        self._visible = False
         self._retry_after_save = False
         self._buttons: dict[str, ctk.CTkButton] = {}
         self._cards: dict[str, CardFrame] = {}
@@ -68,25 +65,6 @@ class VPNView(ctk.CTkFrame):
             font=ctk.CTkFont(size=22, weight="bold"),
             text_color=("#0f172a", "#ffffff"),
         ).pack(side="left", padx=16)
-        self.refresh_button = ctk.CTkButton(
-            header,
-            text=t("vpn.refresh"),
-            width=130,
-            height=36,
-            corner_radius=8,
-            fg_color=("#3b82c4", "#2563a5"),
-            hover_color=("#2563a5", "#1d4f7a"),
-            command=self.refresh_status,
-        )
-        self.refresh_button.pack(side="right")
-        self.settings_button = IconButton(
-            header,
-            text=f"\u2699  {t('vpn.settings')}",
-            width=145,
-            height=36,
-            command=self._open_vpn_settings,
-        )
-        self.settings_button.pack(side="right", padx=(0, 10))
         self.show_bice_var = ctk.BooleanVar(
             value=bool(self.app.config.get("vpn_show_bice", False))
         )
@@ -116,11 +94,22 @@ class VPNView(ctk.CTkFrame):
             text_color="#64748b",
         )
         self.status_dot.pack(side="left", padx=(24, 12))
+        self.refresh_button = ctk.CTkButton(
+            self.status_band,
+            text=t("vpn.refresh"),
+            width=130,
+            height=36,
+            corner_radius=8,
+            fg_color=("#3b82c4", "#2563a5"),
+            hover_color=("#2563a5", "#1d4f7a"),
+            command=self.refresh_status,
+        )
+        self.refresh_button.pack(side="right", padx=20)
         status_copy = ctk.CTkFrame(self.status_band, fg_color="transparent")
         status_copy.pack(side="left", fill="both", expand=True, pady=18)
         self.status_title = ctk.CTkLabel(
             status_copy,
-            text=t("vpn.checking"),
+            text=t("vpn.status.pending"),
             anchor="w",
             font=ctk.CTkFont(size=18, weight="bold"),
             text_color=("#0f172a", "#f8fafc"),
@@ -193,34 +182,33 @@ class VPNView(ctk.CTkFrame):
         self.settings_panel.pack(fill="both", expand=True)
 
     def on_show(self) -> None:
-        self._visible = True
         self.show_bice_var.set(bool(self.app.config.get("vpn_show_bice", False)))
         self._apply_bice_visibility()
-        self._poll_id = self.after(100, self.refresh_status)
+        if self.service.last_status is not None:
+            self._apply_status(self.service.last_status)
 
     def on_hide(self) -> None:
-        self._visible = False
         self._retry_after_save = False
-        self._cancel_poll()
 
     def show_settings(self) -> None:
         self.tabs.set(self._settings_tab)
 
     def refresh_status(self) -> None:
-        self._cancel_poll()
         if self._running or self._refreshing:
-            self._schedule_poll()
             return
         self._refreshing = True
-        self._set_controls_enabled(False)
         self.refresh_button.configure(state="disabled")
-        self.settings_button.configure(state="disabled")
         self.message_label.configure(text=t("vpn.checking"))
 
         def worker() -> None:
             try:
-                status = self.service.get_status()
-                self._ui(lambda: self._apply_status(status))
+                status = self.service.try_get_status()
+                if status is not None:
+                    self._ui(lambda: self._apply_status(status))
+                else:
+                    self._ui(
+                        lambda: self.message_label.configure(text=t("vpn.ready"))
+                    )
             except Exception as exc:
                 self._ui(lambda: self._show_error(str(exc)))
             finally:
@@ -229,11 +217,11 @@ class VPNView(ctk.CTkFrame):
         threading.Thread(target=worker, daemon=True).start()
 
     def _switch_to(self, target: str) -> None:
-        if self._running or self._refreshing:
+        if self._running:
             return
         self._running = True
-        self._cancel_poll()
         self._set_controls_enabled(False)
+        self.refresh_button.configure(state="disabled")
         self.progress.start()
         self.message_label.configure(text=t("vpn.working"))
 
@@ -253,20 +241,13 @@ class VPNView(ctk.CTkFrame):
         self._running = False
         self.progress.stop()
         self.progress.set(0)
+        self.refresh_button.configure(state="normal")
         self._apply_status(result.status, message=result.message)
         if result.error_code == "wrong_password":
             self._handle_wrong_password()
-            self._schedule_poll()
             return
         if not result.ok and result.error_code != "cancelled":
             messagebox.showerror(t("common.error"), result.message, parent=self)
-        self._schedule_poll()
-
-    def _open_vpn_settings(self) -> None:
-        if self._running or self._refreshing:
-            return
-        self._cancel_poll()
-        self.tabs.set(self._settings_tab)
 
     def _refresh_preferences(self) -> None:
         self.show_bice_var.set(bool(self.app.config.get("vpn_show_bice", False)))
@@ -292,6 +273,7 @@ class VPNView(ctk.CTkFrame):
             return
         self._running = True
         self._set_controls_enabled(False)
+        self.refresh_button.configure(state="disabled")
         self.progress.start()
         self.message_label.configure(text=t("vpn.credentials.retrying"))
 
@@ -340,6 +322,8 @@ class VPNView(ctk.CTkFrame):
         *,
         message: str = "",
     ) -> None:
+        if self._running and not message:
+            return
         self._status = status
         self.app._tray.set_vpn_status(status)
         connected = status != NONE
@@ -363,13 +347,12 @@ class VPNView(ctk.CTkFrame):
             text=message,
             text_color=("#b91c1c", "#fca5a5"),
         )
-        self._set_controls_enabled(False)
+        self._set_controls_enabled(not self._running)
 
     def _finish_refresh(self) -> None:
         self._refreshing = False
-        self.refresh_button.configure(state="normal")
-        self.settings_button.configure(state="normal")
-        self._schedule_poll()
+        if not self._running:
+            self.refresh_button.configure(state="normal")
 
     def _style_cards(self) -> None:
         for target, card in self._cards.items():
@@ -401,27 +384,9 @@ class VPNView(ctk.CTkFrame):
             else:
                 button.configure(state=state)
 
-    def _schedule_poll(self) -> None:
-        self._cancel_poll()
-        if self._visible and self.winfo_exists():
-            self._poll_id = self.after(self.POLL_MS, self.refresh_status)
-
-    def _cancel_poll(self) -> None:
-        if self._poll_id is not None:
-            try:
-                self.after_cancel(self._poll_id)
-            except Exception:
-                pass
-            self._poll_id = None
-
     def _ui(self, callback) -> None:
         try:
             if self.winfo_exists():
                 self.after(0, callback)
         except Exception:
             pass
-
-    def destroy(self) -> None:
-        self._visible = False
-        self._cancel_poll()
-        super().destroy()
