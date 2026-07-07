@@ -4,10 +4,12 @@ from __future__ import annotations
 import os
 import json
 import logging
+import queue
 import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from html import unescape
 from dataclasses import dataclass
@@ -24,6 +26,10 @@ SAVED_ISSUES_FILE = DATA_DIR / "fbbatch_saved_issues.json"
 FBBATCH_OUTPUT_DIR = REPO_ROOT / "outputs" / "fbbatch"
 OUTLOOK_DRAFT_SETTLE_SECONDS = 12.0
 OUTLOOK_START_TIMEOUT_SECONDS = 30.0
+JAVA_DEFAULT_IDLE_TIMEOUT_SECONDS = 10 * 60.0
+JAVA_EVENT_IDLE_TIMEOUT_SECONDS = 40 * 60.0
+JAVA_MAX_RUNTIME_SECONDS = 90 * 60.0
+JAVA_EXIT_GRACE_SECONDS = 60.0
 ProgressCallback = Callable[[int, str], None]
 _ENV_CREDENTIAL_BUCKET = {
     "PROD": "shared_prod",
@@ -947,6 +953,17 @@ def _run_java(
     if not java:
         return BatchResult(False, "Java was not found in PATH.")
     tracker = _JavaProgress(progress_kind, progress)
+    process_label = _java_process_label(progress_kind)
+    idle_timeout = _java_idle_timeout_seconds(progress_kind)
+    started = time.monotonic()
+    log.info(
+        "fbbatch_java: starting process=%s class=%s root=%s idle_timeout=%ss max_runtime=%ss",
+        process_label,
+        main_class,
+        root,
+        int(idle_timeout),
+        int(JAVA_MAX_RUNTIME_SECONDS),
+    )
     try:
         process = subprocess.Popen(
             [java, "-cp", "lib/*", main_class],
@@ -962,26 +979,139 @@ def _run_java(
             process.stdin.write(stdin_text)
             process.stdin.close()
         lines: list[str] = []
-        started = time.monotonic()
-        if process.stdout:
-            for line in process.stdout:
-                lines.append(line)
-                tracker.update(line)
-                if time.monotonic() - started > 600:
-                    process.kill()
-                    return BatchResult(False, "The Java process timed out.")
-        exit_code = process.wait(timeout=10)
+        output_queue: queue.Queue[object] = queue.Queue()
+        output_finished = object()
+        reader_errors: list[BaseException] = []
+
+        def read_output() -> None:
+            try:
+                if process.stdout:
+                    for output_line in process.stdout:
+                        output_queue.put(output_line)
+            except Exception as exc:  # Preserve reader failures for the worker thread.
+                reader_errors.append(exc)
+            finally:
+                output_queue.put(output_finished)
+
+        reader = threading.Thread(
+            target=read_output,
+            name=f"fbbatch-{progress_kind or 'java'}-output",
+            daemon=True,
+        )
+        reader.start()
+        last_output = started
+        last_heartbeat_minute = 0
+        timeout_message = ""
+
+        while True:
+            now = time.monotonic()
+            elapsed = now - started
+            idle = now - last_output
+            if elapsed >= JAVA_MAX_RUNTIME_SECONDS:
+                timeout_message = (
+                    f"{process_label} exceeded the {int(JAVA_MAX_RUNTIME_SECONDS // 60)}-minute "
+                    "safety limit."
+                )
+                break
+            if idle >= idle_timeout:
+                timeout_message = (
+                    f"{process_label} stopped after {int(idle_timeout // 60)} minutes "
+                    "without output."
+                )
+                break
+
+            idle_minutes = int(idle // 60)
+            if idle_minutes > last_heartbeat_minute:
+                tracker.heartbeat(idle)
+                last_heartbeat_minute = idle_minutes
+
+            wait_seconds = max(
+                0.05,
+                min(
+                    1.0,
+                    JAVA_MAX_RUNTIME_SECONDS - elapsed,
+                    idle_timeout - idle,
+                ),
+            )
+            try:
+                item = output_queue.get(timeout=wait_seconds)
+            except queue.Empty:
+                if process.poll() is not None and not reader.is_alive():
+                    break
+                continue
+
+            if item is output_finished:
+                break
+            line = str(item)
+            lines.append(line)
+            last_output = time.monotonic()
+            last_heartbeat_minute = 0
+            tracker.update(line)
+
+        if timeout_message:
+            process.kill()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                log.warning("fbbatch_java: process did not exit promptly after kill process=%s", process_label)
+            output_tail = _safe_tail("".join(lines))
+            log.error(
+                "fbbatch_java: timeout process=%s elapsed=%.1fs idle=%.1fs message=%s output_tail=%s",
+                process_label,
+                time.monotonic() - started,
+                time.monotonic() - last_output,
+                timeout_message,
+                output_tail,
+            )
+            return BatchResult(False, timeout_message)
+
+        exit_code = process.wait(timeout=JAVA_EXIT_GRACE_SECONDS)
+        reader.join(timeout=1)
+        if reader_errors:
+            log.warning(
+                "fbbatch_java: output reader failed process=%s error=%s",
+                process_label,
+                reader_errors[-1],
+            )
     except subprocess.TimeoutExpired:
-        return BatchResult(False, "The Java process timed out.")
+        process.kill()
+        message = f"{process_label} finished its output but did not exit cleanly."
+        log.exception("fbbatch_java: exit timeout process=%s", process_label)
+        return BatchResult(False, message)
     except OSError as exc:
+        log.exception("fbbatch_java: could not start process=%s", process_label)
         return BatchResult(False, f"Could not start Java: {exc}")
 
     combined_output = "".join(lines)
     ok = exit_code == 0
+    elapsed = time.monotonic() - started
     if ok:
         _emit_progress(progress, 90, "Java process completed")
+        log.info("fbbatch_java: completed process=%s elapsed=%.1fs", process_label, elapsed)
+    else:
+        log.error(
+            "fbbatch_java: failed process=%s exit_code=%s elapsed=%.1fs output_tail=%s",
+            process_label,
+            exit_code,
+            elapsed,
+            _safe_tail(combined_output),
+        )
     message = "Completed." if ok else _safe_tail(combined_output)
     return BatchResult(ok, message, exit_code=exit_code)
+
+
+def _java_process_label(progress_kind: str) -> str:
+    if progress_kind == "event":
+        return "EOD Batch Event"
+    if progress_kind.startswith("report"):
+        return "EOD Batch Report"
+    return "Java process"
+
+
+def _java_idle_timeout_seconds(progress_kind: str) -> float:
+    if progress_kind == "event":
+        return JAVA_EVENT_IDLE_TIMEOUT_SECONDS
+    return JAVA_DEFAULT_IDLE_TIMEOUT_SECONDS
 
 
 class _JavaProgress:
@@ -994,6 +1124,7 @@ class _JavaProgress:
         self.events_seen: set[str] = set()
         self.event_summaries_seen: set[str] = set()
         self.process_seen: set[str] = set()
+        self.last_event_name = ""
         self.last_percent = 0
 
     def update(self, line: str) -> None:
@@ -1015,7 +1146,8 @@ class _JavaProgress:
         if match:
             event_name = match.group(1).strip()
             self.events_seen.add(event_name)
-            pct = min(80, 8 + int((len(self.events_seen) / self.EVENT_TOTAL) * 72))
+            self.last_event_name = event_name
+            pct = min(90, 5 + int((len(self.events_seen) / self.EVENT_TOTAL) * 85))
             self._emit(pct, f"Event {len(self.events_seen)}/{self.EVENT_TOTAL}: {event_name[:70]}")
             return
         if len(self.events_seen) < self.EVENT_TOTAL:
@@ -1025,8 +1157,18 @@ class _JavaProgress:
             event_name = summary.group(1).strip()
             self.event_summaries_seen.add(event_name)
             count = len(self.event_summaries_seen)
-            pct = min(89, 80 + int((count / self.EVENT_TOTAL) * 9))
+            pct = min(92, 90 + int((count / self.EVENT_TOTAL) * 2))
             self._emit(pct, f"Building event report {count}/{self.EVENT_TOTAL}")
+
+    def heartbeat(self, idle_seconds: float) -> None:
+        if self.kind != "event" or not self.events_seen:
+            return
+        minutes = max(1, int(idle_seconds // 60))
+        self._emit(
+            self.last_percent,
+            f"Still processing ({minutes} min without a new Event); last completed "
+            f"{len(self.events_seen)}/{self.EVENT_TOTAL}: {self.last_event_name[:60]}",
+        )
 
     def _update_report(self, line: str) -> None:
         match = re.search(r"FBEODBatchProcessInfo\(country=(.*?),\s*process=(.*?),", line)
