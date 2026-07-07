@@ -26,6 +26,9 @@ SAVED_ISSUES_FILE = DATA_DIR / "fbbatch_saved_issues.json"
 FBBATCH_OUTPUT_DIR = REPO_ROOT / "outputs" / "fbbatch"
 OUTLOOK_DRAFT_SETTLE_SECONDS = 12.0
 OUTLOOK_START_TIMEOUT_SECONDS = 30.0
+OUTLOOK_PROFILE_NAME = "Exchange"
+OUTLOOK_INLINE_IMAGE_MAX_WIDTH = 960
+OUTLOOK_INLINE_IMAGE_MAX_HEIGHT = 720
 JAVA_DEFAULT_IDLE_TIMEOUT_SECONDS = 10 * 60.0
 JAVA_EVENT_IDLE_TIMEOUT_SECONDS = 40 * 60.0
 JAVA_MAX_RUNTIME_SECONDS = 90 * 60.0
@@ -558,6 +561,48 @@ def create_outlook_draft(
     attachments: list[Path],
     inline_images: list[Path],
 ) -> OutlookDraftResult:
+    from fbbatch.new_outlook import (
+        NewOutlookAutomationError,
+        NewOutlookUnavailable,
+        create_new_outlook_draft,
+    )
+
+    try:
+        create_new_outlook_draft(
+            subject=subject,
+            from_account=from_account,
+            to=to,
+            cc=cc,
+            body_text=body_text,
+            attachments=attachments,
+            inline_images=inline_images,
+        )
+        log.info("outlook_draft: completed with New Outlook")
+        return OutlookDraftResult(entry_id="new-outlook", folder_name="Drafts")
+    except (NewOutlookUnavailable, NewOutlookAutomationError) as exc:
+        log.warning("outlook_draft: New Outlook failed; using Classic Outlook fallback: %s", exc)
+
+    return _create_classic_outlook_draft(
+        subject=subject,
+        from_account=from_account,
+        to=to,
+        cc=cc,
+        body_text=body_text,
+        attachments=attachments,
+        inline_images=inline_images,
+    )
+
+
+def _create_classic_outlook_draft(
+    *,
+    subject: str,
+    from_account: str,
+    to: str,
+    cc: str,
+    body_text: str,
+    attachments: list[Path],
+    inline_images: list[Path],
+) -> OutlookDraftResult:
     import html
     try:
         import pythoncom
@@ -703,6 +748,10 @@ def _start_outlook_application(client, timeout: float = OUTLOOK_START_TIMEOUT_SE
     if executable is not None:
         log.info("outlook_draft: starting visible Outlook path=%s", executable)
         subprocess.Popen([str(executable)], cwd=str(executable.parent))
+        _start_outlook_profile_dialog_helper(
+            profile_name=OUTLOOK_PROFILE_NAME,
+            timeout=timeout,
+        )
     else:
         log.info("outlook_draft: OUTLOOK.EXE not found; starting through COM")
         dispatched = client.Dispatch("Outlook.Application")
@@ -720,6 +769,100 @@ def _start_outlook_application(client, timeout: float = OUTLOOK_START_TIMEOUT_SE
         return dispatched
     log.warning("outlook_draft: active Outlook wait timed out; falling back to COM Dispatch")
     return client.Dispatch("Outlook.Application")
+
+
+def _start_outlook_profile_dialog_helper(
+    *,
+    profile_name: str,
+    timeout: float,
+) -> threading.Thread:
+    helper = threading.Thread(
+        target=_confirm_outlook_profile_dialog,
+        kwargs={"profile_name": profile_name, "timeout": timeout},
+        name="outlook-profile-dialog",
+        daemon=True,
+    )
+    helper.start()
+    return helper
+
+
+def _confirm_outlook_profile_dialog(*, profile_name: str, timeout: float) -> bool:
+    try:
+        from pywinauto import Desktop
+    except ImportError:
+        log.warning("outlook_draft: pywinauto unavailable; cannot confirm Outlook profile dialog")
+        return False
+
+    deadline = time.monotonic() + max(0.0, timeout)
+    desktop = Desktop(backend="uia")
+    dialog_titles = {
+        "choose profile",
+        "elegir perfil",
+        "seleccionar perfil",
+    }
+    while time.monotonic() < deadline:
+        try:
+            windows = desktop.windows()
+        except Exception:
+            log.debug("outlook_draft: profile dialog scan failed", exc_info=True)
+            time.sleep(0.25)
+            continue
+
+        for window in windows:
+            try:
+                title = window.window_text().strip().casefold()
+                if title not in dialog_titles:
+                    continue
+                log.info("outlook_draft: Outlook profile dialog detected title=%r", title)
+                if _accept_outlook_profile_dialog(window, profile_name):
+                    log.info("outlook_draft: Outlook profile confirmed profile=%s", profile_name)
+                    return True
+            except Exception:
+                log.debug("outlook_draft: profile dialog changed while handling it", exc_info=True)
+        time.sleep(0.25)
+
+    log.info("outlook_draft: Outlook profile dialog was not shown before timeout")
+    return False
+
+
+def _accept_outlook_profile_dialog(dialog, profile_name: str) -> bool:
+    controls = dialog.descendants()
+    combo_boxes = [
+        control
+        for control in controls
+        if str(control.element_info.control_type) == "ComboBox"
+    ]
+    if combo_boxes:
+        combo = combo_boxes[0]
+        current = combo.window_text().strip().casefold()
+        if profile_name.casefold() not in current:
+            try:
+                combo.select(profile_name)
+            except Exception:
+                log.warning(
+                    "outlook_draft: could not select Outlook profile=%s current=%r",
+                    profile_name,
+                    current,
+                    exc_info=True,
+                )
+                return False
+
+    accepted_labels = {"ok", "aceptar"}
+    buttons = [
+        control
+        for control in controls
+        if str(control.element_info.control_type) == "Button"
+        and control.window_text().strip().casefold() in accepted_labels
+    ]
+    if not buttons:
+        log.warning("outlook_draft: Outlook profile dialog has no OK/Accept button")
+        return False
+
+    try:
+        buttons[0].invoke()
+    except Exception:
+        buttons[0].click_input()
+    return True
 
 
 def _find_outlook_executable() -> Path | None:
@@ -922,12 +1065,38 @@ def _attach_inline_images(mail, images: list[Path]) -> str:
                     exc_info=True,
                 )
         escaped_id = html.escape(content_id, quote=True)
+        display_width, display_height = _inline_image_display_size(
+            image,
+            max_width=OUTLOOK_INLINE_IMAGE_MAX_WIDTH,
+            max_height=OUTLOOK_INLINE_IMAGE_MAX_HEIGHT,
+        )
         chunks.append(
             f'<div style="margin:16px 0;"><img src="cid:{escaped_id}" '
-            'style="display:block;max-width:100%;height:auto;"></div>'
+            f'width="{display_width}" height="{display_height}" '
+            f'style="display:block;width:{display_width}px;max-width:100%;height:auto;"></div>'
         )
         log.info("outlook_draft: inline CID image attached path=%s cid=%s", image, content_id)
     return "".join(chunks)
+
+
+def _inline_image_display_size(
+    image_path: Path,
+    *,
+    max_width: int,
+    max_height: int,
+) -> tuple[int, int]:
+    try:
+        from PIL import Image
+
+        with Image.open(image_path) as image:
+            scale = min(1.0, max_width / image.width, max_height / image.height)
+            return (
+                max(1, round(image.width * scale)),
+                max(1, round(image.height * scale)),
+            )
+    except (OSError, ValueError):
+        log.warning("outlook_draft: could not inspect inline image size path=%s", image_path)
+        return max_width, max_height
 
 
 def issues_for_date(issue_date: str) -> list[dict[str, str]]:

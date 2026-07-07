@@ -16,6 +16,7 @@ from fbbatch.runner import (  # noqa: E402
     JAVA_EVENT_IDLE_TIMEOUT_SECONDS,
     JAVA_MAX_RUNTIME_SECONDS,
     _JavaProgress,
+    _accept_outlook_profile_dialog,
     _ensure_outlook_window,
     _java_idle_timeout_seconds,
     _java_process_label,
@@ -117,12 +118,46 @@ class OutlookStartupTests(unittest.TestCase):
         with (
             patch("fbbatch.runner._find_outlook_executable", return_value=executable),
             patch("fbbatch.runner.subprocess.Popen") as popen,
+            patch("fbbatch.runner._start_outlook_profile_dialog_helper") as profile_helper,
         ):
             result = _start_outlook_application(client, timeout=1)
 
         self.assertIs(result, outlook)
         popen.assert_called_once_with([str(executable)], cwd=str(executable.parent))
+        profile_helper.assert_called_once_with(profile_name="Exchange", timeout=1)
         client.Dispatch.assert_not_called()
+
+    def test_profile_dialog_selects_exchange_and_accepts(self) -> None:
+        combo = Mock()
+        combo.element_info.control_type = "ComboBox"
+        combo.window_text.return_value = "Other profile"
+        button = Mock()
+        button.element_info.control_type = "Button"
+        button.window_text.return_value = "OK"
+        dialog = Mock()
+        dialog.descendants.return_value = [combo, button]
+
+        accepted = _accept_outlook_profile_dialog(dialog, "Exchange")
+
+        self.assertTrue(accepted)
+        combo.select.assert_called_once_with("Exchange")
+        button.invoke.assert_called_once_with()
+
+    def test_profile_dialog_accepts_preselected_exchange(self) -> None:
+        combo = Mock()
+        combo.element_info.control_type = "ComboBox"
+        combo.window_text.return_value = "Exchange"
+        button = Mock()
+        button.element_info.control_type = "Button"
+        button.window_text.return_value = "Aceptar"
+        dialog = Mock()
+        dialog.descendants.return_value = [combo, button]
+
+        accepted = _accept_outlook_profile_dialog(dialog, "Exchange")
+
+        self.assertTrue(accepted)
+        combo.select.assert_not_called()
+        button.invoke.assert_called_once_with()
 
     def test_missing_explorer_opens_visible_outlook_window(self) -> None:
         folder = SimpleNamespace(Display=Mock())
