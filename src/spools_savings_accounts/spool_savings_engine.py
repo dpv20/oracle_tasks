@@ -64,6 +64,12 @@ _VERIFY_TABLES: tuple[str, ...] = (
     "ICTB_ACC_PR",
     "ICTB_ENTRIES_HISTORY",
     "ACTB_VD_BAL",
+    "ACTB_HISTORY",
+    "ACTB_DAILY_LOG",
+    "ACTB_RECON_MASTER",
+    "ACTB_RECON_DETAILS",
+    "ACTB_RECON_MASTER_C",
+    "ACTB_RECON_DETAILS_C",
     "ICTB_ITM_TOV",
 )
 _VERIFY_TABLE_SPECS: tuple[tuple[str, str, str, str | None], ...] = (
@@ -73,6 +79,12 @@ _VERIFY_TABLE_SPECS: tuple[tuple[str, str, str, str | None], ...] = (
     ("ICTB_ACC_PR", "ictb_acc_pr", "acc", "brn"),
     ("ICTB_ENTRIES_HISTORY", "ictb_entries_history", "acc", "brn"),
     ("ACTB_VD_BAL", "actb_vd_bal", "acc", "brn"),
+    ("ACTB_HISTORY", "actb_history", "ac_no", "ac_branch"),
+    ("ACTB_DAILY_LOG", "actb_daily_log", "ac_no", "ac_branch"),
+    ("ACTB_RECON_MASTER", "actb_recon_master", "account", "branch"),
+    ("ACTB_RECON_DETAILS", "actb_recon_details", "account", "branch"),
+    ("ACTB_RECON_MASTER_C", "actb_recon_master_c", "account", "branch"),
+    ("ACTB_RECON_DETAILS_C", "actb_recon_details_c", "account", "branch"),
     ("ICTB_ITM_TOV", "ictb_itm_tov", "acc", "brn"),
 )
 _INSERT_TABLE_RE = re.compile(r"^\s*insert\s+into\s+([a-z0-9_]+)\s*\(", re.IGNORECASE)

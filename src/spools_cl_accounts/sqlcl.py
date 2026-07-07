@@ -98,6 +98,18 @@ class SqlclRunner:
         cancel_event: threading.Event | None = None,
     ) -> RunResult:
         """Run a SQL script file with optional positional args (`&1`, `&2`, ...)."""
+        if not args:
+            try:
+                script_text = Path(script_path).read_text(encoding="utf-8", errors="replace")
+            except OSError as e:
+                return RunResult(127, "", f"SQL script not found: {script_path} ({e})")
+            return self._invoke(
+                [self.exe, "-S", "-L", connection],
+                stdin=script_text,
+                timeout=timeout,
+                cancel_event=cancel_event,
+            )
+
         cmd: list[str] = [self.exe, "-S", "-L", connection, f"@{script_path}"]
         if args:
             cmd.extend(args)
