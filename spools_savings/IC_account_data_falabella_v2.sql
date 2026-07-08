@@ -480,7 +480,7 @@ declare
         emit_delete('ACTB_RECON_MASTER_C', 'BRANCH = ' || lit(g_branch) || ' AND ACCOUNT = ' || lit(g_account));
         emit_delete('ACTB_RECON_MASTER', 'BRANCH = ' || lit(g_branch) || ' AND ACCOUNT = ' || lit(g_account));
         emit_delete('ACTB_DAILY_LOG', 'AC_BRANCH = ' || lit(g_branch) || ' AND AC_NO = ' || lit(g_account));
-        emit_delete('ACTB_HISTORY', 'AC_BRANCH = ' || lit(g_branch) || ' AND AC_NO = ' || lit(g_account));
+        emit_delete('ACTB_HISTORY', 'AC_BRANCH = ' || lit(g_branch) || ' AND RELATED_ACCOUNT = ' || lit(g_account));
         emit_delete('ICTB_UDEVALS', 'PROD IN (SELECT DISTINCT PROD FROM ICTB_ACC_PR WHERE BRN = ' || lit(g_branch) || ' AND ACC = ' || lit(g_account) || ') AND COND_TYPE = 0 AND COND_KEY = ' || lit(g_branch || g_account));
         emit_delete('ICTB_ITM_TOV', 'ACC = ' || lit(g_account));
         emit_delete('ICTB_BACK_DATED_UDEVALS', 'COND_KEY LIKE ''%' || replace(g_account, '''', '''''') || '%''');
@@ -541,7 +541,7 @@ declare
         emit_table('ICTB_BOOK_ERR', 'ACC = ' || lit(g_account));
         emit_table('ICTB_CALC_ERR', 'ACC = ' || lit(g_account));
         emit_table('ACTB_VD_BAL', 'BRN = ' || lit(g_branch) || ' AND ACC = ' || lit(g_account), 'VAL_DT');
-        emit_table('ACTB_HISTORY', 'AC_BRANCH = ' || lit(g_branch) || ' AND AC_NO = ' || lit(g_account), 'TRN_DT, TRN_REF_NO, EVENT_SR_NO, AC_ENTRY_SR_NO');
+        emit_table('ACTB_HISTORY', 'AC_BRANCH = ' || lit(g_branch) || ' AND RELATED_ACCOUNT = ' || lit(g_account), 'TRN_DT, TRN_REF_NO, EVENT_SR_NO, AC_ENTRY_SR_NO');
         emit_table('ACTB_DAILY_LOG', 'AC_BRANCH = ' || lit(g_branch) || ' AND AC_NO = ' || lit(g_account), 'TRN_DT, TRN_REF_NO, EVENT_SR_NO, AC_ENTRY_SR_NO');
         emit_table('ACTB_RECON_MASTER', 'BRANCH = ' || lit(g_branch) || ' AND ACCOUNT = ' || lit(g_account), 'ENTRYDATE, RECONNO');
         emit_table('ACTB_RECON_MASTER_C', 'BRANCH = ' || lit(g_branch) || ' AND ACCOUNT = ' || lit(g_account), 'RECONNO');

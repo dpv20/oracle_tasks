@@ -79,7 +79,7 @@ _VERIFY_TABLE_SPECS: tuple[tuple[str, str, str, str | None], ...] = (
     ("ICTB_ACC_PR", "ictb_acc_pr", "acc", "brn"),
     ("ICTB_ENTRIES_HISTORY", "ictb_entries_history", "acc", "brn"),
     ("ACTB_VD_BAL", "actb_vd_bal", "acc", "brn"),
-    ("ACTB_HISTORY", "actb_history", "ac_no", "ac_branch"),
+    ("ACTB_HISTORY", "actb_history", "related_account", "ac_branch"),
     ("ACTB_DAILY_LOG", "actb_daily_log", "ac_no", "ac_branch"),
     ("ACTB_RECON_MASTER", "actb_recon_master", "account", "branch"),
     ("ACTB_RECON_DETAILS", "actb_recon_details", "account", "branch"),

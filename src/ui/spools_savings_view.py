@@ -1028,6 +1028,7 @@ class SpoolsSavingsView(ctk.CTkFrame):
         inject_set = set(inject_accounts)
         temp_dir = tempfile.TemporaryDirectory(prefix="oracle_tasks_savings_")
         working_dir = Path(temp_dir.name)
+        save_errors: list[str] = []
 
         def on_extract_status(account: str, status: SpoolSavingsStatus, msg: str) -> None:
             display = msg
@@ -1063,6 +1064,16 @@ class SpoolsSavingsView(ctk.CTkFrame):
                     result.account, result.status.value, result.branch, result.output_path, result.error,
                 )
 
+            # Keep completed extracts before injection starts. Applying can take a
+            # long time, and the working directory is deleted when the run ends.
+            if extract_archive_dir is None:
+                try:
+                    saved = self._persist_generated_spools(country, results)
+                    log.info("Persisted %s Savings spool(s) before injection", len(saved))
+                except OSError as exc:
+                    log.exception("Could not persist Savings extract output before injection")
+                    save_errors.append(str(exc))
+
             by_account = {result.account: result for result in results}
             apply_items = [
                 (acc, by_account[acc].output_path)
@@ -1079,11 +1090,11 @@ class SpoolsSavingsView(ctk.CTkFrame):
                             archive_path = self._create_extract_archive(country, results, extract_archive_dir)
                             if archive_path is not None:
                                 details["archive"] = [str(archive_path)]
-                        else:
-                            self._persist_generated_spools(country, results)
                     except OSError as exc:
                         log.exception("Could not persist Savings extract output")
-                        details["save_error"] = [str(exc)]
+                        save_errors.append(str(exc))
+                if save_errors:
+                    details["save_error"] = save_errors
                 self._post_ui(
                     lambda r=run_id, d=details, c=cancel_event.is_set(): self._finish(
                         extract_ok, extract_err, 0, 0, total, 0, r, d, c,
@@ -1134,7 +1145,9 @@ class SpoolsSavingsView(ctk.CTkFrame):
                     )
                 except OSError as exc:
                     log.exception("Could not persist Savings apply output")
-                    details["save_error"] = [str(exc)]
+                    save_errors.append(str(exc))
+            if save_errors:
+                details["save_error"] = save_errors
             self._post_ui(
                 lambda r=run_id, d=details, c=cancel_event.is_set(): self._finish(
                     extract_ok, extract_err, inject_ok, inject_err, total, len(apply_items), r, d, c,
@@ -1207,7 +1220,9 @@ class SpoolsSavingsView(ctk.CTkFrame):
                 continue
             dest = savings_output_path_for(country, result.account)
             dest.parent.mkdir(parents=True, exist_ok=True)
-            if result.status in _APPLY_SUCCESS_STATUSES and result.output_path.exists():
+            # The generated spool is useful even when injection fails or is
+            # cancelled, so never leave it only in the temporary directory.
+            if result.output_path.exists():
                 shutil.copy2(result.output_path, dest)
             log_path = result.output_path.with_name(f"{result.output_path.stem}_apply.log")
             if log_path.exists():
