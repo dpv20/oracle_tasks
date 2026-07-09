@@ -24,8 +24,8 @@ log = logging.getLogger(__name__)
 DEFAULT_FBBATCH_ROOT = REPO_ROOT / "FBBatchSetup"
 SAVED_ISSUES_FILE = DATA_DIR / "fbbatch_saved_issues.json"
 FBBATCH_OUTPUT_DIR = REPO_ROOT / "outputs" / "fbbatch"
-OUTLOOK_DRAFT_SETTLE_SECONDS = 12.0
-OUTLOOK_START_TIMEOUT_SECONDS = 30.0
+OUTLOOK_START_TIMEOUT_SECONDS = 10.0
+OUTLOOK_DRAFT_SYNC_SECONDS = 15.0
 OUTLOOK_PROFILE_NAME = "Exchange"
 OUTLOOK_INLINE_IMAGE_MAX_WIDTH = 960
 OUTLOOK_INLINE_IMAGE_MAX_HEIGHT = 720
@@ -567,6 +567,23 @@ def create_outlook_draft(
         create_new_outlook_draft,
     )
 
+    classic_executable = _find_outlook_executable()
+    if classic_executable is not None:
+        log.info(
+            "outlook_draft: using Classic Outlook primary path executable=%s",
+            classic_executable,
+        )
+        return _create_classic_outlook_draft(
+            subject=subject,
+            from_account=from_account,
+            to=to,
+            cc=cc,
+            body_text=body_text,
+            attachments=attachments,
+            inline_images=inline_images,
+        )
+
+    log.info("outlook_draft: Classic Outlook not installed; using New Outlook")
     try:
         create_new_outlook_draft(
             subject=subject,
@@ -579,18 +596,18 @@ def create_outlook_draft(
         )
         log.info("outlook_draft: completed with New Outlook")
         return OutlookDraftResult(entry_id="new-outlook", folder_name="Drafts")
-    except (NewOutlookUnavailable, NewOutlookAutomationError) as exc:
-        log.warning("outlook_draft: New Outlook failed; using Classic Outlook fallback: %s", exc)
+    except NewOutlookUnavailable as exc:
+        raise RuntimeError(
+            f"Neither Classic Outlook nor New Outlook could be opened.\nLog: {LOG_FILE}"
+        ) from exc
+    except NewOutlookAutomationError as exc:
+        log.error("outlook_draft: New Outlook draft started but could not be completed: %s", exc)
+        raise RuntimeError(
+            "New Outlook opened the email but could not complete it safely. "
+            f"The Classic Outlook fallback was not opened to avoid creating a duplicate.\nLog: {LOG_FILE}"
+        ) from exc
 
-    return _create_classic_outlook_draft(
-        subject=subject,
-        from_account=from_account,
-        to=to,
-        cc=cc,
-        body_text=body_text,
-        attachments=attachments,
-        inline_images=inline_images,
-    )
+    raise AssertionError("New Outlook draft creation returned unexpectedly.")
 
 
 def _create_classic_outlook_draft(
@@ -619,10 +636,12 @@ def _create_classic_outlook_draft(
         len([path for path in attachments if path]),
         len([path for path in inline_images if path]),
     )
+    outlook = None
+    started_outlook = False
     pythoncom.CoInitialize()
     try:
         try:
-            outlook = _start_outlook_application(win32com.client)
+            outlook, started_outlook = _start_outlook_application(win32com.client)
             namespace = outlook.GetNamespace("MAPI")
             log.info("outlook_draft: got MAPI namespace")
             try:
@@ -708,14 +727,12 @@ def _create_classic_outlook_draft(
             _outlook_attr(mail, "EntryID"),
             _outlook_parent_label(mail),
         )
-        _settle_outlook_draft(mail, OUTLOOK_DRAFT_SETTLE_SECONDS)
-        _outlook_call("final draft save", mail.Save, attempts=3, delay=0.8)
         draft_state = OutlookDraftResult(
             entry_id=_outlook_attr(mail, "EntryID"),
             folder_name=_outlook_attr(drafts_folder, "Name") or "Drafts",
         )
         log.info(
-            "outlook_draft: final Save succeeded; treating item as saved in %s entry_id=%r",
+            "outlook_draft: Save succeeded; treating item as saved in %s entry_id=%r",
             _outlook_folder_label(drafts_folder),
             draft_state.entry_id,
         )
@@ -724,6 +741,11 @@ def _create_classic_outlook_draft(
             draft_state.entry_id,
             draft_state.folder_name,
         )
+        log.info(
+            "outlook_draft: waiting %.1fs for Exchange/New Outlook draft sync",
+            OUTLOOK_DRAFT_SYNC_SECONDS,
+        )
+        time.sleep(OUTLOOK_DRAFT_SYNC_SECONDS)
         return OutlookDraftResult(
             entry_id=draft_state.entry_id,
             folder_name=draft_state.folder_name,
@@ -732,6 +754,15 @@ def _create_classic_outlook_draft(
         log.exception("outlook_draft: failed")
         raise RuntimeError(f"{exc}\nLog: {LOG_FILE}") from exc
     finally:
+        if started_outlook and outlook is not None:
+            try:
+                outlook.Quit()
+                log.info("outlook_draft: closed Classic Outlook started by Oracle Tasks")
+            except Exception:
+                log.warning(
+                    "outlook_draft: draft is saved but Classic Outlook could not be closed automatically",
+                    exc_info=True,
+                )
         pythoncom.CoUninitialize()
 
 
@@ -739,15 +770,22 @@ def _start_outlook_application(client, timeout: float = OUTLOOK_START_TIMEOUT_SE
     try:
         outlook = client.GetActiveObject("Outlook.Application")
         log.info("outlook_draft: using active Outlook.Application")
-        return outlook
+        return outlook, False
     except Exception:
         pass
 
     executable = _find_outlook_executable()
     dispatched = None
     if executable is not None:
-        log.info("outlook_draft: starting visible Outlook path=%s", executable)
-        subprocess.Popen([str(executable)], cwd=str(executable.parent))
+        log.info(
+            "outlook_draft: starting visible Outlook path=%s profile=%s",
+            executable,
+            OUTLOOK_PROFILE_NAME,
+        )
+        subprocess.Popen(
+            [str(executable), "/profile", OUTLOOK_PROFILE_NAME],
+            cwd=str(executable.parent),
+        )
         _start_outlook_profile_dialog_helper(
             profile_name=OUTLOOK_PROFILE_NAME,
             timeout=timeout,
@@ -761,14 +799,14 @@ def _start_outlook_application(client, timeout: float = OUTLOOK_START_TIMEOUT_SE
         try:
             outlook = client.GetActiveObject("Outlook.Application")
             log.info("outlook_draft: Outlook.Application became active")
-            return outlook
+            return outlook, True
         except Exception:
             time.sleep(0.5)
 
     if dispatched is not None:
-        return dispatched
+        return dispatched, True
     log.warning("outlook_draft: active Outlook wait timed out; falling back to COM Dispatch")
-    return client.Dispatch("Outlook.Application")
+    return client.Dispatch("Outlook.Application"), True
 
 
 def _start_outlook_profile_dialog_helper(
@@ -811,9 +849,19 @@ def _confirm_outlook_profile_dialog(*, profile_name: str, timeout: float) -> boo
         for window in windows:
             try:
                 title = window.window_text().strip().casefold()
-                if title not in dialog_titles:
+                controls = window.descendants()
+                nested_title = next(
+                    (
+                        control.window_text().strip().casefold()
+                        for control in controls
+                        if control.window_text().strip().casefold() in dialog_titles
+                    ),
+                    "",
+                )
+                if title not in dialog_titles and not nested_title:
                     continue
-                log.info("outlook_draft: Outlook profile dialog detected title=%r", title)
+                detected_title = title if title in dialog_titles else nested_title
+                log.info("outlook_draft: Outlook profile dialog detected title=%r", detected_title)
                 if _accept_outlook_profile_dialog(window, profile_name):
                     log.info("outlook_draft: Outlook profile confirmed profile=%s", profile_name)
                     return True
@@ -989,19 +1037,6 @@ def _outlook_call(label: str, func, *, attempts: int = 5, delay: float = 0.6):
             )
             time.sleep(delay * attempt)
     raise last_exc or RuntimeError(f"Outlook call failed: {label}")
-
-
-def _settle_outlook_draft(mail, seconds: float) -> None:
-    deadline = time.monotonic() + seconds
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            break
-        time.sleep(min(2.0, remaining))
-        try:
-            _outlook_call("save hidden draft while waiting", mail.Save, attempts=2, delay=0.5)
-        except Exception:
-            log.exception("outlook_draft: periodic hidden draft save failed")
 
 
 def _safe_filename(value: str) -> str:

@@ -49,12 +49,18 @@ def create_new_outlook_draft(
 
     try:
         import pythoncom
-        from pywinauto import Desktop, keyboard
     except ImportError as exc:
         raise NewOutlookUnavailable("New Outlook automation requires pywin32 and pywinauto.") from exc
 
     pythoncom.CoInitialize()
     try:
+        try:
+            from pywinauto import Desktop, keyboard
+        except ImportError as exc:
+            raise NewOutlookUnavailable(
+                "New Outlook automation requires pywin32 and pywinauto."
+            ) from exc
+        log.info("new_outlook_draft: COM initialized for Outlook automation thread")
         desktop = Desktop(backend="uia")
         existing_handles = {
             window.handle
@@ -89,20 +95,17 @@ def create_new_outlook_draft(
         )
         _wait_for_compose_controls(compose_window, timeout=NEW_OUTLOOK_START_TIMEOUT_SECONDS)
         _ensure_from_account(desktop, compose_window, from_account)
-        _fill_recipient_field(compose_window, "_TO", _split_recipients(to), keyboard)
-        _fill_recipient_field(compose_window, "_CC", _split_recipients(cc), keyboard)
+        # New mail opens with focus in To. Preserve that native sequence:
+        # paste To, Tab to Cc, paste Cc, then populate subject and body.
+        _fill_recipient_fields(compose_window, to, cc, keyboard)
         _fill_subject(compose_window, subject, keyboard)
         body = _find_body_editor(compose_window)
-        body.click_input()
-        keyboard.send_keys("^{HOME}")
 
         message_text = (
             "Confidential - Oracle Restricted \\Including External Recipients\r\n\r\n"
             f"{body_text.strip()}\r\n\r\n"
         )
-        _set_clipboard_text(message_text)
-        keyboard.send_keys("^v")
-        time.sleep(0.4)
+        _fill_body(body, message_text, keyboard)
 
         if existing_attachments:
             _set_clipboard_files(existing_attachments)
@@ -126,9 +129,13 @@ def create_new_outlook_draft(
         _show_drafts_folder(main_window)
         log.info("new_outlook_draft: compose window closed; draft remains in Drafts")
     except NewOutlookUnavailable:
+        if compose_window is not None:
+            _discard_failed_compose(compose_window)
         raise
     except Exception as exc:
         log.exception("new_outlook_draft: automation failed")
+        if compose_window is not None:
+            _discard_failed_compose(compose_window)
         raise NewOutlookAutomationError(str(exc)) from exc
     finally:
         try:
@@ -333,23 +340,112 @@ def _ensure_from_account(desktop, window, from_account: str) -> None:
     )
 
 
-def _fill_recipient_field(window, automation_suffix: str, recipients: list[str], keyboard) -> None:
-    if not recipients:
+def _fill_recipient_fields(window, to_text: str, cc_text: str, keyboard) -> None:
+    to_recipients = _split_recipients(to_text)
+    cc_recipients = _split_recipients(cc_text)
+    if not to_recipients:
         return
+
+    _set_clipboard_text(to_text.strip())
+    keyboard.send_keys("^v")
+    # New Outlook resolves the whole pasted row without Enter. Keeping focus
+    # untouched is important because one Tab then reaches the Cc row.
+    time.sleep(3.0)
+
+    if cc_recipients:
+        keyboard.send_keys("{TAB}")
+        _set_clipboard_text(cc_text.strip())
+        keyboard.send_keys("^v")
+        time.sleep(3.0)
+
+    _wait_for_recipient_confirmation(window, "_TO", len(to_recipients), timeout=20.0)
+    if cc_recipients:
+        _wait_for_recipient_confirmation(window, "_CC", len(cc_recipients), timeout=20.0)
+    log.info(
+        "new_outlook_draft: recipient fields completed to_count=%s cc_count=%s",
+        len(to_recipients),
+        len(cc_recipients),
+    )
+def _find_recipient_well(window, automation_suffix: str):
     wells = [
         control
         for control in window.descendants()
         if control.element_info.control_type == "Group"
         and str(control.element_info.automation_id).endswith(automation_suffix)
     ]
-    if not wells:
-        raise NewOutlookAutomationError(f"New Outlook did not expose recipient field {automation_suffix}.")
-    well = wells[0]
-    well.click_input()
-    for recipient in recipients:
-        _set_clipboard_text(recipient)
-        keyboard.send_keys("^v{ENTER}")
-        time.sleep(0.15)
+    return wells[0] if wells else None
+
+
+def _find_recipient_input(well, automation_suffix: str):
+    wanted_label = automation_suffix.removeprefix("_").casefold()
+    candidates = [
+        control
+        for control in well.descendants()
+        if control.element_info.control_type in ("Edit", "Group")
+        and control.window_text().strip().casefold() == wanted_label
+    ]
+    if candidates:
+        return candidates[0]
+    raise NewOutlookAutomationError(
+        f"New Outlook did not expose the input surface for recipient field {automation_suffix}."
+    )
+
+
+def _recipient_is_visible(well, recipient: str) -> bool:
+    wanted = recipient.strip().casefold()
+    for control in well.descendants():
+        values: list[str] = []
+        try:
+            values.append(str(control.window_text()))
+        except Exception:
+            pass
+        try:
+            values.append(str(control.element_info.name))
+        except Exception:
+            pass
+        if any(wanted in value.casefold() for value in values):
+            return True
+    return False
+
+
+def _recipient_chip_count(well) -> int:
+    chip_ids: set[str] = set()
+    described_totals: list[int] = []
+    position_pattern = re.compile(r"\b\d+\s+(?:of|de)\s+(\d+)\b", re.IGNORECASE)
+    for control in well.descendants():
+        if control.element_info.control_type == "Group":
+            automation_id = str(control.element_info.automation_id)
+            if automation_id.startswith("REK"):
+                chip_ids.add(automation_id)
+        try:
+            value = str(control.window_text())
+        except Exception:
+            value = ""
+        match = position_pattern.search(value)
+        if match:
+            described_totals.append(int(match.group(1)))
+    return max([len(chip_ids), *described_totals], default=0)
+
+
+def _wait_for_recipient_confirmation(
+    window,
+    automation_suffix: str,
+    expected_count: int,
+    *,
+    timeout: float,
+) -> None:
+    deadline = time.monotonic() + timeout
+    confirmed = 0
+    while time.monotonic() < deadline:
+        well = _find_recipient_well(window, automation_suffix)
+        if well is not None:
+            confirmed = _recipient_chip_count(well)
+            if confirmed >= expected_count:
+                return
+        time.sleep(0.2)
+    raise NewOutlookAutomationError(
+        f"New Outlook resolved {confirmed} of {expected_count} recipients in the selected field."
+    )
 
 
 def _fill_subject(window, subject: str, keyboard) -> None:
@@ -361,11 +457,53 @@ def _fill_subject(window, subject: str, keyboard) -> None:
     ]
     if not fields:
         raise NewOutlookAutomationError("New Outlook did not expose the Subject field.")
-    fields[0].click_input()
-    keyboard.send_keys("^a")
-    _set_clipboard_text(subject)
-    keyboard.send_keys("^v")
-    time.sleep(0.2)
+    field = fields[0]
+    field.click_input()
+    try:
+        field.set_edit_text(subject)
+    except Exception:
+        log.debug(
+            "new_outlook_draft: UIA subject assignment failed; using clipboard fallback",
+            exc_info=True,
+        )
+        keyboard.send_keys("^a")
+        _set_clipboard_text(subject)
+        keyboard.send_keys("^v")
+
+    # Publish the field value before moving on to recipient controls.
+    keyboard.send_keys("{TAB}")
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if _control_contains_text(field, subject):
+            log.info("new_outlook_draft: subject completed")
+            return
+        time.sleep(0.15)
+    raise NewOutlookAutomationError("New Outlook did not confirm the message subject.")
+
+
+def _control_contains_text(control, expected: str) -> bool:
+    wanted = expected.strip().casefold()
+    values: list[str] = []
+
+    for getter_name in ("get_value", "window_text"):
+        try:
+            value = getattr(control, getter_name)()
+        except Exception:
+            continue
+        if value is not None:
+            values.append(str(value))
+
+    try:
+        values.append(str(control.element_info.name))
+    except Exception:
+        pass
+
+    try:
+        values.append(str(control.iface_value.CurrentValue))
+    except Exception:
+        pass
+
+    return any(wanted in value.strip().casefold() for value in values)
 
 
 def _find_body_editor(window):
@@ -380,16 +518,31 @@ def _find_body_editor(window):
     return editors[-1]
 
 
+def _fill_body(body, message_text: str, keyboard) -> None:
+    body.click_input()
+    keyboard.send_keys("^{HOME}")
+    _set_clipboard_text(message_text)
+    keyboard.send_keys("^v")
+    marker = "Confidential - Oracle Restricted"
+    deadline = time.monotonic() + 4.0
+    while time.monotonic() < deadline:
+        if marker.casefold() in body.window_text().casefold():
+            log.info("new_outlook_draft: body text completed")
+            return
+        time.sleep(0.2)
+    raise NewOutlookAutomationError("New Outlook did not confirm the message body.")
+
+
 def _wait_for_attachment_chips(window, attachments: list[Path], *, timeout: float) -> None:
-    wanted = {path.stem.lower() for path in attachments}
+    wanted = {path.name.casefold() for path in attachments}
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        visible = {
-            control.window_text().strip().lower()
+        visible = [
+            control.window_text().strip().casefold()
             for control in window.descendants()
-            if control.element_info.control_type == "ListItem" and control.window_text().strip()
-        }
-        if all(any(stem in label for label in visible) for stem in wanted):
+            if control.window_text().strip()
+        ]
+        if all(any(filename in label for label in visible) for filename in wanted):
             log.info("new_outlook_draft: attachment paste confirmed files=%s", sorted(wanted))
             return
         time.sleep(0.4)
@@ -435,6 +588,33 @@ def _close_popout_compose(window) -> None:
         close_buttons[0].invoke()
     else:
         window.close()
+
+
+def _discard_failed_compose(window, *, timeout: float = 5.0) -> bool:
+    try:
+        window.close()
+    except Exception:
+        log.warning("new_outlook_draft: could not request closing failed compose", exc_info=True)
+        return False
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            discard_buttons = [
+                control
+                for control in window.descendants()
+                if control.element_info.control_type == "Button"
+                and control.window_text().strip().casefold() in ("no", "discard", "descartar")
+            ]
+            if discard_buttons:
+                discard_buttons[0].invoke()
+                log.info("new_outlook_draft: incomplete compose discarded")
+                return True
+        except Exception:
+            log.debug("new_outlook_draft: waiting for close-draft confirmation", exc_info=True)
+        time.sleep(0.2)
+    log.warning("new_outlook_draft: incomplete compose could not be discarded automatically")
+    return False
 
 
 def _show_drafts_folder(main_window) -> None:

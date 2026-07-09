@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -23,7 +24,12 @@ from fbbatch.runner import (  # noqa: E402
     _run_java,
     _start_outlook_application,
 )
-from ui.fbbatch_view import _scale_phase_progress  # noqa: E402
+from ui.fbbatch_view import (  # noqa: E402
+    _DraftRetryContext,
+    _discover_draft_retry_context,
+    _retry_context_is_valid,
+    _scale_phase_progress,
+)
 
 
 class EventProgressTests(unittest.TestCase):
@@ -107,6 +113,85 @@ class EventProgressTests(unittest.TestCase):
         self.assertEqual(_scale_phase_progress(50, 50, 90), 70)
         self.assertEqual(_scale_phase_progress(100, 50, 90), 90)
 
+    def test_draft_retry_requires_existing_images_and_attachments(self) -> None:
+        image = ROOT_DIR / "shift" / "report_no_issue.txt"
+        attachment = ROOT_DIR / "shift" / "event.txt"
+        context = _DraftRetryContext(
+            report_date="08072026",
+            include_event=True,
+            attachments=(attachment,),
+            inline_images=(image,),
+            html_path=None,
+            pdf_path=attachment,
+            images_dir=None,
+            output_dir=None,
+        )
+
+        self.assertTrue(_retry_context_is_valid(context))
+
+    def test_draft_retry_rejects_missing_generated_image(self) -> None:
+        context = _DraftRetryContext(
+            report_date="08072026",
+            include_event=False,
+            attachments=(),
+            inline_images=(ROOT_DIR / "missing-summary.png",),
+            html_path=None,
+            pdf_path=None,
+            images_dir=None,
+            output_dir=None,
+        )
+
+        self.assertFalse(_retry_context_is_valid(context))
+
+    def test_draft_retry_discovers_outputs_generated_by_separate_actions(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "NightShift_08-07-2026"
+            output_dir.mkdir()
+            (output_dir / "summary.png").write_bytes(b"png")
+            (output_dir / "incident_01.png").write_bytes(b"png")
+            event_pdf = output_dir / "EODBatchEvent_08-07-2026.pdf"
+            event_pdf.write_bytes(b"pdf")
+
+            context, missing = _discover_draft_retry_context(
+                "08072026",
+                output_root=Path(temp_dir),
+            )
+
+        self.assertEqual(missing, "")
+        self.assertIsNotNone(context)
+        self.assertEqual(len(context.inline_images), 2)
+        self.assertEqual(context.attachments, (event_pdf,))
+
+    def test_draft_retry_reports_missing_event_pdf(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "NightShift_08-07-2026"
+            output_dir.mkdir()
+            (output_dir / "summary.png").write_bytes(b"png")
+
+            context, missing = _discover_draft_retry_context(
+                "08072026",
+                output_root=Path(temp_dir),
+            )
+
+        self.assertIsNone(context)
+        self.assertEqual(missing, "event")
+
+    def test_draft_retry_allows_weekend_without_event_pdf(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "NightShift_05-07-2026"
+            output_dir.mkdir()
+            (output_dir / "summary.png").write_bytes(b"png")
+
+            context, missing = _discover_draft_retry_context(
+                "05072026",
+                output_root=Path(temp_dir),
+            )
+
+        self.assertEqual(missing, "")
+        self.assertIsNotNone(context)
+        self.assertFalse(context.include_event)
+        self.assertEqual(context.attachments, ())
+
 
 class OutlookStartupTests(unittest.TestCase):
     def test_outlook_executable_is_started_before_active_object_is_returned(self) -> None:
@@ -120,10 +205,14 @@ class OutlookStartupTests(unittest.TestCase):
             patch("fbbatch.runner.subprocess.Popen") as popen,
             patch("fbbatch.runner._start_outlook_profile_dialog_helper") as profile_helper,
         ):
-            result = _start_outlook_application(client, timeout=1)
+            result, started_here = _start_outlook_application(client, timeout=1)
 
         self.assertIs(result, outlook)
-        popen.assert_called_once_with([str(executable)], cwd=str(executable.parent))
+        self.assertTrue(started_here)
+        popen.assert_called_once_with(
+            [str(executable), "/profile", "Exchange"],
+            cwd=str(executable.parent),
+        )
         profile_helper.assert_called_once_with(profile_name="Exchange", timeout=1)
         client.Dispatch.assert_not_called()
 
@@ -157,6 +246,23 @@ class OutlookStartupTests(unittest.TestCase):
 
         self.assertTrue(accepted)
         combo.select.assert_not_called()
+        button.invoke.assert_called_once_with()
+
+    def test_profile_dialog_can_be_handled_inside_microsoft_parent_window(self) -> None:
+        title = Mock()
+        title.element_info.control_type = "Text"
+        title.window_text.return_value = "Choose Profile"
+        combo = Mock()
+        combo.element_info.control_type = "ComboBox"
+        combo.window_text.return_value = "Exchange"
+        button = Mock()
+        button.element_info.control_type = "Button"
+        button.window_text.return_value = "OK"
+        parent = Mock()
+        parent.window_text.return_value = "Microsoft"
+        parent.descendants.return_value = [title, combo, button]
+
+        self.assertTrue(_accept_outlook_profile_dialog(parent, "Exchange"))
         button.invoke.assert_called_once_with()
 
     def test_missing_explorer_opens_visible_outlook_window(self) -> None:

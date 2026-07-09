@@ -6,6 +6,7 @@ import logging
 import threading
 import calendar
 from datetime import date, datetime, timedelta
+from dataclasses import dataclass
 from pathlib import Path
 from tkinter import filedialog, messagebox
 
@@ -13,6 +14,7 @@ import customtkinter as ctk
 
 from fbbatch.runner import (
     BatchResult,
+    FBBATCH_OUTPUT_DIR,
     ISSUE_FIELDS,
     check_falabella_vpn,
     create_outlook_draft,
@@ -107,6 +109,69 @@ def _issue_labels() -> dict[str, str]:
     }
 
 
+@dataclass(frozen=True)
+class _DraftRetryContext:
+    report_date: str
+    include_event: bool
+    attachments: tuple[Path, ...]
+    inline_images: tuple[Path, ...]
+    html_path: Path | None
+    pdf_path: Path | None
+    images_dir: Path | None
+    output_dir: Path | None
+
+
+def _retry_context_is_valid(context: _DraftRetryContext | None) -> bool:
+    if context is None or not context.inline_images:
+        return False
+    return all(path.is_file() for path in (*context.attachments, *context.inline_images))
+
+
+def _discover_draft_retry_context(
+    report_date: str,
+    *,
+    output_root: Path = FBBATCH_OUTPUT_DIR,
+) -> tuple[_DraftRetryContext | None, str]:
+    report_day = datetime.strptime(report_date, "%d%m%Y").date()
+    output_dir = output_root / f"NightShift_{report_day:%d-%m-%Y}"
+    if not output_dir.is_dir():
+        return None, "output"
+
+    summary_image = output_dir / "summary.png"
+    inline_images = []
+    if summary_image.is_file():
+        inline_images.append(summary_image)
+    inline_images.extend(sorted(output_dir.glob("incident_*.png")))
+    if not inline_images:
+        return None, "images"
+
+    summary_html = output_dir / "summary.html"
+    include_event = report_day.weekday() not in (5, 6)
+    if summary_html.is_file() and report_indicates_chile_batch_skipped(summary_html):
+        include_event = False
+
+    event_pdfs = sorted(
+        output_dir.glob("EODBatchEvent_*.pdf"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    event_pdf = event_pdfs[0] if event_pdfs else None
+    if include_event and event_pdf is None:
+        return None, "event"
+
+    context = _DraftRetryContext(
+        report_date=report_date,
+        include_event=include_event,
+        attachments=(event_pdf,) if include_event and event_pdf else (),
+        inline_images=tuple(inline_images),
+        html_path=summary_html if summary_html.is_file() else None,
+        pdf_path=event_pdf,
+        images_dir=output_dir,
+        output_dir=output_dir,
+    )
+    return context, ""
+
+
 class FBBatchSetupView(ctk.CTkFrame):
     def __init__(self, master, app):
         super().__init__(master, fg_color="transparent")
@@ -122,6 +187,7 @@ class FBBatchSetupView(ctk.CTkFrame):
         self._full_output_dir: Path | None = None
         self._event_output_dir: Path | None = None
         self._report_output_dir: Path | None = None
+        self._draft_retry_context: _DraftRetryContext | None = None
         self._active_progress = "event"
 
         header = ctk.CTkFrame(self, fg_color="transparent")
@@ -217,6 +283,13 @@ class FBBatchSetupView(ctk.CTkFrame):
             command=lambda: self._open_path(self._full_output_dir),
         )
         self.full_open_location_btn.pack(side="right", padx=5)
+        self.full_retry_draft_btn = ctk.CTkButton(
+            self.full_output_row,
+            text=t("fbbatch.mail.retry"),
+            width=170,
+            command=self._on_retry_draft,
+        )
+        self.full_retry_draft_btn.pack(side="right", padx=5)
         self.full_progress_bar = ctk.CTkProgressBar(inner)
         self.full_progress_bar.set(0)
         self.full_progress_bar.grid(row=5, column=0, columnspan=5, sticky="ew", pady=(14, 2))
@@ -384,6 +457,14 @@ class FBBatchSetupView(ctk.CTkFrame):
     def _mail_values_for_current_date(self) -> dict[str, str]:
         report_date = self._current_full_report_date()
         include_event = datetime.strptime(report_date, "%d%m%Y").date().weekday() not in (5, 6)
+        return self._mail_values_for_report_date(report_date, include_event=include_event)
+
+    def _mail_values_for_report_date(
+        self,
+        report_date: str,
+        *,
+        include_event: bool,
+    ) -> dict[str, str]:
         from_account = (
             self.app.config.get("fbbatch_mail_from")
             or self.app.config.get("oracle_email")
@@ -575,6 +656,84 @@ class FBBatchSetupView(ctk.CTkFrame):
             )
         )
 
+    def _on_retry_draft(self) -> None:
+        report_date = self._current_full_report_date()
+        context, missing = _discover_draft_retry_context(report_date)
+        if not _retry_context_is_valid(context):
+            display_date = datetime.strptime(report_date, "%d%m%Y").strftime("%d-%m-%Y")
+            messagebox.showerror(
+                t("common.error"),
+                t(
+                    "fbbatch.mail.retry_missing",
+                    date=display_date,
+                    detail=t(f"fbbatch.mail.retry_missing_{missing or 'images'}"),
+                ),
+                parent=self,
+            )
+            return
+        self._draft_retry_context = context
+
+        mail_values = self._mail_values_for_report_date(
+            context.report_date,
+            include_event=context.include_event,
+        )
+        if not mail_values["from_account"]:
+            messagebox.showwarning(
+                t("fbbatch.mail.from_missing_title"),
+                t("fbbatch.mail.from_missing"),
+                parent=self,
+            )
+            self._open_mail_settings()
+            return
+
+        self._active_progress = "full"
+        self._run_background(
+            lambda progress: self._retry_draft(
+                context=context,
+                subject=mail_values["subject"],
+                from_account=mail_values["from_account"],
+                to=mail_values["to"],
+                cc=mail_values["cc"],
+                body=mail_values["body"],
+                progress=progress,
+            ),
+            preserve_outputs=True,
+        )
+
+    @staticmethod
+    def _retry_draft(
+        *,
+        context: _DraftRetryContext,
+        subject: str,
+        from_account: str,
+        to: str,
+        cc: str,
+        body: str,
+        progress,
+    ) -> BatchResult:
+        progress(91, t("fbbatch.mail.opening_outlook"))
+        progress(94, t("fbbatch.mail.retrying"))
+        create_outlook_draft(
+            subject=subject,
+            from_account=from_account,
+            to=to,
+            cc=cc,
+            body_text=body,
+            attachments=list(context.attachments),
+            inline_images=list(context.inline_images),
+        )
+        progress(100, t("fbbatch.mail.opened"))
+        return BatchResult(
+            True,
+            t("fbbatch.mail.opened"),
+            html_path=context.html_path,
+            pdf_path=context.pdf_path,
+            image_paths=list(context.inline_images),
+            images_dir=context.images_dir,
+            output_dir=context.output_dir,
+            event_skipped=not context.include_event,
+        )
+
     def _run_full_report(
         self,
         *,
@@ -650,16 +809,39 @@ class FBBatchSetupView(ctk.CTkFrame):
         subject = render_mail_template(subject_template, report_date, include_event=include_event)
         body = render_mail_template(body_template, report_date, include_event=include_event)
         attachments = [event_pdf] if include_event and event_pdf else []
-        progress(94, t("fbbatch.mail.creating"))
-        create_outlook_draft(
-            subject=subject,
-            from_account=from_account,
-            to=to,
-            cc=cc,
-            body_text=body,
-            attachments=attachments,
-            inline_images=report_result.image_paths,
+        retry_context = _DraftRetryContext(
+            report_date=report_date,
+            include_event=include_event,
+            attachments=tuple(attachments),
+            inline_images=tuple(report_result.image_paths),
+            html_path=report_result.html_path,
+            pdf_path=event_pdf,
+            images_dir=report_result.images_dir,
+            output_dir=report_result.output_dir,
         )
+        self._draft_retry_context = retry_context
+        progress(94, t("fbbatch.mail.creating"))
+        try:
+            create_outlook_draft(
+                subject=subject,
+                from_account=from_account,
+                to=to,
+                cc=cc,
+                body_text=body,
+                attachments=attachments,
+                inline_images=report_result.image_paths,
+            )
+        except Exception as exc:
+            return BatchResult(
+                False,
+                str(exc),
+                html_path=retry_context.html_path,
+                pdf_path=retry_context.pdf_path,
+                image_paths=list(retry_context.inline_images),
+                images_dir=retry_context.images_dir,
+                output_dir=retry_context.output_dir,
+                event_skipped=not retry_context.include_event,
+            )
         progress(100, t("fbbatch.mail.opened"))
         return BatchResult(
             True,
@@ -746,7 +928,7 @@ class FBBatchSetupView(ctk.CTkFrame):
             parent=self,
         )
 
-    def _run_background(self, work) -> None:
+    def _run_background(self, work, *, preserve_outputs: bool = False) -> None:
         if self._running:
             return
         self._running = True
@@ -763,7 +945,7 @@ class FBBatchSetupView(ctk.CTkFrame):
             self._report_images_dir = None
             self._report_output_dir = None
             self.report_open_location_btn.configure(state="disabled")
-        else:
+        elif not preserve_outputs:
             self._event_pdf = None
             self._event_html = None
             self._report_html = None
@@ -851,11 +1033,12 @@ class FBBatchSetupView(ctk.CTkFrame):
             if self._report_output_dir and self._report_output_dir.exists():
                 self.report_open_location_btn.configure(state="normal")
         else:
-            self._event_pdf = result.pdf_path
-            self._report_html = result.html_path
-            self._report_images_dir = result.images_dir
-            self._full_output_dir = result.output_dir
-            self._report_output_dir = result.output_dir
+            context = self._draft_retry_context
+            self._event_pdf = context.pdf_path if context else result.pdf_path
+            self._report_html = context.html_path if context else result.html_path
+            self._report_images_dir = context.images_dir if context else result.images_dir
+            self._full_output_dir = context.output_dir if context else result.output_dir
+            self._report_output_dir = self._full_output_dir
             if self._event_pdf and self._event_pdf.exists():
                 self._event_output_dir = result.output_dir
                 self.event_open_location_btn.configure(state="normal")
