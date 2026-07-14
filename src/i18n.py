@@ -303,6 +303,19 @@ T: dict[str, dict[str, str]] = {
         "settings.vpn.save": "Save VPN settings",
         "settings.vpn.saved": "VPN settings saved.",
 
+        # Global logs dialog
+        "logs.button": "Logs",
+        "logs.title": "Application logs",
+        "logs.description": "Export the complete diagnostic history or clear all saved application logs.",
+        "logs.location": "Log file:\n{path}",
+        "logs.export": "Export logs",
+        "logs.export_title": "Export application logs",
+        "logs.clear": "Clear logs",
+        "logs.no_log": "No application log exists yet.",
+        "logs.exported": "Logs exported to:\n{path}",
+        "logs.clear_confirm": "Delete the active log and all rotated log history?",
+        "logs.cleared": "The application logs were cleared.",
+
         # Settings → About
         "settings.about.version": "Version",
         "settings.about.repo": "Repository",
@@ -325,6 +338,9 @@ T: dict[str, dict[str, str]] = {
         "fbbatch.mail.from": "From account",
         "fbbatch.mail.body": "Body",
         "fbbatch.mail.edit": "Mail settings",
+        "fbbatch.mail.use_classic": "Use Classic Outlook",
+        "fbbatch.mail.install_classic": "Install Classic Outlook",
+        "fbbatch.mail.install_open_failed": "The Microsoft installation page could not be opened.\n\n{url}",
         "fbbatch.mail.summary": "Mail: {subject}\nFrom: {sender}",
         "fbbatch.mail.from_missing_title": "From account required",
         "fbbatch.mail.from_missing": "From account is empty. Click Mail settings before generating the report.",
@@ -729,6 +745,19 @@ T: dict[str, dict[str, str]] = {
         "settings.vpn.save": "Guardar configuracion VPN",
         "settings.vpn.saved": "Configuracion VPN guardada.",
 
+        # Ventana global de logs
+        "logs.button": "Logs",
+        "logs.title": "Logs de la aplicacion",
+        "logs.description": "Exporta el historial completo de diagnostico o limpia todos los logs guardados por la aplicacion.",
+        "logs.location": "Archivo de log:\n{path}",
+        "logs.export": "Exportar logs",
+        "logs.export_title": "Exportar logs de la aplicacion",
+        "logs.clear": "Limpiar logs",
+        "logs.no_log": "Todavia no existe un log de la aplicacion.",
+        "logs.exported": "Logs exportados a:\n{path}",
+        "logs.clear_confirm": "Eliminar el log activo y todo el historial de logs rotados?",
+        "logs.cleared": "Los logs de la aplicacion fueron limpiados.",
+
         # Settings → About
         "settings.about.version": "Versión",
         "settings.about.repo": "Repositorio",
@@ -752,6 +781,9 @@ T: dict[str, dict[str, str]] = {
         "fbbatch.mail.from": "Cuenta remitente",
         "fbbatch.mail.body": "Body",
         "fbbatch.mail.edit": "Configurar mail",
+        "fbbatch.mail.use_classic": "Usar Outlook clasico",
+        "fbbatch.mail.install_classic": "Instalar Outlook clasico",
+        "fbbatch.mail.install_open_failed": "No se pudo abrir la pagina de instalacion de Microsoft.\n\n{url}",
         "fbbatch.mail.summary": "Mail: {subject}\nFrom: {sender}",
         "fbbatch.mail.from_missing_title": "Cuenta remitente requerida",
         "fbbatch.mail.from_missing": "La cuenta remitente está vacía. Haz clic en Configurar mail antes de generar el reporte.",

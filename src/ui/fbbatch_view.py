@@ -5,6 +5,7 @@ import os
 import logging
 import threading
 import calendar
+import webbrowser
 from datetime import date, datetime, timedelta
 from dataclasses import dataclass
 from pathlib import Path
@@ -64,6 +65,10 @@ DEFAULT_MAIL_CC = (
     '"Ashwin M" <ashwin.m@oracle.com>; '
     '"Diego Pavez" <diego.pavez@oracle.com>'
 )
+CLASSIC_OUTLOOK_INSTALL_PAGES = {
+    "en": "https://support.microsoft.com/en-us/outlook/install-or-reinstall-classic-outlook-on-a-windows-pc",
+    "es": "https://support.microsoft.com/es-es/outlook/install-or-reinstall-classic-outlook-on-a-windows-pc",
+}
 EXAMPLE_ISSUE = {
     "DATE": "01-APR-26",
     "COUNTRY": "COLOMBIA",
@@ -125,6 +130,13 @@ def _retry_context_is_valid(context: _DraftRetryContext | None) -> bool:
     if context is None or not context.inline_images:
         return False
     return all(path.is_file() for path in (*context.attachments, *context.inline_images))
+
+
+def _classic_outlook_install_url(language: str) -> str:
+    return CLASSIC_OUTLOOK_INSTALL_PAGES.get(
+        language.strip().lower(),
+        CLASSIC_OUTLOOK_INSTALL_PAGES["en"],
+    )
 
 
 def _discover_draft_retry_context(
@@ -267,12 +279,27 @@ class FBBatchSetupView(ctk.CTkFrame):
             text_color=("gray40", "gray65"),
         )
         self.mail_summary.grid(row=0, column=0, sticky="ew")
+        ctk.CTkButton(
+            mail_row,
+            text=t("fbbatch.mail.install_classic"),
+            width=175,
+            command=self._open_classic_outlook_install_page,
+        ).grid(row=0, column=1, padx=(12, 0))
         IconButton(
             mail_row,
             text=t("fbbatch.mail.edit"),
             width=150,
             command=self._open_mail_settings,
-        ).grid(row=0, column=1, padx=(12, 0))
+        ).grid(row=0, column=2, padx=(12, 0))
+        self.use_classic_outlook_var = ctk.BooleanVar(
+            value=bool(self.app.config.get("fbbatch_use_classic_outlook", False))
+        )
+        ctk.CTkCheckBox(
+            mail_row,
+            text=t("fbbatch.mail.use_classic"),
+            variable=self.use_classic_outlook_var,
+            command=self._save_outlook_route,
+        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(10, 0))
         self.full_output_row = ctk.CTkFrame(inner, fg_color="transparent")
         self.full_output_row.grid(row=7, column=0, columnspan=5, sticky="e", pady=(10, 0))
         self.full_open_location_btn = ctk.CTkButton(
@@ -512,6 +539,30 @@ class FBBatchSetupView(ctk.CTkFrame):
     def _open_mail_settings(self) -> None:
         MailSettingsDialog(self, values=self._mail_values_for_current_date(), on_saved=self._save_mail_settings)
 
+    def _open_classic_outlook_install_page(self) -> None:
+        language = str(self.app.config.get("language", "en"))
+        url = _classic_outlook_install_url(language)
+        log.info("night_shift: opening Classic Outlook installation page language=%s url=%s", language, url)
+        try:
+            opened = webbrowser.open(url, new=2)
+        except OSError:
+            log.exception("night_shift: could not open Classic Outlook installation page")
+            opened = False
+        if not opened:
+            messagebox.showerror(
+                t("common.error"),
+                t("fbbatch.mail.install_open_failed", url=url),
+                parent=self,
+            )
+
+    def _save_outlook_route(self) -> None:
+        use_classic = bool(self.use_classic_outlook_var.get())
+        self.app.config.set("fbbatch_use_classic_outlook", use_classic)
+        log.info(
+            "night_shift: Outlook route preference changed route=%s",
+            "classic" if use_classic else "new",
+        )
+
     def _save_mail_settings(self, values: dict[str, str]) -> None:
         self.app.config.set("fbbatch_mail_subject", values["subject_template"].strip() or "NSSR : {MONTH_UPPER} {DAY} {YEAR}")
         self.app.config.set("fbbatch_mail_from", values["from_account"].strip())
@@ -618,6 +669,12 @@ class FBBatchSetupView(ctk.CTkFrame):
             return
         env = self.full_env.get()
         vpn_ok, vpn_message = check_falabella_vpn()
+        log.info(
+            "night_shift: VPN prerequisite checked ok=%s detail=%r env=%s",
+            vpn_ok,
+            vpn_message,
+            env,
+        )
         if not vpn_ok:
             messagebox.showerror(t("fbbatch.vpn.required_title"), t("fbbatch.vpn.required", detail=vpn_message), parent=self)
             return
@@ -636,8 +693,25 @@ class FBBatchSetupView(ctk.CTkFrame):
         to = mail_values["to"]
         cc = mail_values["cc"]
         body_template = mail_values["body_template"]
+        use_classic_outlook = bool(self.use_classic_outlook_var.get())
 
         latest = bool(self.full_latest_var.get())
+        log.info(
+            "night_shift: generate requested env=%s report_date=%s latest=%s has_issue=%s "
+            "root=%s from_configured=%s to_chars=%s cc_chars=%s",
+            env,
+            report_date,
+            latest,
+            bool(issues),
+            root,
+            bool(from_account),
+            len(to),
+            len(cc),
+        )
+        log.info(
+            "night_shift: generate selected Outlook route=%s",
+            "classic" if use_classic_outlook else "new",
+        )
         self._active_progress = "full"
         self._run_background(
             lambda progress: self._run_full_report(
@@ -651,6 +725,7 @@ class FBBatchSetupView(ctk.CTkFrame):
                 to=to,
                 cc=cc,
                 body_template=body_template,
+                use_classic_outlook=use_classic_outlook,
                 credentials=self.app.config.all_credentials(),
                 progress=progress,
             )
@@ -659,7 +734,19 @@ class FBBatchSetupView(ctk.CTkFrame):
     def _on_retry_draft(self) -> None:
         report_date = self._current_full_report_date()
         context, missing = _discover_draft_retry_context(report_date)
+        log.info(
+            "night_shift: retry requested report_date=%s context_found=%s missing=%r",
+            report_date,
+            context is not None,
+            missing,
+        )
         if not _retry_context_is_valid(context):
+            log.warning(
+                "night_shift: retry artifacts invalid report_date=%s missing=%r context=%r",
+                report_date,
+                missing,
+                context,
+            )
             display_date = datetime.strptime(report_date, "%d%m%Y").strftime("%d-%m-%Y")
             messagebox.showerror(
                 t("common.error"),
@@ -672,6 +759,16 @@ class FBBatchSetupView(ctk.CTkFrame):
             )
             return
         self._draft_retry_context = context
+        log.info(
+            "night_shift: retry artifacts include_event=%s attachments=%s inline_images=%s "
+            "html=%s pdf=%s output_dir=%s",
+            context.include_event,
+            [str(path) for path in context.attachments],
+            [str(path) for path in context.inline_images],
+            context.html_path,
+            context.pdf_path,
+            context.output_dir,
+        )
 
         mail_values = self._mail_values_for_report_date(
             context.report_date,
@@ -687,6 +784,11 @@ class FBBatchSetupView(ctk.CTkFrame):
             return
 
         self._active_progress = "full"
+        use_classic_outlook = bool(self.use_classic_outlook_var.get())
+        log.info(
+            "night_shift: retry selected Outlook route=%s",
+            "classic" if use_classic_outlook else "new",
+        )
         self._run_background(
             lambda progress: self._retry_draft(
                 context=context,
@@ -695,6 +797,7 @@ class FBBatchSetupView(ctk.CTkFrame):
                 to=mail_values["to"],
                 cc=mail_values["cc"],
                 body=mail_values["body"],
+                use_classic_outlook=use_classic_outlook,
                 progress=progress,
             ),
             preserve_outputs=True,
@@ -709,8 +812,17 @@ class FBBatchSetupView(ctk.CTkFrame):
         to: str,
         cc: str,
         body: str,
+        use_classic_outlook: bool,
         progress,
     ) -> BatchResult:
+        log.info(
+            "night_shift: retry draft starting report_date=%s include_event=%s "
+            "attachments=%s inline_images=%s",
+            context.report_date,
+            context.include_event,
+            len(context.attachments),
+            len(context.inline_images),
+        )
         progress(91, t("fbbatch.mail.opening_outlook"))
         progress(94, t("fbbatch.mail.retrying"))
         create_outlook_draft(
@@ -721,7 +833,9 @@ class FBBatchSetupView(ctk.CTkFrame):
             body_text=body,
             attachments=list(context.attachments),
             inline_images=list(context.inline_images),
+            use_classic_outlook=use_classic_outlook,
         )
+        log.info("night_shift: retry draft completed report_date=%s", context.report_date)
         progress(100, t("fbbatch.mail.opened"))
         return BatchResult(
             True,
@@ -747,12 +861,23 @@ class FBBatchSetupView(ctk.CTkFrame):
         to: str,
         cc: str,
         body_template: str,
+        use_classic_outlook: bool,
         credentials: dict,
         progress,
     ) -> BatchResult:
         report_day = datetime.strptime(report_date, "%d%m%Y").date()
         include_event = report_day.weekday() not in (5, 6)
         event_pdf: Path | None = None
+        log.info(
+            "night_shift: workflow started env=%s report_date=%s latest=%s has_issue=%s "
+            "weekday=%s include_event_initial=%s",
+            env,
+            report_date,
+            latest,
+            has_issue,
+            report_day.weekday(),
+            include_event,
+        )
 
         report_result = run_batch_report(
             env,
@@ -765,12 +890,21 @@ class FBBatchSetupView(ctk.CTkFrame):
             ),
             credentials=credentials,
         )
+        log.info(
+            "night_shift: report completed ok=%s message=%r html=%s images=%s output_dir=%s",
+            report_result.ok,
+            report_result.message,
+            report_result.html_path,
+            [str(path) for path in (report_result.image_paths or [])],
+            report_result.output_dir,
+        )
         if not report_result.ok:
             return report_result
         if not report_result.image_paths:
             return BatchResult(False, "Report images were not created.")
 
         chile_batch_skipped = report_indicates_chile_batch_skipped(report_result.html_path)
+        log.info("night_shift: Chile batch skipped=%s", chile_batch_skipped)
         if chile_batch_skipped:
             include_event = False
             progress(90, t("fbbatch.mail.event_skipped_chile"))
@@ -785,6 +919,13 @@ class FBBatchSetupView(ctk.CTkFrame):
                         _scale_phase_progress(percent, 50, 90), f"Event: {message}"
                     ),
                     credentials=credentials,
+                )
+                log.info(
+                    "night_shift: event completed ok=%s message=%r pdf=%s output_dir=%s",
+                    event_result.ok,
+                    event_result.message,
+                    event_result.pdf_path,
+                    event_result.output_dir,
                 )
                 if not event_result.ok:
                     return event_result
@@ -820,6 +961,14 @@ class FBBatchSetupView(ctk.CTkFrame):
             output_dir=report_result.output_dir,
         )
         self._draft_retry_context = retry_context
+        log.info(
+            "night_shift: creating draft include_event=%s attachments=%s inline_images=%s "
+            "from_configured=%s",
+            include_event,
+            [str(path) for path in attachments],
+            [str(path) for path in report_result.image_paths],
+            bool(from_account),
+        )
         progress(94, t("fbbatch.mail.creating"))
         try:
             create_outlook_draft(
@@ -830,8 +979,10 @@ class FBBatchSetupView(ctk.CTkFrame):
                 body_text=body,
                 attachments=attachments,
                 inline_images=report_result.image_paths,
+                use_classic_outlook=use_classic_outlook,
             )
         except Exception as exc:
+            log.exception("night_shift: draft creation failed report_date=%s", report_date)
             return BatchResult(
                 False,
                 str(exc),
@@ -842,6 +993,7 @@ class FBBatchSetupView(ctk.CTkFrame):
                 output_dir=retry_context.output_dir,
                 event_skipped=not retry_context.include_event,
             )
+        log.info("night_shift: workflow completed report_date=%s", report_date)
         progress(100, t("fbbatch.mail.opened"))
         return BatchResult(
             True,
@@ -932,6 +1084,7 @@ class FBBatchSetupView(ctk.CTkFrame):
         if self._running:
             return
         self._running = True
+        self.full_retry_draft_btn.configure(state="disabled")
         self._last_pdf = None
         self._last_html = None
         self._last_images_dir = None
@@ -1011,6 +1164,7 @@ class FBBatchSetupView(ctk.CTkFrame):
 
     def _finish(self, result: BatchResult) -> None:
         self._running = False
+        self.full_retry_draft_btn.configure(state="normal")
         self._last_html = result.html_path
         self._last_pdf = result.pdf_path
         self._last_images_dir = result.images_dir

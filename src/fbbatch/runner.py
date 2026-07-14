@@ -16,6 +16,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from fbbatch.outlook_diagnostics import (
+    describe_com_object,
+    describe_mapi_namespace,
+    log_outlook_environment,
+    log_outlook_processes,
+    log_outlook_uia_windows,
+)
 from paths import DATA_DIR, LOG_FILE, REPO_ROOT
 from settings.config import decrypt_password
 
@@ -24,11 +31,13 @@ log = logging.getLogger(__name__)
 DEFAULT_FBBATCH_ROOT = REPO_ROOT / "FBBatchSetup"
 SAVED_ISSUES_FILE = DATA_DIR / "fbbatch_saved_issues.json"
 FBBATCH_OUTPUT_DIR = REPO_ROOT / "outputs" / "fbbatch"
-OUTLOOK_START_TIMEOUT_SECONDS = 10.0
+OUTLOOK_START_TIMEOUT_SECONDS = 45.0
 OUTLOOK_DRAFT_SYNC_SECONDS = 15.0
 OUTLOOK_PROFILE_NAME = "Exchange"
+OUTLOOK_PROFILE_DIALOG_TIMEOUT_SECONDS = 45.0
 OUTLOOK_INLINE_IMAGE_MAX_WIDTH = 960
 OUTLOOK_INLINE_IMAGE_MAX_HEIGHT = 720
+_classic_outlook_started_by_app = False
 JAVA_DEFAULT_IDLE_TIMEOUT_SECONDS = 10 * 60.0
 JAVA_EVENT_IDLE_TIMEOUT_SECONDS = 40 * 60.0
 JAVA_MAX_RUNTIME_SECONDS = 90 * 60.0
@@ -77,6 +86,10 @@ class BatchResult:
 class OutlookDraftResult:
     entry_id: str
     folder_name: str
+
+
+class ClassicOutlookUnavailable(RuntimeError):
+    """Classic Outlook could not expose MAPI before a draft was created."""
 
 
 ISSUE_FIELDS = (
@@ -560,6 +573,7 @@ def create_outlook_draft(
     body_text: str,
     attachments: list[Path],
     inline_images: list[Path],
+    use_classic_outlook: bool = False,
 ) -> OutlookDraftResult:
     from fbbatch.new_outlook import (
         NewOutlookAutomationError,
@@ -567,23 +581,55 @@ def create_outlook_draft(
         create_new_outlook_draft,
     )
 
-    classic_executable = _find_outlook_executable()
-    if classic_executable is not None:
+    log.info(
+        "outlook_draft: ===== attempt started subject=%r from=%r to_count=%s cc_count=%s "
+        "attachments=%s inline_images=%s =====",
+        subject,
+        from_account,
+        len(_split_outlook_recipients(to)),
+        len(_split_outlook_recipients(cc)),
+        len([path for path in attachments if path]),
+        len([path for path in inline_images if path]),
+    )
+    log_outlook_environment(log, stage="draft-route-selection")
+
+    route = "classic" if use_classic_outlook else "new"
+    log.info("outlook_draft: selected exclusive route=%s", route)
+
+    if use_classic_outlook:
+        classic_executable = _find_outlook_executable()
+        if classic_executable is None:
+            raise RuntimeError(
+                f"Classic Outlook is not installed. Disable 'Use Classic Outlook' to use New Outlook.\n"
+                f"Log: {LOG_FILE}"
+            )
         log.info(
-            "outlook_draft: using Classic Outlook primary path executable=%s",
+            "outlook_draft: using selected Classic Outlook path executable=%s",
             classic_executable,
         )
-        return _create_classic_outlook_draft(
-            subject=subject,
-            from_account=from_account,
-            to=to,
-            cc=cc,
-            body_text=body_text,
-            attachments=attachments,
-            inline_images=inline_images,
-        )
+        try:
+            result = _create_classic_outlook_draft(
+                subject=subject,
+                from_account=from_account,
+                to=to,
+                cc=cc,
+                body_text=body_text,
+                attachments=attachments,
+                inline_images=inline_images,
+            )
+            log.info("outlook_draft: ===== attempt completed route=classic =====")
+            return result
+        except ClassicOutlookUnavailable as exc:
+            log.exception(
+                "outlook_draft: selected Classic Outlook route unavailable; "
+                "New Outlook will not be opened"
+            )
+            raise RuntimeError(
+                "Classic Outlook could not open a usable MAPI session. "
+                "New Outlook was not opened because the Classic Outlook option is selected.\n"
+                f"Log: {LOG_FILE}"
+            ) from exc
 
-    log.info("outlook_draft: Classic Outlook not installed; using New Outlook")
     try:
         create_new_outlook_draft(
             subject=subject,
@@ -595,16 +641,18 @@ def create_outlook_draft(
             inline_images=inline_images,
         )
         log.info("outlook_draft: completed with New Outlook")
+        log.info("outlook_draft: ===== attempt completed route=new =====")
         return OutlookDraftResult(entry_id="new-outlook", folder_name="Drafts")
     except NewOutlookUnavailable as exc:
         raise RuntimeError(
-            f"Neither Classic Outlook nor New Outlook could be opened.\nLog: {LOG_FILE}"
+            "New Outlook could not be opened. Classic Outlook was not opened because it is not selected.\n"
+            f"Log: {LOG_FILE}"
         ) from exc
     except NewOutlookAutomationError as exc:
         log.error("outlook_draft: New Outlook draft started but could not be completed: %s", exc)
         raise RuntimeError(
             "New Outlook opened the email but could not complete it safely. "
-            f"The Classic Outlook fallback was not opened to avoid creating a duplicate.\nLog: {LOG_FILE}"
+            f"Classic Outlook was not opened.\nLog: {LOG_FILE}"
         ) from exc
 
     raise AssertionError("New Outlook draft creation returned unexpectedly.")
@@ -620,6 +668,7 @@ def _create_classic_outlook_draft(
     attachments: list[Path],
     inline_images: list[Path],
 ) -> OutlookDraftResult:
+    global _classic_outlook_started_by_app
     import html
     try:
         import pythoncom
@@ -642,8 +691,13 @@ def _create_classic_outlook_draft(
     try:
         try:
             outlook, started_outlook = _start_outlook_application(win32com.client)
-            namespace = outlook.GetNamespace("MAPI")
-            log.info("outlook_draft: got MAPI namespace")
+            log.info(
+                "outlook_draft: Classic application ready started_here=%s %s",
+                started_outlook,
+                describe_com_object(outlook),
+            )
+            namespace = _get_outlook_mapi_namespace(outlook)
+            log.info("outlook_draft: got MAPI namespace %s", describe_mapi_namespace(namespace))
             try:
                 namespace.Logon("Exchange", "", False, False)
                 log.info("outlook_draft: namespace logon profile=Exchange ok")
@@ -651,9 +705,14 @@ def _create_classic_outlook_draft(
                 log.exception("outlook_draft: namespace logon profile=Exchange failed; trying default profile")
                 namespace.Logon("", "", False, False)
                 log.info("outlook_draft: namespace logon default profile ok")
-            _ensure_outlook_window(outlook, namespace)
+            log.info(
+                "outlook_draft: MAPI after logon %s",
+                describe_mapi_namespace(namespace, include_collections=True),
+            )
         except Exception as exc:
-            raise RuntimeError("Outlook is not installed or could not be opened.") from exc
+            raise ClassicOutlookUnavailable(
+                "Classic Outlook is installed but could not open a usable MAPI session."
+            ) from exc
 
         wanted_account = from_account.strip().lower()
         selected = None
@@ -750,73 +809,172 @@ def _create_classic_outlook_draft(
             entry_id=draft_state.entry_id,
             folder_name=draft_state.folder_name,
         )
+    except ClassicOutlookUnavailable:
+        log.exception("outlook_draft: Classic Outlook unavailable before draft creation")
+        log_outlook_environment(log, stage="classic-unavailable")
+        raise
     except Exception as exc:
         log.exception("outlook_draft: failed")
+        log_outlook_environment(log, stage="classic-draft-failed")
         raise RuntimeError(f"{exc}\nLog: {LOG_FILE}") from exc
     finally:
         if started_outlook and outlook is not None:
             try:
                 outlook.Quit()
+                _classic_outlook_started_by_app = False
                 log.info("outlook_draft: closed Classic Outlook started by Oracle Tasks")
             except Exception:
                 log.warning(
-                    "outlook_draft: draft is saved but Classic Outlook could not be closed automatically",
+                    "outlook_draft: Classic Outlook could not be closed automatically",
                     exc_info=True,
                 )
+        log_outlook_processes(log, stage="classic-finally")
         pythoncom.CoUninitialize()
 
 
+def _get_outlook_mapi_namespace(outlook):
+    log.info("outlook_draft: requesting MAPI from %s", describe_com_object(outlook))
+    try:
+        namespace = outlook.GetNamespace("MAPI")
+        log.info("outlook_draft: GetNamespace(MAPI) succeeded %s", describe_mapi_namespace(namespace))
+        return namespace
+    except Exception as get_namespace_exc:
+        log.warning(
+            "outlook_draft: Outlook.Application.GetNamespace failed type=%s detail=%r; trying Session",
+            type(get_namespace_exc).__name__,
+            str(get_namespace_exc),
+        )
+        try:
+            namespace = outlook.Session
+        except Exception as session_exc:
+            raise RuntimeError("Outlook.Application does not expose a MAPI namespace.") from session_exc
+        if namespace is None:
+            raise RuntimeError("Outlook.Application returned an empty MAPI session.") from get_namespace_exc
+        log.info("outlook_draft: Session property succeeded %s", describe_mapi_namespace(namespace))
+        return namespace
+
+
 def _start_outlook_application(client, timeout: float = OUTLOOK_START_TIMEOUT_SECONDS):
+    global _classic_outlook_started_by_app
+    started_at = time.monotonic()
+    log_outlook_processes(log, stage="classic-before-active-check")
     try:
         outlook = client.GetActiveObject("Outlook.Application")
-        log.info("outlook_draft: using active Outlook.Application")
-        return outlook, False
-    except Exception:
-        pass
+        log.info(
+            "outlook_draft: using active Outlook.Application elapsed=%.2fs %s",
+            time.monotonic() - started_at,
+            describe_com_object(outlook),
+        )
+        return outlook, _classic_outlook_started_by_app
+    except Exception as exc:
+        log.info(
+            "outlook_draft: no active Outlook.Application type=%s detail=%r",
+            type(exc).__name__,
+            str(exc),
+        )
+        _classic_outlook_started_by_app = False
 
     executable = _find_outlook_executable()
-    dispatched = None
-    if executable is not None:
-        log.info(
-            "outlook_draft: starting visible Outlook path=%s profile=%s",
-            executable,
-            OUTLOOK_PROFILE_NAME,
-        )
-        subprocess.Popen(
+    if executable is None:
+        raise ClassicOutlookUnavailable("Classic Outlook executable was not found.")
+
+    log.info(
+        "outlook_draft: starting minimized Classic Outlook path=%s profile=%s timeout=%.1fs",
+        executable,
+        OUTLOOK_PROFILE_NAME,
+        timeout,
+    )
+    profile_stop_event = threading.Event()
+    profile_timeout = max(timeout, OUTLOOK_PROFILE_DIALOG_TIMEOUT_SECONDS)
+    profile_helper = _start_outlook_profile_dialog_helper(
+        profile_name=OUTLOOK_PROFILE_NAME,
+        timeout=profile_timeout,
+        stop_event=profile_stop_event,
+    )
+    log.info(
+        "outlook_draft: profile dialog helper started before Classic launch thread=%r timeout=%.1fs",
+        profile_helper.name,
+        profile_timeout,
+    )
+
+    popen_kwargs: dict[str, object] = {"cwd": str(executable.parent)}
+    if os.name == "nt":
+        startup_info = subprocess.STARTUPINFO()
+        startup_info.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startup_info.wShowWindow = 2  # SW_SHOWMINIMIZED keeps Office dialogs automatable.
+        popen_kwargs["startupinfo"] = startup_info
+    try:
+        process = subprocess.Popen(
             [str(executable), "/profile", OUTLOOK_PROFILE_NAME],
-            cwd=str(executable.parent),
+            **popen_kwargs,
         )
-        _start_outlook_profile_dialog_helper(
-            profile_name=OUTLOOK_PROFILE_NAME,
-            timeout=timeout,
-        )
-    else:
-        log.info("outlook_draft: OUTLOOK.EXE not found; starting through COM")
-        dispatched = client.Dispatch("Outlook.Application")
+    except Exception as exc:
+        _classic_outlook_started_by_app = False
+        profile_stop_event.set()
+        profile_helper.join(timeout=1.0)
+        log.exception("outlook_draft: minimized Classic Outlook launch failed")
+        log_outlook_processes(log, stage="classic-minimized-launch-failed")
+        raise ClassicOutlookUnavailable(
+            "Classic Outlook could not be started with the Exchange profile."
+        ) from exc
+    _classic_outlook_started_by_app = True
+    log.info("outlook_draft: minimized Classic Outlook process launched pid=%s", process.pid)
 
     deadline = time.monotonic() + max(0.0, timeout)
     while time.monotonic() < deadline:
         try:
             outlook = client.GetActiveObject("Outlook.Application")
-            log.info("outlook_draft: Outlook.Application became active")
+            log.info(
+                "outlook_draft: minimized Classic Outlook COM ready elapsed=%.2fs %s",
+                time.monotonic() - started_at,
+                describe_com_object(outlook),
+            )
+            profile_stop_event.set()
+            profile_helper.join(timeout=1.0)
+            log_outlook_processes(log, stage="classic-minimized-com-ready")
             return outlook, True
         except Exception:
-            time.sleep(0.5)
+            time.sleep(0.25)
 
-    if dispatched is not None:
-        return dispatched, True
-    log.warning("outlook_draft: active Outlook wait timed out; falling back to COM Dispatch")
-    return client.Dispatch("Outlook.Application"), True
+    profile_stop_event.set()
+    profile_helper.join(timeout=1.0)
+    _terminate_started_outlook_process(process)
+    _classic_outlook_started_by_app = False
+    log_outlook_processes(log, stage="classic-minimized-com-timeout")
+    raise ClassicOutlookUnavailable(
+        f"Classic Outlook did not register its COM server within {timeout:.1f} seconds."
+    )
+
+
+def _terminate_started_outlook_process(process) -> None:
+    """Close only the Classic Outlook process launched by this attempt."""
+    try:
+        if process.poll() is not None:
+            return
+        process.terminate()
+        process.wait(timeout=5.0)
+        log.info("outlook_draft: terminated incomplete Classic Outlook startup pid=%s", process.pid)
+    except Exception:
+        log.warning(
+            "outlook_draft: incomplete Classic Outlook startup could not be terminated pid=%s",
+            getattr(process, "pid", "<unknown>"),
+            exc_info=True,
+        )
 
 
 def _start_outlook_profile_dialog_helper(
     *,
     profile_name: str,
     timeout: float,
+    stop_event: threading.Event | None = None,
 ) -> threading.Thread:
     helper = threading.Thread(
         target=_confirm_outlook_profile_dialog,
-        kwargs={"profile_name": profile_name, "timeout": timeout},
+        kwargs={
+            "profile_name": profile_name,
+            "timeout": timeout,
+            "stop_event": stop_event,
+        },
         name="outlook-profile-dialog",
         daemon=True,
     )
@@ -824,21 +982,54 @@ def _start_outlook_profile_dialog_helper(
     return helper
 
 
-def _confirm_outlook_profile_dialog(*, profile_name: str, timeout: float) -> bool:
+def _confirm_outlook_profile_dialog(
+    *,
+    profile_name: str,
+    timeout: float,
+    stop_event: threading.Event | None = None,
+) -> bool:
+    try:
+        import pythoncom
+    except ImportError:
+        log.warning("outlook_draft: pythoncom unavailable; cannot confirm Outlook profile dialog")
+        return False
+
+    pythoncom.CoInitialize()
+    try:
+        return _watch_outlook_profile_dialog(
+            profile_name=profile_name,
+            timeout=timeout,
+            stop_event=stop_event,
+        )
+    finally:
+        pythoncom.CoUninitialize()
+
+
+def _watch_outlook_profile_dialog(
+    *,
+    profile_name: str,
+    timeout: float,
+    stop_event: threading.Event | None = None,
+) -> bool:
     try:
         from pywinauto import Desktop
-    except ImportError:
-        log.warning("outlook_draft: pywinauto unavailable; cannot confirm Outlook profile dialog")
+    except Exception:
+        log.exception("outlook_draft: pywinauto unavailable; cannot confirm Outlook profile dialog")
         return False
 
     deadline = time.monotonic() + max(0.0, timeout)
     desktop = Desktop(backend="uia")
+    log.info(
+        "outlook_draft: profile dialog watcher started profile=%r timeout=%.1fs",
+        profile_name,
+        timeout,
+    )
     dialog_titles = {
         "choose profile",
         "elegir perfil",
         "seleccionar perfil",
     }
-    while time.monotonic() < deadline:
+    while time.monotonic() < deadline and not (stop_event and stop_event.is_set()):
         try:
             windows = desktop.windows()
         except Exception:
@@ -869,7 +1060,11 @@ def _confirm_outlook_profile_dialog(*, profile_name: str, timeout: float) -> boo
                 log.debug("outlook_draft: profile dialog changed while handling it", exc_info=True)
         time.sleep(0.25)
 
+    if stop_event and stop_event.is_set():
+        log.info("outlook_draft: profile dialog watcher stopped after COM dispatch completed")
+        return False
     log.info("outlook_draft: Outlook profile dialog was not shown before timeout")
+    log_outlook_uia_windows(log, desktop, stage="classic-profile-dialog-timeout")
     return False
 
 
@@ -903,14 +1098,81 @@ def _accept_outlook_profile_dialog(dialog, profile_name: str) -> bool:
         and control.window_text().strip().casefold() in accepted_labels
     ]
     if not buttons:
-        log.warning("outlook_draft: Outlook profile dialog has no OK/Accept button")
-        return False
+        log.info(
+            "outlook_draft: Outlook profile OK button is not exposed through UIA; "
+            "trying native Win32 controls"
+        )
+        if _click_outlook_profile_ok_native(dialog):
+            return True
+        try:
+            dialog.set_focus()
+            dialog.type_keys("{ENTER}", set_foreground=True)
+            log.info("outlook_draft: Outlook profile confirmed with Enter key fallback")
+            return True
+        except Exception:
+            log.exception("outlook_draft: Outlook profile Enter key fallback failed")
+            return False
 
     try:
         buttons[0].invoke()
     except Exception:
         buttons[0].click_input()
     return True
+
+
+def _click_outlook_profile_ok_native(dialog) -> bool:
+    """Accept the native profile dialog when UI Automation hides its buttons."""
+    try:
+        import win32con
+        import win32gui
+    except ImportError:
+        log.warning("outlook_draft: Win32 APIs unavailable for native profile confirmation")
+        return False
+
+    dialog_handle = int(getattr(dialog, "handle", 0) or 0)
+    if not dialog_handle:
+        log.warning("outlook_draft: profile dialog has no native window handle")
+        return False
+
+    try:
+        try:
+            ok_handle = int(win32gui.GetDlgItem(dialog_handle, 1) or 0)
+        except Exception:
+            # Newer Office builds wrap the native dialog, so IDOK may live on
+            # a descendant rather than the top-level UIA window.
+            ok_handle = 0
+        if ok_handle:
+            win32gui.SendMessage(ok_handle, win32con.BM_CLICK, 0, 0)
+            log.info(
+                "outlook_draft: Outlook profile confirmed through native IDOK handle=%s",
+                ok_handle,
+            )
+            return True
+
+        accepted_labels = {"ok", "aceptar"}
+        matching_buttons: list[int] = []
+
+        def _collect_button(handle, _context) -> bool:
+            class_name = win32gui.GetClassName(handle).strip().casefold()
+            label = win32gui.GetWindowText(handle).replace("&", "").strip().casefold()
+            if class_name == "button" and label in accepted_labels:
+                matching_buttons.append(int(handle))
+            return True
+
+        win32gui.EnumChildWindows(dialog_handle, _collect_button, None)
+        if matching_buttons:
+            win32gui.SendMessage(matching_buttons[0], win32con.BM_CLICK, 0, 0)
+            log.info(
+                "outlook_draft: Outlook profile confirmed through native button handle=%s",
+                matching_buttons[0],
+            )
+            return True
+    except Exception:
+        log.exception("outlook_draft: native Outlook profile confirmation failed")
+        return False
+
+    log.warning("outlook_draft: native Outlook profile dialog has no OK/Accept button")
+    return False
 
 
 def _find_outlook_executable() -> Path | None:
@@ -1084,7 +1346,6 @@ def _attach_inline_images(mail, images: list[Path]) -> str:
         optional_properties = (
             ("0x370E001F", "image/png"),
             ("0x7FFE000B", True),
-            ("0x37140003", 4),
         )
         for property_tag, value in optional_properties:
             try:
@@ -1179,6 +1440,13 @@ def _run_java(
             bufsize=1,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
+        log.info(
+            "fbbatch_java: started process=%s pid=%s stdin_chars=%s stdin_lines=%s",
+            process_label,
+            getattr(process, "pid", "<unknown>"),
+            len(stdin_text),
+            len(stdin_text.splitlines()),
+        )
         if process.stdin:
             process.stdin.write(stdin_text)
             process.stdin.close()
@@ -1250,6 +1518,14 @@ def _run_java(
             lines.append(line)
             last_output = time.monotonic()
             last_heartbeat_minute = 0
+            safe_line = _redact_process_output_for_log(line)
+            if safe_line:
+                log.info(
+                    "fbbatch_java_output: process=%s elapsed=%.1fs line=%s",
+                    process_label,
+                    last_output - started,
+                    safe_line,
+                )
             tracker.update(line)
 
         if timeout_message:
@@ -1265,7 +1541,7 @@ def _run_java(
                 time.monotonic() - started,
                 time.monotonic() - last_output,
                 timeout_message,
-                output_tail,
+                _redact_process_output_for_log(output_tail),
             )
             return BatchResult(False, timeout_message)
 
@@ -1298,7 +1574,7 @@ def _run_java(
             process_label,
             exit_code,
             elapsed,
-            _safe_tail(combined_output),
+            _redact_process_output_for_log(_safe_tail(combined_output)),
         )
     message = "Completed." if ok else _safe_tail(combined_output)
     return BatchResult(ok, message, exit_code=exit_code)
@@ -2076,3 +2352,21 @@ def _safe_tail(text: str) -> str:
     if not lines:
         return "Java process failed."
     return "\n".join(lines[-4:])[:800]
+
+
+_SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?i)\b(password|passwd|pwd|secret|token)\s*([=:])\s*(?:\"[^\"]*\"|'[^']*'|\S+)"
+)
+_ORACLE_CONNECT_RE = re.compile(
+    r"(?i)(?<![\w@])([a-z0-9_.-]+)/([^\s/@]+)@([a-z0-9_.:/-]+)"
+)
+
+
+def _redact_process_output_for_log(text: str, *, max_chars: int = 2_000) -> str:
+    """Keep diagnostic output useful without persisting obvious secrets."""
+    cleaned = str(text).strip("\r\n")
+    cleaned = _SECRET_ASSIGNMENT_RE.sub(lambda match: f"{match.group(1)}{match.group(2)}<redacted>", cleaned)
+    cleaned = _ORACLE_CONNECT_RE.sub(r"\1/<redacted>@\3", cleaned)
+    if len(cleaned) > max_chars:
+        cleaned = f"{cleaned[:max_chars]}...<truncated {len(cleaned) - max_chars} chars>"
+    return cleaned

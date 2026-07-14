@@ -23,6 +23,7 @@ from features.vpn.service import VPNService
 
 from .home_view import HomeView
 from .fbbatch_view import FBBatchSetupView
+from .logs_dialog import LogsDialog
 from features.vpn.view import VPNView
 from .settings_view import SettingsView
 from .spools_cl_view import SpoolsCLView
@@ -47,6 +48,8 @@ class OracleTasksApp:
         ctk.set_default_color_theme("blue")
 
         self.root = ctk.CTk()
+        self.root.report_callback_exception = self._report_callback_exception
+        self._logs_dialog = None
         if start_hidden:
             self.root.withdraw()
         self.root.title(t("app.title"))
@@ -115,6 +118,20 @@ class OracleTasksApp:
         )
         self.theme_btn.pack(fill="x", pady=(0, 10))
 
+        self.logs_btn = ctk.CTkButton(
+            self.sidebar_footer,
+            text="",
+            height=32,
+            corner_radius=6,
+            fg_color=("#ffffff", "#1e293b"),
+            text_color=("#334155", "#f8fafc"),
+            border_color=("#e2e8f0", "#334155"),
+            border_width=1,
+            font=ctk.CTkFont(size=12, weight="normal"),
+            command=self._open_logs_dialog,
+        )
+        self.logs_btn.pack(fill="x", pady=(0, 10))
+
         # Credits / version info
         self.credits_label = ctk.CTkLabel(
             self.sidebar_footer,
@@ -181,6 +198,7 @@ class OracleTasksApp:
         current_theme = self.config.get("theme", "light")
         theme_text = "☀️  " + t("settings.general.theme.light") if current_theme == "light" else "🌙  " + t("settings.general.theme.dark")
         self.theme_btn.configure(text=theme_text)
+        self.logs_btn.configure(text=t("logs.button"))
 
         credits_text = f"v{__version__}\nDiego Pavez Verdi"
         self.credits_label.configure(text=credits_text)
@@ -193,6 +211,14 @@ class OracleTasksApp:
         new_theme = "dark" if current == "light" else "light"
         self.apply_theme(new_theme)
         self.rebuild_views()
+
+    def _open_logs_dialog(self) -> None:
+        dialog = self._logs_dialog
+        if dialog is not None and dialog.winfo_exists():
+            dialog.lift()
+            dialog.focus_force()
+            return
+        self._logs_dialog = LogsDialog(self.root)
 
     def _has_running_work(self) -> bool:
         return any(bool(getattr(view, "_running", False)) for view in self._views.values())
@@ -626,6 +652,13 @@ class OracleTasksApp:
             pythonw = sys.executable
         script = REPO_ROOT / "src" / "main.py"
         return f'"{pythonw}" "{script}"'
+
+    def _report_callback_exception(self, exc_type, exc_value, traceback_obj) -> None:
+        log.critical(
+            "Unhandled Tk callback exception",
+            exc_info=(exc_type, exc_value, traceback_obj),
+        )
+        sys.__excepthook__(exc_type, exc_value, traceback_obj)
 
     def run(self) -> None:
         log.info("Oracle Tasks Chile v%s starting (lang=%s, theme=%s)",

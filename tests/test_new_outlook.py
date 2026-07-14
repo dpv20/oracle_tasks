@@ -14,6 +14,8 @@ sys.path.insert(0, str(SRC_DIR))
 from fbbatch.new_outlook import (  # noqa: E402
     NewOutlookAutomationError,
     NewOutlookUnavailable,
+    _close_popout_compose,
+    _close_started_main_window,
     _control_contains_text,
     _discard_failed_compose,
     _fill_recipient_fields,
@@ -21,14 +23,21 @@ from fbbatch.new_outlook import (  # noqa: E402
     _fit_image_size,
     _find_recipient_input,
     _launch_new_outlook,
+    _open_new_outlook_main_window,
     _open_new_mail,
     _recipient_chip_count,
     _recipient_is_visible,
     _split_recipients,
+    _wait_for_main_window,
+    _wait_for_saved_confirmation,
     find_new_outlook_executable,
     make_file_drop_payload,
 )
-from fbbatch.runner import OutlookDraftResult, create_outlook_draft  # noqa: E402
+from fbbatch.runner import (  # noqa: E402
+    ClassicOutlookUnavailable,
+    OutlookDraftResult,
+    create_outlook_draft,
+)
 
 
 class NewOutlookTests(unittest.TestCase):
@@ -63,6 +72,76 @@ class NewOutlookTests(unittest.TestCase):
             _launch_new_outlook(executable)
 
         popen.assert_called_once_with([str(executable)], cwd=str(executable.parent))
+
+    def test_main_window_detection_does_not_require_outlook_title_suffix(self) -> None:
+        rectangle = Mock()
+        rectangle.width.return_value = 1200
+        rectangle.height.return_value = 800
+        window = Mock()
+        window.handle = 321
+        window.element_info.class_name = "Outlook Host"
+        window.window_text.return_value = "Mail"
+        window.rectangle.return_value = rectangle
+        window.descendants.return_value = []
+        desktop = Mock()
+        desktop.windows.return_value = [window]
+
+        selected = _wait_for_main_window(desktop, timeout=0.1)
+
+        self.assertIs(selected, window)
+
+    def test_headless_new_outlook_is_restarted_before_launch(self) -> None:
+        main_window = Mock()
+        desktop = Mock()
+        with (
+            patch(
+                "fbbatch.new_outlook._new_outlook_process_ids",
+                side_effect=[{101}, {202}],
+            ),
+            patch("fbbatch.new_outlook._terminate_new_outlook_processes") as terminate,
+            patch("fbbatch.new_outlook._launch_new_outlook") as launch,
+            patch("fbbatch.new_outlook._wait_for_main_window", return_value=main_window),
+            patch("fbbatch.new_outlook.log_outlook_processes"),
+        ):
+            result = _open_new_outlook_main_window(
+                desktop,
+                Path("olk.exe"),
+                existing_outlook_handles=set(),
+            )
+
+        self.assertIs(result, main_window)
+        terminate.assert_called_once_with({101}, reason="prelaunch-headless")
+        launch.assert_called_once_with(Path("olk.exe"), activation="app-id")
+
+    def test_app_id_launch_without_window_retries_alias(self) -> None:
+        main_window = Mock()
+        desktop = Mock()
+        desktop.windows.return_value = []
+        with (
+            patch(
+                "fbbatch.new_outlook._new_outlook_process_ids",
+                side_effect=[set(), {202}],
+            ),
+            patch("fbbatch.new_outlook._terminate_new_outlook_processes") as terminate,
+            patch("fbbatch.new_outlook._launch_new_outlook") as launch,
+            patch(
+                "fbbatch.new_outlook._wait_for_main_window",
+                side_effect=[NewOutlookUnavailable("no window"), main_window],
+            ),
+            patch("fbbatch.new_outlook.log_outlook_processes"),
+        ):
+            result = _open_new_outlook_main_window(
+                desktop,
+                Path("olk.exe"),
+                existing_outlook_handles=set(),
+            )
+
+        self.assertIs(result, main_window)
+        terminate.assert_called_once_with({202}, reason="app-id-no-window")
+        self.assertEqual(
+            [call.kwargs["activation"] for call in launch.call_args_list],
+            ["app-id", "alias"],
+        )
 
     def test_new_mail_waits_until_outlook_finishes_loading(self) -> None:
         button = Mock()
@@ -211,6 +290,85 @@ class NewOutlookTests(unittest.TestCase):
         window.close.assert_called_once_with()
         button.invoke.assert_called_once_with()
 
+    def test_saved_compose_confirms_close_draft_dialog(self) -> None:
+        close_button = Mock()
+        close_button.element_info.control_type = "Button"
+        close_button.element_info.automation_id = "windowIconClose"
+        prompt = Mock()
+        prompt.element_info.control_type = "Text"
+        prompt.window_text.return_value = "Close draft"
+        yes_button = Mock()
+        yes_button.element_info.control_type = "Button"
+        yes_button.window_text.return_value = "Yes"
+        window = Mock()
+        window.handle = 123
+        window.descendants.side_effect = [[close_button], [prompt, yes_button]]
+
+        with (
+            patch("fbbatch.new_outlook._native_window_exists", side_effect=[True, False]),
+            patch("fbbatch.new_outlook.time.sleep"),
+        ):
+            _close_popout_compose(window, timeout=1.0)
+
+        close_button.invoke.assert_called_once_with()
+        yes_button.invoke.assert_called_once_with()
+
+    def test_saved_compose_finds_close_dialog_exposed_as_separate_window(self) -> None:
+        close_button = Mock()
+        close_button.element_info.control_type = "Button"
+        close_button.element_info.automation_id = "windowIconClose"
+        prompt = Mock()
+        prompt.window_text.return_value = "Close draft"
+        yes_button = Mock()
+        yes_button.element_info.control_type = "Button"
+        yes_button.window_text.return_value = "Yes"
+        dialog = Mock(handle=456)
+        dialog.window_text.return_value = "Close draft"
+        dialog.descendants.return_value = [prompt, yes_button]
+        desktop = Mock()
+        desktop.windows.return_value = [dialog]
+        window = Mock(handle=123)
+        window.window_text.return_value = "NSSR test"
+        window.descendants.side_effect = [[close_button], []]
+
+        with (
+            patch("fbbatch.new_outlook._native_window_exists", side_effect=[True, False]),
+            patch("fbbatch.new_outlook.time.sleep"),
+        ):
+            _close_popout_compose(window, desktop=desktop, timeout=1.0)
+
+        yes_button.invoke.assert_called_once_with()
+
+    def test_saved_confirmation_ignores_status_until_settle_period(self) -> None:
+        status = Mock()
+        status.window_text.return_value = "Draft saved at 8:05 PM"
+        window = Mock()
+        window.descendants.return_value = [status]
+
+        with (
+            patch(
+                "fbbatch.new_outlook.time.monotonic",
+                side_effect=[0.0, 1.0, 2.0, 3.0, 6.0, 7.0],
+            ),
+            patch("fbbatch.new_outlook.time.sleep") as sleep,
+        ):
+            result = _wait_for_saved_confirmation(
+                window,
+                timeout=10.0,
+                minimum_wait=5.0,
+            )
+
+        self.assertEqual(result, "Draft saved at 8:05 PM")
+        sleep.assert_called_once_with(0.25)
+
+    def test_new_outlook_main_window_started_by_automation_can_be_closed(self) -> None:
+        window = Mock()
+        window.handle = 321
+
+        _close_started_main_window(window)
+
+        window.close.assert_called_once_with()
+
     def test_inline_image_is_scaled_to_email_width(self) -> None:
         self.assertEqual(
             _fit_image_size(1346, 1025, max_width=960, max_height=720),
@@ -223,7 +381,20 @@ class NewOutlookTests(unittest.TestCase):
             (640, 480),
         )
 
-    def test_outlook_draft_prefers_classic_outlook_when_installed(self) -> None:
+    def test_outlook_draft_uses_new_outlook_by_default_even_when_classic_is_installed(self) -> None:
+        with (
+            patch("fbbatch.runner._find_outlook_executable") as find_classic,
+            patch("fbbatch.new_outlook.create_new_outlook_draft") as new_outlook,
+            patch("fbbatch.runner._create_classic_outlook_draft") as classic_outlook,
+        ):
+            result = create_outlook_draft(**self._draft_arguments())
+
+        new_outlook.assert_called_once()
+        classic_outlook.assert_not_called()
+        find_classic.assert_not_called()
+        self.assertEqual(result, OutlookDraftResult(entry_id="new-outlook", folder_name="Drafts"))
+
+    def test_outlook_draft_uses_classic_only_when_selected(self) -> None:
         expected = OutlookDraftResult(entry_id="classic-id", folder_name="Drafts")
         with (
             patch("fbbatch.new_outlook.create_new_outlook_draft") as new_outlook,
@@ -233,37 +404,79 @@ class NewOutlookTests(unittest.TestCase):
                 return_value=expected,
             ) as classic_outlook,
         ):
-            result = create_outlook_draft(**self._draft_arguments())
+            result = create_outlook_draft(
+                **self._draft_arguments(),
+                use_classic_outlook=True,
+            )
 
         classic_outlook.assert_called_once()
         new_outlook.assert_not_called()
         self.assertEqual(result, expected)
 
-    def test_new_outlook_is_used_when_classic_outlook_is_not_installed(self) -> None:
+    def test_selected_classic_route_does_not_fallback_when_classic_is_not_installed(self) -> None:
         with (
             patch("fbbatch.runner._find_outlook_executable", return_value=None),
             patch("fbbatch.new_outlook.create_new_outlook_draft") as new_outlook,
             patch("fbbatch.runner._create_classic_outlook_draft") as classic_outlook,
         ):
-            result = create_outlook_draft(**self._draft_arguments())
+            with self.assertRaisesRegex(RuntimeError, "Classic Outlook is not installed"):
+                create_outlook_draft(
+                    **self._draft_arguments(),
+                    use_classic_outlook=True,
+                )
 
-        new_outlook.assert_called_once()
+        new_outlook.assert_not_called()
         classic_outlook.assert_not_called()
-        self.assertEqual(result, OutlookDraftResult(entry_id="new-outlook", folder_name="Drafts"))
 
-    def test_classic_outlook_is_not_opened_after_new_outlook_started_a_draft(self) -> None:
+    def test_selected_classic_route_does_not_fallback_when_mapi_is_unavailable(self) -> None:
         with (
-            patch("fbbatch.runner._find_outlook_executable", return_value=None),
+            patch("fbbatch.runner._find_outlook_executable", return_value=Path("OUTLOOK.EXE")),
+            patch(
+                "fbbatch.runner._create_classic_outlook_draft",
+                side_effect=ClassicOutlookUnavailable("MAPI unavailable"),
+            ) as classic_outlook,
+            patch("fbbatch.new_outlook.create_new_outlook_draft") as new_outlook,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "New Outlook was not opened"):
+                create_outlook_draft(
+                    **self._draft_arguments(),
+                    use_classic_outlook=True,
+                )
+
+        classic_outlook.assert_called_once()
+        new_outlook.assert_not_called()
+
+    def test_selected_classic_route_does_not_fallback_after_draft_failure(self) -> None:
+        with (
+            patch("fbbatch.runner._find_outlook_executable", return_value=Path("OUTLOOK.EXE")),
+            patch(
+                "fbbatch.runner._create_classic_outlook_draft",
+                side_effect=RuntimeError("draft save failed"),
+            ),
+            patch("fbbatch.new_outlook.create_new_outlook_draft") as new_outlook,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "draft save failed"):
+                create_outlook_draft(
+                    **self._draft_arguments(),
+                    use_classic_outlook=True,
+                )
+
+        new_outlook.assert_not_called()
+
+    def test_classic_outlook_is_not_opened_after_selected_new_route_fails(self) -> None:
+        with (
+            patch("fbbatch.runner._find_outlook_executable") as find_classic,
             patch(
                 "fbbatch.new_outlook.create_new_outlook_draft",
                 side_effect=NewOutlookAutomationError("controls changed"),
             ),
             patch("fbbatch.runner._create_classic_outlook_draft") as classic_outlook,
         ):
-            with self.assertRaisesRegex(RuntimeError, "avoid creating a duplicate"):
+            with self.assertRaisesRegex(RuntimeError, "Classic Outlook was not opened"):
                 create_outlook_draft(**self._draft_arguments())
 
         classic_outlook.assert_not_called()
+        find_classic.assert_not_called()
 
 
 if __name__ == "__main__":

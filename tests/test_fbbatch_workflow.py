@@ -18,14 +18,19 @@ from fbbatch.runner import (  # noqa: E402
     JAVA_MAX_RUNTIME_SECONDS,
     _JavaProgress,
     _accept_outlook_profile_dialog,
+    _click_outlook_profile_ok_native,
+    _confirm_outlook_profile_dialog,
     _ensure_outlook_window,
+    _get_outlook_mapi_namespace,
     _java_idle_timeout_seconds,
     _java_process_label,
+    _redact_process_output_for_log,
     _run_java,
     _start_outlook_application,
 )
 from ui.fbbatch_view import (  # noqa: E402
     _DraftRetryContext,
+    _classic_outlook_install_url,
     _discover_draft_retry_context,
     _retry_context_is_valid,
     _scale_phase_progress,
@@ -33,6 +38,22 @@ from ui.fbbatch_view import (  # noqa: E402
 
 
 class EventProgressTests(unittest.TestCase):
+    def test_classic_outlook_install_page_matches_app_language(self) -> None:
+        self.assertIn("/es-es/", _classic_outlook_install_url("es"))
+        self.assertIn("/en-us/", _classic_outlook_install_url("en"))
+        self.assertIn("/en-us/", _classic_outlook_install_url("unknown"))
+
+    def test_java_output_logging_redacts_common_secret_formats(self) -> None:
+        line = "password=Secret123 user=scott connect=scott/tiger@CHILE_QA_19C Event=DEVENGO"
+
+        cleaned = _redact_process_output_for_log(line)
+
+        self.assertNotIn("Secret123", cleaned)
+        self.assertNotIn("tiger", cleaned)
+        self.assertIn("password=<redacted>", cleaned)
+        self.assertIn("scott/<redacted>@CHILE_QA_19C", cleaned)
+        self.assertIn("Event=DEVENGO", cleaned)
+
     def test_java_watchdog_allows_long_running_event(self) -> None:
         self.assertEqual(JAVA_DEFAULT_IDLE_TIMEOUT_SECONDS, 10 * 60)
         self.assertEqual(JAVA_EVENT_IDLE_TIMEOUT_SECONDS, 40 * 60)
@@ -194,7 +215,36 @@ class EventProgressTests(unittest.TestCase):
 
 
 class OutlookStartupTests(unittest.TestCase):
-    def test_outlook_executable_is_started_before_active_object_is_returned(self) -> None:
+    def test_profile_dialog_watcher_initializes_com_on_its_thread(self) -> None:
+        with (
+            patch("pythoncom.CoInitialize") as co_initialize,
+            patch("pythoncom.CoUninitialize") as co_uninitialize,
+            patch("fbbatch.runner._watch_outlook_profile_dialog", return_value=True) as watcher,
+        ):
+            result = _confirm_outlook_profile_dialog(
+                profile_name="Exchange",
+                timeout=5,
+            )
+
+        self.assertTrue(result)
+        co_initialize.assert_called_once_with()
+        watcher.assert_called_once_with(
+            profile_name="Exchange",
+            timeout=5,
+            stop_event=None,
+        )
+        co_uninitialize.assert_called_once_with()
+
+    def test_mapi_namespace_falls_back_to_session_property(self) -> None:
+        namespace = object()
+        outlook = SimpleNamespace(
+            GetNamespace=Mock(side_effect=AttributeError("GetNamespace")),
+            Session=namespace,
+        )
+
+        self.assertIs(_get_outlook_mapi_namespace(outlook), namespace)
+
+    def test_outlook_is_started_minimized_with_exchange_profile(self) -> None:
         outlook = object()
         client = Mock()
         client.GetActiveObject.side_effect = [RuntimeError("not running"), outlook]
@@ -204,17 +254,62 @@ class OutlookStartupTests(unittest.TestCase):
             patch("fbbatch.runner._find_outlook_executable", return_value=executable),
             patch("fbbatch.runner.subprocess.Popen") as popen,
             patch("fbbatch.runner._start_outlook_profile_dialog_helper") as profile_helper,
+            patch("fbbatch.runner._classic_outlook_started_by_app", False),
         ):
             result, started_here = _start_outlook_application(client, timeout=1)
 
         self.assertIs(result, outlook)
         self.assertTrue(started_here)
-        popen.assert_called_once_with(
-            [str(executable), "/profile", "Exchange"],
-            cwd=str(executable.parent),
-        )
-        profile_helper.assert_called_once_with(profile_name="Exchange", timeout=1)
         client.Dispatch.assert_not_called()
+        self.assertEqual(
+            popen.call_args.args[0],
+            [str(executable), "/profile", "Exchange"],
+        )
+        self.assertEqual(popen.call_args.kwargs["cwd"], str(executable.parent))
+        self.assertIn("startupinfo", popen.call_args.kwargs)
+        self.assertEqual(popen.call_args.kwargs["startupinfo"].wShowWindow, 2)
+        self.assertNotIn("creationflags", popen.call_args.kwargs)
+        profile_helper.assert_called_once()
+        self.assertEqual(profile_helper.call_args.kwargs["profile_name"], "Exchange")
+        self.assertEqual(profile_helper.call_args.kwargs["timeout"], 45.0)
+        profile_helper.return_value.join.assert_called_once_with(timeout=1.0)
+
+    def test_hidden_outlook_launch_failure_is_reported(self) -> None:
+        client = Mock()
+        client.GetActiveObject.side_effect = RuntimeError("not running")
+        executable = Path(r"C:\Program Files\Microsoft Office\root\Office16\OUTLOOK.EXE")
+
+        with (
+            patch("fbbatch.runner._find_outlook_executable", return_value=executable),
+            patch("fbbatch.runner.subprocess.Popen", side_effect=OSError("launch failed")),
+            patch("fbbatch.runner._start_outlook_profile_dialog_helper") as profile_helper,
+            patch("fbbatch.runner._classic_outlook_started_by_app", False),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Exchange profile"):
+                _start_outlook_application(client, timeout=0)
+
+        client.Dispatch.assert_not_called()
+        profile_helper.return_value.join.assert_called_once_with(timeout=1.0)
+
+    def test_classic_startup_timeout_terminates_launched_process(self) -> None:
+        client = Mock()
+        client.GetActiveObject.side_effect = RuntimeError("not running")
+        executable = Path(r"C:\Program Files\Microsoft Office\root\Office16\OUTLOOK.EXE")
+        process = Mock(pid=456)
+        process.poll.return_value = None
+
+        with (
+            patch("fbbatch.runner._find_outlook_executable", return_value=executable),
+            patch("fbbatch.runner.subprocess.Popen", return_value=process),
+            patch("fbbatch.runner._start_outlook_profile_dialog_helper") as profile_helper,
+            patch("fbbatch.runner._classic_outlook_started_by_app", False),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "did not register"):
+                _start_outlook_application(client, timeout=0)
+
+        profile_helper.return_value.join.assert_called_once_with(timeout=1.0)
+        process.terminate.assert_called_once_with()
+        process.wait.assert_called_once_with(timeout=5.0)
 
     def test_profile_dialog_selects_exchange_and_accepts(self) -> None:
         combo = Mock()
@@ -264,6 +359,31 @@ class OutlookStartupTests(unittest.TestCase):
 
         self.assertTrue(_accept_outlook_profile_dialog(parent, "Exchange"))
         button.invoke.assert_called_once_with()
+
+    def test_profile_dialog_uses_native_ok_when_uia_hides_the_button(self) -> None:
+        dialog = Mock()
+        dialog.handle = 100
+        dialog.descendants.return_value = []
+
+        with patch(
+            "fbbatch.runner._click_outlook_profile_ok_native",
+            return_value=True,
+        ) as native_ok:
+            accepted = _accept_outlook_profile_dialog(dialog, "Exchange")
+
+        self.assertTrue(accepted)
+        native_ok.assert_called_once_with(dialog)
+
+    def test_native_profile_confirmation_clicks_standard_idok(self) -> None:
+        dialog = SimpleNamespace(handle=100)
+        with (
+            patch("win32gui.GetDlgItem", return_value=200),
+            patch("win32gui.SendMessage") as send_message,
+        ):
+            accepted = _click_outlook_profile_ok_native(dialog)
+
+        self.assertTrue(accepted)
+        self.assertEqual(send_message.call_args.args[0], 200)
 
     def test_missing_explorer_opens_visible_outlook_window(self) -> None:
         folder = SimpleNamespace(Display=Mock())
