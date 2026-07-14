@@ -31,6 +31,14 @@ OUTLOOK_INLINE_IMAGE_MAX_HEIGHT = 720
 NEW_OUTLOOK_APP_USER_MODEL_ID = (
     "Microsoft.OutlookForWindows_8wekyb3d8bbwe!Microsoft.OutlookforWindows"
 )
+NEW_MAIL_CONTROL_TYPES = {"Button", "SplitButton", "MenuItem"}
+NEW_MAIL_DIRECT_LABELS = {
+    "new mail",
+    "new message",
+    "nuevo correo",
+    "nuevo mensaje",
+}
+NEW_MAIL_COMPACT_LABELS = {"new", "nuevo"}
 
 
 class NewOutlookUnavailable(RuntimeError):
@@ -507,8 +515,7 @@ def _main_window_score(window, *, from_account: str = "") -> tuple[int, int, int
     try:
         has_new_mail = int(
             any(
-                control.element_info.control_type == "Button"
-                and control.window_text().strip().casefold() in ("new mail", "nuevo correo")
+                _new_mail_control_kind(control) is not None
                 for control in window.descendants()
             )
         )
@@ -556,19 +563,17 @@ def _open_new_mail(
     timeout: float,
     poll_interval: float = 0.4,
 ) -> None:
-    log.info("new_outlook_draft: waiting for New mail button timeout=%.1fs", timeout)
+    log.info("new_outlook_draft: waiting for New mail/New control timeout=%.1fs", timeout)
     deadline = time.monotonic() + max(0.0, timeout)
     scans = 0
     last_button_count = 0
+    last_control_labels: list[str] = []
     while time.monotonic() < deadline:
         scans += 1
         try:
-            buttons = [
-                control
-                for control in main_window.descendants()
-                if control.element_info.control_type == "Button"
-                and control.window_text().strip().lower() in ("new mail", "nuevo correo")
-            ]
+            controls = main_window.descendants()
+            buttons = [control for control in controls if _new_mail_control_kind(control)]
+            last_control_labels = _button_like_control_labels(controls)
         except Exception:
             buttons = []
             log.debug("new_outlook_draft: New mail control scan failed while Outlook loads", exc_info=True)
@@ -580,12 +585,38 @@ def _open_new_mail(
                     continue
             except Exception:
                 pass
+            kind = _new_mail_control_kind(button)
+            label = _preferred_control_label(button)
+            control_type = str(getattr(button.element_info, "control_type", ""))
+
+            # Some New Outlook builds collapse the compose split button to
+            # just "New". Invoking it may open the type menu instead of Mail,
+            # so use Outlook's native compose shortcut on the validated window.
+            if kind == "compact":
+                try:
+                    main_window.set_focus()
+                    keyboard.send_keys("^n")
+                    log.info(
+                        "new_outlook_draft: compact compose control found; sent Ctrl+N "
+                        "label=%r type=%s scans=%s",
+                        label,
+                        control_type,
+                        scans,
+                    )
+                    return
+                except Exception:
+                    log.debug(
+                        "new_outlook_draft: Ctrl+N failed for compact compose control",
+                        exc_info=True,
+                    )
             try:
                 button.invoke()
             except Exception:
                 button.click_input()
             log.info(
-                "new_outlook_draft: New mail invoked after Outlook finished loading scans=%s",
+                "new_outlook_draft: compose control invoked label=%r type=%s scans=%s",
+                label,
+                control_type,
                 scans,
             )
             return
@@ -593,15 +624,77 @@ def _open_new_mail(
 
     log.warning(
         "new_outlook_draft: New mail button timeout scans=%s last_button_count=%s "
-        "main_handle=%s title=%r",
+        "main_handle=%s title=%r button_like_controls=%s",
         scans,
         last_button_count,
         getattr(main_window, "handle", "<unknown>"),
         main_window.window_text(),
+        last_control_labels,
     )
-    raise NewOutlookUnavailable(
-        "New Outlook opened, but its New mail button did not finish loading."
+    try:
+        main_window.set_focus()
+        keyboard.send_keys("^n")
+        log.info("new_outlook_draft: compose control not identified; sent Ctrl+N fallback")
+    except Exception as exc:
+        raise NewOutlookUnavailable(
+            "New Outlook opened, but its New mail control could not be activated."
+        ) from exc
+
+
+def _new_mail_control_kind(control) -> str | None:
+    control_type = str(getattr(control.element_info, "control_type", ""))
+    if control_type not in NEW_MAIL_CONTROL_TYPES:
+        return None
+    labels = _control_labels(control)
+    if any(_label_matches_prefix(label, NEW_MAIL_DIRECT_LABELS) for label in labels):
+        return "direct"
+    if any(label in NEW_MAIL_COMPACT_LABELS for label in labels):
+        return "compact"
+    return None
+
+
+def _control_labels(control) -> set[str]:
+    values: list[object] = []
+    try:
+        values.append(control.window_text())
+    except Exception:
+        pass
+    try:
+        values.append(control.element_info.name)
+    except Exception:
+        pass
+    labels = set()
+    for value in values:
+        if not isinstance(value, str):
+            continue
+        normalized = re.sub(r"\s+", " ", value.replace("&", " ")).strip().casefold()
+        if normalized:
+            labels.add(normalized)
+    return labels
+
+
+def _preferred_control_label(control) -> str:
+    labels = sorted(_control_labels(control), key=lambda value: (len(value), value))
+    return labels[0] if labels else ""
+
+
+def _label_matches_prefix(label: str, expected: set[str]) -> bool:
+    return any(
+        label == candidate
+        or label.startswith(f"{candidate} ")
+        or label.startswith(f"{candidate},")
+        for candidate in expected
     )
+
+
+def _button_like_control_labels(controls) -> list[str]:
+    labels = {
+        f"{control.element_info.control_type}:{label}"
+        for control in controls
+        if str(getattr(control.element_info, "control_type", "")) in NEW_MAIL_CONTROL_TYPES
+        for label in _control_labels(control)
+    }
+    return sorted(labels)[:40]
 
 
 def _wait_for_compose_window(desktop, existing_handles: set[int], *, timeout: float):

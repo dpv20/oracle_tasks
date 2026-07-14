@@ -188,6 +188,35 @@ class NewOutlookTests(unittest.TestCase):
         self.assertEqual(main_window.descendants.call_count, 3)
         button.invoke.assert_called_once_with()
 
+    def test_compact_new_split_button_uses_compose_shortcut(self) -> None:
+        button = Mock()
+        button.element_info.control_type = "SplitButton"
+        button.element_info.name = "New"
+        button.window_text.return_value = "New"
+        button.is_enabled.return_value = True
+        main_window = Mock()
+        main_window.descendants.return_value = [button]
+        keyboard = Mock()
+
+        _open_new_mail(main_window, keyboard, timeout=1.0, poll_interval=0.0)
+
+        main_window.set_focus.assert_called_once_with()
+        keyboard.send_keys.assert_called_once_with("^n")
+        button.invoke.assert_not_called()
+
+    def test_new_message_button_is_treated_as_direct_compose(self) -> None:
+        button = Mock()
+        button.element_info.control_type = "Button"
+        button.element_info.name = "New message, Ctrl+N"
+        button.window_text.return_value = "New message, Ctrl+N"
+        button.is_enabled.return_value = True
+        main_window = Mock()
+        main_window.descendants.return_value = [button]
+
+        _open_new_mail(main_window, Mock(), timeout=1.0, poll_interval=0.0)
+
+        button.invoke.assert_called_once_with()
+
     def test_from_account_menu_item_can_contain_email_in_child_text(self) -> None:
         from_button = Mock()
         from_button.element_info.control_type = "Button"
