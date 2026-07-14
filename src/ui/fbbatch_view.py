@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import logging
+import queue
 import threading
 import calendar
 import webbrowser
@@ -13,6 +14,7 @@ from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
 
+from fbbatch.graph_mail import GraphDeviceCode, GraphMailClient
 from fbbatch.runner import (
     BatchResult,
     FBBATCH_OUTPUT_DIR,
@@ -281,9 +283,9 @@ class FBBatchSetupView(ctk.CTkFrame):
         self.mail_summary.grid(row=0, column=0, sticky="ew")
         ctk.CTkButton(
             mail_row,
-            text=t("fbbatch.mail.install_classic"),
+            text=t("fbbatch.graph.settings"),
             width=175,
-            command=self._open_classic_outlook_install_page,
+            command=self._open_graph_settings,
         ).grid(row=0, column=1, padx=(12, 0))
         IconButton(
             mail_row,
@@ -291,15 +293,32 @@ class FBBatchSetupView(ctk.CTkFrame):
             width=150,
             command=self._open_mail_settings,
         ).grid(row=0, column=2, padx=(12, 0))
-        self.use_classic_outlook_var = ctk.BooleanVar(
-            value=bool(self.app.config.get("fbbatch_use_classic_outlook", False))
+        method_row = ctk.CTkFrame(mail_row, fg_color="transparent")
+        method_row.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+        ctk.CTkLabel(method_row, text=t("fbbatch.mail.method"), anchor="w").pack(side="left")
+        self._mail_method_labels = {
+            t("fbbatch.mail.method_classic"): "classic",
+            t("fbbatch.mail.method_new"): "new",
+            t("fbbatch.mail.method_graph"): "graph",
+        }
+        configured_method = str(self.app.config.get("fbbatch_mail_method", "new") or "new")
+        selected_label = next(
+            (label for label, method in self._mail_method_labels.items() if method == configured_method),
+            t("fbbatch.mail.method_new"),
         )
-        ctk.CTkCheckBox(
-            mail_row,
-            text=t("fbbatch.mail.use_classic"),
-            variable=self.use_classic_outlook_var,
-            command=self._save_outlook_route,
-        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        self.mail_method_control = ctk.CTkSegmentedButton(
+            method_row,
+            values=list(self._mail_method_labels),
+            command=self._save_mail_method,
+        )
+        self.mail_method_control.set(selected_label)
+        self.mail_method_control.pack(side="left", padx=(10, 0))
+        ctk.CTkButton(
+            method_row,
+            text=t("fbbatch.mail.install_classic"),
+            width=175,
+            command=self._open_classic_outlook_install_page,
+        ).pack(side="right")
         self.full_output_row = ctk.CTkFrame(inner, fg_color="transparent")
         self.full_output_row.grid(row=7, column=0, columnspan=5, sticky="e", pady=(10, 0))
         self.full_open_location_btn = ctk.CTkButton(
@@ -523,14 +542,24 @@ class FBBatchSetupView(ctk.CTkFrame):
 
     def _refresh_mail_summary(self) -> None:
         values = self._mail_values_for_current_date()
-        from_account = values["from_account"]
+        method = self._current_mail_method()
+        from_account = (
+            str(self.app.config.get("falabella_email", "") or "").strip()
+            if method == "graph"
+            else values["from_account"]
+        )
         summary = t(
             "fbbatch.mail.summary",
             subject=values["subject"],
             sender=from_account or t("fbbatch.mail.not_configured"),
         )
         if not from_account:
-            summary += "\n⚠ " + t("fbbatch.mail.from_missing")
+            missing_key = (
+                "fbbatch.graph.falabella_missing"
+                if method == "graph"
+                else "fbbatch.mail.from_missing"
+            )
+            summary += "\n⚠ " + t(missing_key)
         self.mail_summary.configure(
             text=summary,
             text_color=("#a16207", "#fbbf24") if not from_account else ("gray40", "gray65"),
@@ -538,6 +567,20 @@ class FBBatchSetupView(ctk.CTkFrame):
 
     def _open_mail_settings(self) -> None:
         MailSettingsDialog(self, values=self._mail_values_for_current_date(), on_saved=self._save_mail_settings)
+
+    def _open_graph_settings(self) -> None:
+        falabella_account = str(self.app.config.get("falabella_email", "") or "").strip()
+        if not falabella_account:
+            messagebox.showwarning(
+                t("fbbatch.graph.falabella_missing_title"),
+                t("fbbatch.graph.falabella_missing"),
+                parent=self,
+            )
+            return
+        GraphSettingsDialog(
+            self,
+            preferred_username=falabella_account,
+        )
 
     def _open_classic_outlook_install_page(self) -> None:
         language = str(self.app.config.get("language", "en"))
@@ -555,13 +598,45 @@ class FBBatchSetupView(ctk.CTkFrame):
                 parent=self,
             )
 
-    def _save_outlook_route(self) -> None:
-        use_classic = bool(self.use_classic_outlook_var.get())
-        self.app.config.set("fbbatch_use_classic_outlook", use_classic)
-        log.info(
-            "night_shift: Outlook route preference changed route=%s",
-            "classic" if use_classic else "new",
+    def _current_mail_method(self) -> str:
+        label = self.mail_method_control.get()
+        return self._mail_method_labels.get(label, "new")
+
+    def _save_mail_method(self, selected_label: str) -> None:
+        method = self._mail_method_labels.get(selected_label, "new")
+        self.app.config.update(
+            {
+                "fbbatch_mail_method": method,
+                "fbbatch_use_classic_outlook": method == "classic",
+            }
         )
+        log.info(
+            "night_shift: mail draft method changed method=%s",
+            method,
+        )
+        self._refresh_mail_summary()
+
+    def _selected_mail_settings(self, outlook_sender: str) -> tuple[str, str] | None:
+        method = self._current_mail_method()
+        if method == "graph":
+            falabella_account = str(self.app.config.get("falabella_email", "") or "").strip()
+            if not falabella_account:
+                messagebox.showwarning(
+                    t("fbbatch.graph.falabella_missing_title"),
+                    t("fbbatch.graph.falabella_missing"),
+                    parent=self,
+                )
+                return None
+            return method, falabella_account
+        if not outlook_sender:
+            messagebox.showwarning(
+                t("fbbatch.mail.from_missing_title"),
+                t("fbbatch.mail.from_missing"),
+                parent=self,
+            )
+            self._open_mail_settings()
+            return None
+        return method, outlook_sender
 
     def _save_mail_settings(self, values: dict[str, str]) -> None:
         self.app.config.set("fbbatch_mail_subject", values["subject_template"].strip() or "NSSR : {MONTH_UPPER} {DAY} {YEAR}")
@@ -659,14 +734,6 @@ class FBBatchSetupView(ctk.CTkFrame):
 
     def _on_generate_full_report(self) -> None:
         mail_values = self._mail_values_for_current_date()
-        if not mail_values["from_account"]:
-            messagebox.showwarning(
-                t("fbbatch.mail.from_missing_title"),
-                t("fbbatch.mail.from_missing"),
-                parent=self,
-            )
-            self._open_mail_settings()
-            return
         env = self.full_env.get()
         vpn_ok, vpn_message = check_falabella_vpn()
         log.info(
@@ -693,7 +760,10 @@ class FBBatchSetupView(ctk.CTkFrame):
         to = mail_values["to"]
         cc = mail_values["cc"]
         body_template = mail_values["body_template"]
-        use_classic_outlook = bool(self.use_classic_outlook_var.get())
+        selected_mail = self._selected_mail_settings(from_account)
+        if selected_mail is None:
+            return
+        mail_method, from_account = selected_mail
 
         latest = bool(self.full_latest_var.get())
         log.info(
@@ -709,8 +779,8 @@ class FBBatchSetupView(ctk.CTkFrame):
             len(cc),
         )
         log.info(
-            "night_shift: generate selected Outlook route=%s",
-            "classic" if use_classic_outlook else "new",
+            "night_shift: generate selected mail method=%s",
+            mail_method,
         )
         self._active_progress = "full"
         self._run_background(
@@ -725,7 +795,7 @@ class FBBatchSetupView(ctk.CTkFrame):
                 to=to,
                 cc=cc,
                 body_template=body_template,
-                use_classic_outlook=use_classic_outlook,
+                mail_method=mail_method,
                 credentials=self.app.config.all_credentials(),
                 progress=progress,
             )
@@ -774,30 +844,24 @@ class FBBatchSetupView(ctk.CTkFrame):
             context.report_date,
             include_event=context.include_event,
         )
-        if not mail_values["from_account"]:
-            messagebox.showwarning(
-                t("fbbatch.mail.from_missing_title"),
-                t("fbbatch.mail.from_missing"),
-                parent=self,
-            )
-            self._open_mail_settings()
+        selected_mail = self._selected_mail_settings(mail_values["from_account"])
+        if selected_mail is None:
             return
-
+        mail_method, from_account = selected_mail
         self._active_progress = "full"
-        use_classic_outlook = bool(self.use_classic_outlook_var.get())
         log.info(
-            "night_shift: retry selected Outlook route=%s",
-            "classic" if use_classic_outlook else "new",
+            "night_shift: retry selected mail method=%s",
+            mail_method,
         )
         self._run_background(
             lambda progress: self._retry_draft(
                 context=context,
                 subject=mail_values["subject"],
-                from_account=mail_values["from_account"],
+                from_account=from_account,
                 to=mail_values["to"],
                 cc=mail_values["cc"],
                 body=mail_values["body"],
-                use_classic_outlook=use_classic_outlook,
+                mail_method=mail_method,
                 progress=progress,
             ),
             preserve_outputs=True,
@@ -812,7 +876,7 @@ class FBBatchSetupView(ctk.CTkFrame):
         to: str,
         cc: str,
         body: str,
-        use_classic_outlook: bool,
+        mail_method: str,
         progress,
     ) -> BatchResult:
         log.info(
@@ -823,7 +887,7 @@ class FBBatchSetupView(ctk.CTkFrame):
             len(context.attachments),
             len(context.inline_images),
         )
-        progress(91, t("fbbatch.mail.opening_outlook"))
+        progress(91, t("fbbatch.mail.preparing"))
         progress(94, t("fbbatch.mail.retrying"))
         create_outlook_draft(
             subject=subject,
@@ -833,7 +897,7 @@ class FBBatchSetupView(ctk.CTkFrame):
             body_text=body,
             attachments=list(context.attachments),
             inline_images=list(context.inline_images),
-            use_classic_outlook=use_classic_outlook,
+            mail_method=mail_method,
         )
         log.info("night_shift: retry draft completed report_date=%s", context.report_date)
         progress(100, t("fbbatch.mail.opened"))
@@ -861,7 +925,7 @@ class FBBatchSetupView(ctk.CTkFrame):
         to: str,
         cc: str,
         body_template: str,
-        use_classic_outlook: bool,
+        mail_method: str,
         credentials: dict,
         progress,
     ) -> BatchResult:
@@ -946,7 +1010,7 @@ class FBBatchSetupView(ctk.CTkFrame):
             if not chile_batch_skipped:
                 progress(90, t("fbbatch.mail.event_skipped"))
 
-        progress(91, t("fbbatch.mail.opening_outlook"))
+        progress(91, t("fbbatch.mail.preparing"))
         subject = render_mail_template(subject_template, report_date, include_event=include_event)
         body = render_mail_template(body_template, report_date, include_event=include_event)
         attachments = [event_pdf] if include_event and event_pdf else []
@@ -979,7 +1043,7 @@ class FBBatchSetupView(ctk.CTkFrame):
                 body_text=body,
                 attachments=attachments,
                 inline_images=report_result.image_paths,
-                use_classic_outlook=use_classic_outlook,
+                mail_method=mail_method,
             )
         except Exception as exc:
             log.exception("night_shift: draft creation failed report_date=%s", report_date)
@@ -1211,6 +1275,313 @@ class FBBatchSetupView(ctk.CTkFrame):
     def _open_path(path: Path | None) -> None:
         if path and path.exists():
             os.startfile(str(path))
+
+
+class GraphSettingsDialog(ctk.CTkToplevel):
+    def __init__(
+        self,
+        master,
+        *,
+        preferred_username: str,
+    ) -> None:
+        super().__init__(master)
+        self.preferred_username = preferred_username
+        self._busy = False
+        self._active_device_code: GraphDeviceCode | None = None
+        self._device_login_url = ""
+        self._result_queue: queue.Queue[tuple[str, object, str]] = queue.Queue()
+        self.title(t("fbbatch.graph.settings"))
+        self.transient(master.winfo_toplevel())
+        self.geometry("780x430")
+        self.minsize(720, 400)
+        self.grab_set()
+        self.protocol("WM_DELETE_WINDOW", self._close_dialog)
+
+        wrap = ctk.CTkFrame(self, fg_color="transparent")
+        wrap.pack(fill="both", expand=True, padx=22, pady=20)
+        wrap.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            wrap,
+            text=t("fbbatch.graph.settings"),
+            font=ctk.CTkFont(size=18, weight="bold"),
+            anchor="w",
+        ).grid(row=0, column=0, sticky="ew", pady=(0, 12))
+
+        ctk.CTkLabel(
+            wrap,
+            text=t("fbbatch.graph.description"),
+            anchor="w",
+            justify="left",
+            text_color=("gray40", "gray65"),
+            wraplength=700,
+        ).grid(row=1, column=0, sticky="ew", pady=(0, 16))
+
+        self.device_frame = ctk.CTkFrame(wrap)
+        self.device_frame.grid(row=2, column=0, sticky="ew", pady=(0, 14), ipady=10)
+        self.device_frame.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(
+            self.device_frame,
+            text=t("fbbatch.graph.device_code"),
+            width=130,
+            anchor="w",
+        ).grid(row=0, column=0, sticky="w", padx=(14, 0))
+        self.device_code_label = ctk.CTkLabel(
+            self.device_frame,
+            text="",
+            anchor="w",
+            font=ctk.CTkFont(family="Consolas", size=20, weight="bold"),
+        )
+        self.device_code_label.grid(row=0, column=1, sticky="w", padx=(0, 10))
+        self.copy_code_button = ctk.CTkButton(
+            self.device_frame,
+            text=t("fbbatch.graph.copy_code"),
+            width=115,
+            command=self._copy_device_code,
+        )
+        self.copy_code_button.grid(row=0, column=2, padx=(0, 8))
+        self.open_login_button = ctk.CTkButton(
+            self.device_frame,
+            text=t("fbbatch.graph.open_sign_in"),
+            width=170,
+            command=self._open_device_login,
+        )
+        self.open_login_button.grid(row=0, column=3)
+        self.device_frame.grid_remove()
+
+        self.status_label = ctk.CTkLabel(
+            wrap,
+            text=t("fbbatch.graph.not_connected"),
+            anchor="w",
+            justify="left",
+            text_color=("gray35", "gray70"),
+        )
+        self.status_label.grid(row=3, column=0, sticky="ew", pady=(0, 18))
+
+        auth_actions = ctk.CTkFrame(wrap, fg_color="transparent")
+        auth_actions.grid(row=4, column=0, sticky="w")
+        self.sign_in_button = ctk.CTkButton(
+            auth_actions,
+            text=t("fbbatch.graph.sign_in"),
+            width=170,
+            command=self._sign_in_with_code,
+        )
+        self.sign_in_button.pack(side="left")
+        self.test_button = ctk.CTkButton(
+            auth_actions,
+            text=t("fbbatch.graph.test"),
+            width=115,
+            command=self._test_connection,
+        )
+        self.test_button.pack(side="left", padx=(10, 0))
+        self.sign_out_button = ctk.CTkButton(
+            auth_actions,
+            text=t("fbbatch.graph.sign_out"),
+            width=115,
+            fg_color="transparent",
+            border_width=1,
+            text_color=("gray10", "gray90"),
+            command=self._sign_out,
+        )
+        self.sign_out_button.pack(side="left", padx=(10, 0))
+
+        actions = ctk.CTkFrame(wrap, fg_color="transparent")
+        actions.grid(row=5, column=0, sticky="e", pady=(24, 0))
+        ctk.CTkButton(
+            actions,
+            text=t("common.close"),
+            width=130,
+            fg_color="transparent",
+            border_width=1,
+            text_color=("gray10", "gray90"),
+            command=self._close_dialog,
+        ).pack(side="right")
+
+        self.after(50, self._center_on_screen)
+        self.after(120, self._refresh_cached_status)
+        self.after(100, self._poll_results)
+
+    def _refresh_cached_status(self) -> None:
+        self._set_status(t("fbbatch.graph.checking"))
+
+        def worker() -> None:
+            try:
+                identity = GraphMailClient().cached_identity(self.preferred_username)
+            except Exception as exc:
+                log.exception("graph_mail: cached account inspection failed")
+                self._result_queue.put(("cache", "", str(exc)))
+                return
+            account = identity.username if identity else ""
+            self._result_queue.put(("cache", account, ""))
+
+        threading.Thread(target=worker, name="graph-cache-status", daemon=True).start()
+
+    def _finish_cached_status(self, *, account: str = "", error: str = "") -> None:
+        if not self.winfo_exists():
+            return
+        if self._busy:
+            return
+        if error:
+            self._set_status(error, error=True)
+        elif account:
+            self._set_status(t("fbbatch.graph.cached", account=account))
+        else:
+            self._set_status(t("fbbatch.graph.not_connected"))
+
+    def _sign_in_with_code(self) -> None:
+        if self._busy:
+            return
+        self._hide_device_code()
+        self._set_busy(True)
+        self._set_status(t("fbbatch.graph.requesting_code"))
+
+        def worker() -> None:
+            try:
+                client = GraphMailClient()
+                device_code = client.initiate_device_sign_in()
+                self._active_device_code = device_code
+                self._result_queue.put(("device", device_code, ""))
+                identity = client.complete_device_sign_in(
+                    device_code,
+                    self.preferred_username,
+                )
+            except Exception as exc:
+                log.exception("graph_mail: device-code settings action failed")
+                self._result_queue.put(("action", "", str(exc)))
+                return
+            self._result_queue.put(("action", identity.username, ""))
+
+        threading.Thread(target=worker, name="graph-device-sign-in", daemon=True).start()
+
+    def _test_connection(self) -> None:
+        self._run_graph_action(
+            t("fbbatch.graph.testing"),
+            lambda client: client.test_connection(self.preferred_username),
+        )
+
+    def _sign_out(self) -> None:
+        self._run_graph_action(t("fbbatch.graph.signing_out"), self._sign_out_client)
+
+    @staticmethod
+    def _sign_out_client(client: GraphMailClient):
+        client.sign_out()
+        return None
+
+    def _run_graph_action(self, pending_text: str, action) -> None:
+        if self._busy:
+            return
+        self._set_busy(True)
+        self._set_status(pending_text)
+
+        def worker() -> None:
+            try:
+                client = GraphMailClient()
+                identity = action(client)
+            except Exception as exc:
+                log.exception("graph_mail: settings action failed")
+                self._result_queue.put(("action", "", str(exc)))
+                return
+            account = identity.username if identity else ""
+            self._result_queue.put(("action", account, ""))
+
+        threading.Thread(target=worker, name="graph-settings", daemon=True).start()
+
+    def _poll_results(self) -> None:
+        if not self.winfo_exists():
+            return
+        while True:
+            try:
+                result_type, payload, error = self._result_queue.get_nowait()
+            except queue.Empty:
+                break
+            if result_type == "cache":
+                self._finish_cached_status(account=str(payload), error=error)
+            elif result_type == "device" and isinstance(payload, GraphDeviceCode):
+                self._show_device_code(payload)
+            else:
+                self._finish_action(account=str(payload), error=error)
+        self.after(100, self._poll_results)
+
+    def _show_device_code(self, device_code: GraphDeviceCode) -> None:
+        self._active_device_code = device_code
+        self._device_login_url = device_code.verification_uri
+        self.device_code_label.configure(text=device_code.user_code)
+        self.device_frame.grid()
+        self.copy_code_button.configure(state="normal")
+        self.open_login_button.configure(state="normal")
+        self._set_status(
+            t("fbbatch.graph.enter_code", code=device_code.user_code),
+            success=True,
+        )
+        self._open_device_login()
+
+    def _hide_device_code(self) -> None:
+        self._active_device_code = None
+        self._device_login_url = ""
+        self.device_code_label.configure(text="")
+        self.device_frame.grid_remove()
+
+    def _copy_device_code(self) -> None:
+        code = self.device_code_label.cget("text")
+        if not code:
+            return
+        self.clipboard_clear()
+        self.clipboard_append(code)
+        self._set_status(t("fbbatch.graph.code_copied", code=code), success=True)
+
+    def _open_device_login(self) -> None:
+        if not self._device_login_url:
+            return
+        try:
+            opened = webbrowser.open(self._device_login_url, new=2)
+        except OSError:
+            log.exception("graph_mail: could not open device login page")
+            opened = False
+        if not opened:
+            self._set_status(t("fbbatch.graph.device_login_failed"), error=True)
+
+    def _finish_action(self, *, account: str = "", error: str = "") -> None:
+        if not self.winfo_exists():
+            return
+        self._set_busy(False)
+        if error:
+            self._hide_device_code()
+            self._set_status(error, error=True)
+        elif account:
+            self._hide_device_code()
+            self._set_status(t("fbbatch.graph.connected", account=account), success=True)
+        else:
+            self._hide_device_code()
+            self._set_status(t("fbbatch.graph.signed_out"))
+
+    def _set_busy(self, busy: bool) -> None:
+        self._busy = busy
+        state = "disabled" if busy else "normal"
+        for button in (
+            self.sign_in_button,
+            self.test_button,
+            self.sign_out_button,
+        ):
+            button.configure(state=state)
+
+    def _set_status(self, text: str, *, error: bool = False, success: bool = False) -> None:
+        color = ("gray35", "gray70")
+        if error:
+            color = ("#b91c1c", "#f87171")
+        elif success:
+            color = ("#047857", "#34d399")
+        self.status_label.configure(text=text, text_color=color)
+
+    def _close_dialog(self) -> None:
+        GraphMailClient.cancel_device_sign_in(self._active_device_code)
+        self.destroy()
+
+    def _center_on_screen(self) -> None:
+        self.update_idletasks()
+        width, height = self.winfo_width(), self.winfo_height()
+        x = max(0, (self.winfo_screenwidth() - width) // 2)
+        y = max(0, (self.winfo_screenheight() - height) // 2)
+        self.geometry(f"+{x}+{y}")
+
 
 class MailSettingsDialog(ctk.CTkToplevel):
     def __init__(self, master, *, values: dict[str, str], on_saved):

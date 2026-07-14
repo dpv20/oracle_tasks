@@ -4,9 +4,9 @@ Passwords inside credential dicts are encrypted with DPAPI before being written
 to disk and decrypted on read. Encryption is per-Windows-user, so the file is
 unreadable by other accounts on the same machine.
 
-Config schema (v7):
+Config schema (v8):
 {
-  "version": 7,
+  "version": 8,
   "language": "en" | "es",
   "theme": "light" | "dark",
   "sqlcl_path": "<absolute path to sql.exe>",
@@ -19,6 +19,7 @@ Config schema (v7):
   "fbbatch_mail_cc": "",
   "fbbatch_mail_body": "<template>",
   "fbbatch_use_classic_outlook": false,
+  "fbbatch_mail_method": "new" | "classic" | "graph",
   "spools_cl_output_dir": "<override; empty = use default in DATA_DIR>",
   "verify_savings_apply": false,
   "start_with_windows": true,
@@ -49,7 +50,7 @@ from paths import CONFIG_DIR, CONFIG_FILE
 log = logging.getLogger(__name__)
 
 DEFAULTS: dict[str, Any] = {
-    "version": 7,
+    "version": 8,
     "language": "en",
     "theme": "light",
     "sqlcl_path": "",
@@ -62,6 +63,7 @@ DEFAULTS: dict[str, Any] = {
     "fbbatch_mail_cc": '"KANNAN MUTHUSAMY" <kannan.m@oracle.com>; "Sharath Pattabiraman" <sharath.pattabiraman@oracle.com>; "Ashwin M" <ashwin.m@oracle.com>; "Diego Pavez" <diego.pavez@oracle.com>',
     "fbbatch_mail_body": "",
     "fbbatch_use_classic_outlook": False,
+    "fbbatch_mail_method": "new",
     "spools_cl_output_dir": "",
     "verify_savings_apply": False,
     "start_with_windows": True,
@@ -189,6 +191,10 @@ class ConfigManager:
             merged["vpn_show_bice"] = False
         if loaded_version < 7:
             self._migrate_legacy_vpn_settings(merged)
+        if loaded_version < 8:
+            merged["fbbatch_mail_method"] = (
+                "classic" if bool(merged.get("fbbatch_use_classic_outlook")) else "new"
+            )
         merged["version"] = DEFAULTS["version"]
         return merged
 

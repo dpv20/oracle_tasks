@@ -574,6 +574,7 @@ def create_outlook_draft(
     attachments: list[Path],
     inline_images: list[Path],
     use_classic_outlook: bool = False,
+    mail_method: str | None = None,
 ) -> OutlookDraftResult:
     from fbbatch.new_outlook import (
         NewOutlookAutomationError,
@@ -593,10 +594,28 @@ def create_outlook_draft(
     )
     log_outlook_environment(log, stage="draft-route-selection")
 
-    route = "classic" if use_classic_outlook else "new"
+    route = (mail_method or ("classic" if use_classic_outlook else "new")).strip().lower()
+    if route not in {"new", "classic", "graph"}:
+        raise RuntimeError(f"Unknown mail draft method: {route}")
     log.info("outlook_draft: selected exclusive route=%s", route)
 
-    if use_classic_outlook:
+    if route == "graph":
+        from fbbatch.graph_mail import GraphMailClient
+
+        log.info("outlook_draft: using Microsoft Graph PowerShell device-code identity")
+        result = GraphMailClient().create_draft(
+            subject=subject,
+            from_account=from_account,
+            to=to,
+            cc=cc,
+            body_text=body_text,
+            attachments=attachments,
+            inline_images=inline_images,
+        )
+        log.info("outlook_draft: ===== attempt completed route=graph id=%s =====", result.message_id)
+        return OutlookDraftResult(entry_id=result.message_id, folder_name="Drafts")
+
+    if route == "classic":
         classic_executable = _find_outlook_executable()
         if classic_executable is None:
             raise RuntimeError(

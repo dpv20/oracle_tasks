@@ -18,6 +18,7 @@ from fbbatch.new_outlook import (  # noqa: E402
     _close_started_main_window,
     _control_contains_text,
     _discard_failed_compose,
+    _ensure_from_account,
     _fill_recipient_fields,
     _fill_subject,
     _fit_image_size,
@@ -90,6 +91,37 @@ class NewOutlookTests(unittest.TestCase):
 
         self.assertIs(selected, window)
 
+    def test_main_window_prefers_profile_matching_from_account(self) -> None:
+        def make_window(handle: int, title: str, width: int):
+            rectangle = Mock()
+            rectangle.width.return_value = width
+            rectangle.height.return_value = 800
+            button = Mock()
+            button.element_info.control_type = "Button"
+            button.element_info.name = "New mail"
+            button.window_text.return_value = "New mail"
+            button.descendants.return_value = []
+            window = Mock()
+            window.handle = handle
+            window.element_info.class_name = "Outlook Host"
+            window.window_text.return_value = title
+            window.rectangle.return_value = rectangle
+            window.descendants.return_value = [button]
+            return window
+
+        falabella = make_window(1, "Inbox - Diego Pavez Verdi - Outlook", 1600)
+        oracle = make_window(2, "Mail - Diego Pavez - Outlook", 1200)
+        desktop = Mock()
+        desktop.windows.return_value = [falabella, oracle]
+
+        selected = _wait_for_main_window(
+            desktop,
+            timeout=0.1,
+            from_account="diego.pavez@oracle.com",
+        )
+
+        self.assertIs(selected, oracle)
+
     def test_headless_new_outlook_is_restarted_before_launch(self) -> None:
         main_window = Mock()
         desktop = Mock()
@@ -155,6 +187,35 @@ class NewOutlookTests(unittest.TestCase):
 
         self.assertEqual(main_window.descendants.call_count, 3)
         button.invoke.assert_called_once_with()
+
+    def test_from_account_menu_item_can_contain_email_in_child_text(self) -> None:
+        from_button = Mock()
+        from_button.element_info.control_type = "Button"
+        from_button.element_info.automation_id = "compose_FROM"
+        from_button.window_text.return_value = "From: external@example.com"
+        child = Mock()
+        child.element_info.name = "diego.pavez@oracle.com"
+        child.window_text.return_value = "diego.pavez@oracle.com"
+        child.descendants.return_value = []
+        menu_item = Mock()
+        menu_item.element_info.control_type = "MenuItem"
+        menu_item.element_info.name = "Diego Pavez"
+        menu_item.window_text.return_value = "Diego Pavez"
+        menu_item.descendants.return_value = [child]
+        compose = Mock()
+        compose.descendants.return_value = [from_button]
+        top_window = Mock()
+        top_window.element_info.control_type = "Window"
+        top_window.element_info.name = "New mail"
+        top_window.window_text.return_value = "New mail"
+        top_window.descendants.return_value = [menu_item]
+        desktop = Mock()
+        desktop.windows.return_value = [top_window]
+
+        _ensure_from_account(desktop, compose, "diego.pavez@oracle.com")
+
+        from_button.click_input.assert_called_once_with()
+        menu_item.click_input.assert_called_once_with()
 
     def test_file_drop_payload_contains_absolute_utf16_paths(self) -> None:
         attachment = ROOT_DIR / "shift" / "event.txt"

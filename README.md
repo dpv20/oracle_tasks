@@ -75,6 +75,26 @@ configuration files for that run, and removes them when the process finishes.
 PROD reports require one **PROD (shared)** credential for Chile, Peru, Colombia
 and Mexico. QA and DEV runs use the corresponding Chile credential.
 
+### Microsoft Graph drafts (optional)
+
+Night Shift can create the Outlook draft directly in Exchange through Microsoft
+Graph, without opening Outlook. In **Night Shift -> Microsoft Graph**, select
+**Sign in with code** and enter the displayed code at
+`https://microsoft.com/devicelogin`. This uses the same public device-code flow
+as `Connect-MgGraph -UseDeviceCode`. The Graph route intentionally uses only
+the **Falabella email** saved under **Settings -> General**, and each coworker
+authorizes their own Falabella account. No Tenant ID, Client ID, app
+registration, or client secret is entered in Oracle Tasks. Use **Test access**
+before selecting Graph as the draft method.
+
+Oracle's tenant currently returns `AADSTS50105` for the public Microsoft Graph
+Command Line Tools application. Use Classic or New Outlook for the Oracle
+mailbox unless an Oracle Entra administrator explicitly grants access.
+
+Graph requests delegated `Mail.ReadWrite` access. The OAuth token cache is
+encrypted for the current Windows user with DPAPI, so the device code is
+normally needed only for the first authorization or after access expires.
+
 ---
 
 ## 5. VPN tab

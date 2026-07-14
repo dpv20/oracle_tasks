@@ -125,6 +125,7 @@ def create_new_outlook_draft(
             desktop,
             executable,
             existing_outlook_handles=existing_outlook_handles,
+            from_account=from_account,
         )
         started_main_window = main_window.handle not in existing_outlook_handles
         log.info(
@@ -340,7 +341,13 @@ def _split_recipients(raw: str) -> list[str]:
     return recipients
 
 
-def _open_new_outlook_main_window(desktop, executable: Path, *, existing_outlook_handles: set[int]):
+def _open_new_outlook_main_window(
+    desktop,
+    executable: Path,
+    *,
+    existing_outlook_handles: set[int],
+    from_account: str = "",
+):
     protected_process_ids = _new_outlook_process_ids()
     if not existing_outlook_handles and protected_process_ids:
         log.warning(
@@ -360,6 +367,7 @@ def _open_new_outlook_main_window(desktop, executable: Path, *, existing_outlook
         return _wait_for_main_window(
             desktop,
             timeout=NEW_OUTLOOK_INITIAL_WINDOW_TIMEOUT_SECONDS,
+            from_account=from_account,
         )
     except NewOutlookUnavailable:
         if _outlook_host_handles(desktop):
@@ -378,6 +386,7 @@ def _open_new_outlook_main_window(desktop, executable: Path, *, existing_outlook
     return _wait_for_main_window(
         desktop,
         timeout=NEW_OUTLOOK_RECOVERY_WINDOW_TIMEOUT_SECONDS,
+        from_account=from_account,
     )
 
 
@@ -456,7 +465,7 @@ def _outlook_host_handles(desktop) -> set[int]:
     return handles
 
 
-def _wait_for_main_window(desktop, *, timeout: float):
+def _wait_for_main_window(desktop, *, timeout: float, from_account: str = ""):
     log.info("new_outlook_draft: waiting for main Mail window timeout=%.1fs", timeout)
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -476,7 +485,7 @@ def _wait_for_main_window(desktop, *, timeout: float):
         if candidates:
             selected = max(
                 candidates,
-                key=_main_window_score,
+                key=lambda window: _main_window_score(window, from_account=from_account),
             )
             log.info(
                 "new_outlook_draft: main Mail candidates=%s selected_handle=%s title=%r",
@@ -491,8 +500,9 @@ def _wait_for_main_window(desktop, *, timeout: float):
     raise NewOutlookUnavailable("New Outlook did not open its main Mail window.")
 
 
-def _main_window_score(window) -> tuple[int, int, int]:
+def _main_window_score(window, *, from_account: str = "") -> tuple[int, int, int, int]:
     title = str(window.window_text() or "").casefold()
+    account_match = _window_account_match_score(window, from_account)
     has_new_mail = 0
     try:
         has_new_mail = int(
@@ -506,10 +516,37 @@ def _main_window_score(window) -> tuple[int, int, int]:
         pass
     rectangle = window.rectangle()
     return (
+        account_match,
         has_new_mail,
         int("outlook" in title or title.startswith("mail")),
         rectangle.width() * rectangle.height(),
     )
+
+
+def _window_account_match_score(window, from_account: str) -> int:
+    wanted = from_account.strip().casefold()
+    if not wanted:
+        return 0
+
+    title = str(window.window_text() or "").strip().casefold()
+    try:
+        searchable = " ".join(
+            _control_search_text(control)
+            for control in window.descendants()
+        )
+    except Exception:
+        searchable = ""
+    if wanted in searchable:
+        return 3
+
+    local_part = wanted.split("@", 1)[0]
+    expected_name = " ".join(part for part in re.split(r"[._-]+", local_part) if part)
+    title_parts = [part.strip() for part in title.split(" - ")]
+    if expected_name and expected_name in title_parts:
+        return 2
+    if expected_name and expected_name in title:
+        return 1
+    return 0
 
 
 def _open_new_mail(
@@ -693,9 +730,9 @@ def _ensure_from_account(desktop, window, from_account: str) -> None:
     while time.monotonic() < deadline:
         for top_window in desktop.windows():
             for control in [top_window] + top_window.descendants():
-                if wanted not in control.window_text().lower():
+                if control.element_info.control_type not in ("MenuItem", "ListItem", "Button"):
                     continue
-                if control.element_info.control_type in ("MenuItem", "ListItem", "Button"):
+                if wanted in _control_search_text(control):
                     control.click_input()
                     log.info("new_outlook_draft: selected From account=%s", wanted)
                     return
@@ -703,6 +740,20 @@ def _ensure_from_account(desktop, window, from_account: str) -> None:
     raise NewOutlookAutomationError(
         f"New Outlook is using a different From account and {from_account} could not be selected."
     )
+
+
+def _control_search_text(control) -> str:
+    values = [
+        str(control.window_text() or ""),
+        str(getattr(control.element_info, "name", "") or ""),
+    ]
+    try:
+        for descendant in control.descendants():
+            values.append(str(descendant.window_text() or ""))
+            values.append(str(getattr(descendant.element_info, "name", "") or ""))
+    except Exception:
+        pass
+    return " ".join(values).casefold()
 
 
 def _fill_recipient_fields(window, to_text: str, cc_text: str, keyboard) -> None:
