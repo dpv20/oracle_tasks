@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from datetime import date
 from html import unescape
 from dataclasses import dataclass
 from pathlib import Path
@@ -365,6 +366,9 @@ def run_eod_batch_event(
     progress: ProgressCallback | None = None,
     *,
     credentials: dict | None = None,
+    latest: bool = True,
+    event_date: str = "",
+    next_date: str = "",
 ) -> BatchResult:
     ok, msg, base_root = validate_fbbatch_root(fbbatch_root)
     if not ok:
@@ -376,23 +380,121 @@ def run_eod_batch_event(
                 base_root, env, credentials, include_common=False
             )
         root = base_root / "CHILE"
-        output_dir = root / "output" / "EODBatchEvent"
-        output_dir.mkdir(parents=True, exist_ok=True)
-        before = _latest_html(output_dir)
-        _emit_progress(progress, 1, "Starting EOD Batch Event")
-        result = _run_java(
-            root,
-            "com.fellabela.custom.chile.eodevent.FBCLEODBatchEventApplication",
-            f"{env}\n",
-            progress=progress,
-            progress_kind="event",
-        )
-        html_path = _newest_after(output_dir, before)
-        return _with_pdf(result, html_path, "event", "EODBatchEvent", progress)
+        if latest:
+            return _execute_eod_batch_event(root, env, progress)
+
+        batch_day, next_processing_day = _parse_historical_event_dates(event_date, next_date)
+        _emit_progress(progress, 1, "Preparing historical EOD Batch Event")
+        with tempfile.TemporaryDirectory(prefix="oracle_tasks_eod_event_") as temp_dir:
+            runtime_root = _prepare_historical_event_runtime(
+                root,
+                Path(temp_dir) / "CHILE",
+                batch_day,
+                next_processing_day,
+            )
+            return _execute_eod_batch_event(
+                runtime_root,
+                env,
+                progress,
+                classpath_root=root,
+                expected_event_date=batch_day,
+            )
     except (OSError, ValueError) as exc:
         return BatchResult(False, str(exc))
     finally:
         remove_materialized_fbbatch_credentials(generated_configs)
+
+
+def _execute_eod_batch_event(
+    root: Path,
+    env: str,
+    progress: ProgressCallback | None,
+    *,
+    classpath_root: Path | None = None,
+    expected_event_date: date | None = None,
+) -> BatchResult:
+    output_dir = root / "output" / "EODBatchEvent"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    before = _latest_html(output_dir)
+    _emit_progress(progress, 2, "Starting EOD Batch Event")
+    result = _run_java(
+        root,
+        "com.fellabela.custom.chile.eodevent.FBCLEODBatchEventApplication",
+        f"{env}\n",
+        progress=progress,
+        progress_kind="event",
+        classpath_root=classpath_root,
+    )
+    html_path = _newest_after(output_dir, before)
+    if result.ok and expected_event_date is not None:
+        expected_token = expected_event_date.strftime("%d-%m-%Y")
+        if html_path is None or expected_token not in html_path.stem:
+            actual = html_path.name if html_path else "no HTML output"
+            log.error(
+                "fbbatch_event: historical output date mismatch expected=%s actual=%s",
+                expected_token,
+                actual,
+            )
+            return BatchResult(
+                False,
+                f"Historical Event expected {expected_token}, but Java produced {actual}.",
+                exit_code=result.exit_code,
+            )
+    return _with_pdf(result, html_path, "event", "EODBatchEvent", progress)
+
+
+def _parse_historical_event_dates(event_date: str, next_date: str) -> tuple[date, date]:
+    from datetime import datetime
+
+    try:
+        batch_day = datetime.strptime(event_date.strip(), "%d%m%Y").date()
+    except ValueError as exc:
+        raise ValueError("Invalid Event batch date. Use DDMMYYYY.") from exc
+    try:
+        next_processing_day = datetime.strptime(next_date.strip(), "%d%m%Y").date()
+    except ValueError as exc:
+        raise ValueError("Invalid next processing date. Use DDMMYYYY.") from exc
+    if next_processing_day <= batch_day:
+        raise ValueError("The next processing date must be after the Event batch date.")
+    return batch_day, next_processing_day
+
+
+def _prepare_historical_event_runtime(
+    source_root: Path,
+    runtime_root: Path,
+    batch_day: date,
+    next_processing_day: date,
+) -> Path:
+    shutil.copytree(source_root / "config", runtime_root / "config")
+    shutil.copytree(source_root / "upload", runtime_root / "upload")
+    (runtime_root / "output" / "EODBatchEvent").mkdir(parents=True, exist_ok=True)
+    (runtime_root / "log" / "EODBatchEvent").mkdir(parents=True, exist_ok=True)
+
+    properties_path = runtime_root / "config" / "EODBatchEvent" / "EODBatchEvent.properties"
+    properties = properties_path.read_text(encoding="utf-8")
+    query = (
+        "SELECT "
+        f"TO_TIMESTAMP('{next_processing_day:%Y-%m-%d} 00:00:00.0', "
+        "'YYYY-MM-DD HH24:MI:SS.FF') AS TODAY, "
+        f"TO_TIMESTAMP('{batch_day:%Y-%m-%d} 00:00:00.0', "
+        "'YYYY-MM-DD HH24:MI:SS.FF') AS PREV_WORKING_DAY FROM DUAL"
+    )
+    updated, count = re.subn(
+        r"(?m)^\s*STTM_DATES_QUERY\s*=.*$",
+        f"STTM_DATES_QUERY = {query}",
+        properties,
+        count=1,
+    )
+    if count != 1:
+        raise ValueError("EODBatchEvent.properties does not contain STTM_DATES_QUERY.")
+    properties_path.write_text(updated, encoding="utf-8")
+    log.info(
+        "fbbatch_event: prepared historical runtime batch_date=%s next_processing_date=%s root=%s",
+        batch_day.isoformat(),
+        next_processing_day.isoformat(),
+        runtime_root,
+    )
+    return runtime_root
 
 
 def run_batch_report(
@@ -1430,6 +1532,7 @@ def _run_java(
     *,
     progress: ProgressCallback | None = None,
     progress_kind: str = "",
+    classpath_root: Path | None = None,
 ) -> BatchResult:
     if not root.exists():
         return BatchResult(False, f"FBBatchSetup folder not found: {root}")
@@ -1449,8 +1552,9 @@ def _run_java(
         int(JAVA_MAX_RUNTIME_SECONDS),
     )
     try:
+        classpath = str((classpath_root or root) / "lib" / "*")
         process = subprocess.Popen(
-            [java, "-cp", "lib/*", main_class],
+            [java, "-cp", classpath, main_class],
             cwd=str(root),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,

@@ -97,6 +97,13 @@ def _scale_phase_progress(percent: int, start: int, end: int) -> int:
     return min(end, start + max(1, (percent * width) // 100))
 
 
+def _next_weekday(value: date) -> date:
+    candidate = value + timedelta(days=1)
+    while candidate.weekday() >= 5:
+        candidate += timedelta(days=1)
+    return candidate
+
+
 def _issue_labels() -> dict[str, str]:
     return {
         "DATE": t("fbbatch.issue.date"),
@@ -357,27 +364,81 @@ class FBBatchSetupView(ctk.CTkFrame):
         card.pack(fill="x", pady=(0, 12))
         inner = ctk.CTkFrame(card, fg_color="transparent")
         inner.pack(fill="x", padx=18, pady=16)
-        SectionLabel(inner, text=t("fbbatch.event.title")).grid(row=0, column=0, columnspan=3, sticky="w")
+        SectionLabel(inner, text=t("fbbatch.event.title")).grid(row=0, column=0, columnspan=5, sticky="w")
         ctk.CTkLabel(
             inner,
             text=t("fbbatch.event.desc"),
             anchor="w",
             justify="left",
             text_color=("gray40", "gray65"),
-        ).grid(row=1, column=0, columnspan=3, sticky="ew", pady=(4, 10))
+        ).grid(row=1, column=0, columnspan=5, sticky="ew", pady=(4, 10))
 
         ctk.CTkLabel(inner, text=t("fbbatch.env"), width=120, anchor="w").grid(row=2, column=0, sticky="w", pady=4)
         self.event_env = ctk.CTkOptionMenu(inner, values=list(ENVIRONMENTS))
         self.event_env.grid(row=2, column=1, sticky="ew", padx=8, pady=4)
+        self.event_latest_var = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(
+            inner,
+            text=t("fbbatch.event.latest"),
+            variable=self.event_latest_var,
+            command=self._sync_event_date_state,
+        ).grid(row=2, column=2, sticky="w", padx=8, pady=4)
         IconButton(
             inner,
             text=t("fbbatch.event.run"),
             width=180,
             command=self._on_run_event,
-        ).grid(row=2, column=2, padx=8, pady=4)
+        ).grid(row=2, column=4, sticky="e", padx=8, pady=4)
+
+        self._event_selected_date = date.today() - timedelta(days=1)
+        self._event_next_date = date.today()
+        self.event_date_label = ctk.CTkLabel(
+            inner,
+            text=t("fbbatch.event.batch_date"),
+            width=120,
+            anchor="w",
+        )
+        self.event_date_label.grid(row=3, column=0, sticky="w", pady=4)
+        self.event_date_frame = ctk.CTkFrame(inner, fg_color="transparent")
+        self.event_date_frame.grid(row=3, column=1, columnspan=3, sticky="ew", padx=8, pady=4)
+        self.event_date_frame.grid_columnconfigure(0, weight=1)
+        self.event_date = ctk.CTkEntry(self.event_date_frame)
+        self.event_date.insert(0, _format_issue_date(self._event_selected_date))
+        self.event_date.configure(state="disabled")
+        self.event_date.grid(row=0, column=0, sticky="ew")
+        self.event_calendar_btn = ctk.CTkButton(
+            self.event_date_frame,
+            text=t("fbbatch.calendar"),
+            width=105,
+            command=self._open_event_calendar,
+        )
+        self.event_calendar_btn.grid(row=0, column=1, padx=(8, 0))
+
+        self.event_next_date_label = ctk.CTkLabel(
+            inner,
+            text=t("fbbatch.event.next_date"),
+            width=120,
+            anchor="w",
+        )
+        self.event_next_date_label.grid(row=4, column=0, sticky="w", pady=4)
+        self.event_next_date_frame = ctk.CTkFrame(inner, fg_color="transparent")
+        self.event_next_date_frame.grid(row=4, column=1, columnspan=3, sticky="ew", padx=8, pady=4)
+        self.event_next_date_frame.grid_columnconfigure(0, weight=1)
+        self.event_next_date = ctk.CTkEntry(self.event_next_date_frame)
+        self.event_next_date.insert(0, _format_issue_date(self._event_next_date))
+        self.event_next_date.configure(state="disabled")
+        self.event_next_date.grid(row=0, column=0, sticky="ew")
+        self.event_next_calendar_btn = ctk.CTkButton(
+            self.event_next_date_frame,
+            text=t("fbbatch.calendar"),
+            width=105,
+            command=self._open_event_next_calendar,
+        )
+        self.event_next_calendar_btn.grid(row=0, column=1, padx=(8, 0))
+
         self.event_progress_bar = ctk.CTkProgressBar(inner)
         self.event_progress_bar.set(0)
-        self.event_progress_bar.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(12, 2))
+        self.event_progress_bar.grid(row=5, column=0, columnspan=5, sticky="ew", pady=(12, 2))
         self.event_progress_label = ctk.CTkLabel(
             inner,
             text="",
@@ -386,9 +447,9 @@ class FBBatchSetupView(ctk.CTkFrame):
             text_color=("gray40", "gray65"),
             font=ctk.CTkFont(size=11),
         )
-        self.event_progress_label.grid(row=4, column=0, columnspan=3, sticky="ew")
+        self.event_progress_label.grid(row=6, column=0, columnspan=5, sticky="ew")
         self.event_output_row = ctk.CTkFrame(inner, fg_color="transparent")
-        self.event_output_row.grid(row=5, column=0, columnspan=3, sticky="e", pady=(10, 0))
+        self.event_output_row.grid(row=7, column=0, columnspan=5, sticky="e", pady=(10, 0))
         self.event_open_location_btn = ctk.CTkButton(
             self.event_output_row,
             text=t("fbbatch.open_location"),
@@ -397,8 +458,10 @@ class FBBatchSetupView(ctk.CTkFrame):
             command=lambda: self._open_path(self._event_output_dir),
         )
         self.event_open_location_btn.pack(side="right", padx=5)
+        self._sync_event_date_state()
         self._hide_progress("event")
         inner.grid_columnconfigure(1, weight=1)
+        inner.grid_columnconfigure(3, weight=1)
 
     def _build_report_card(self) -> None:
         card = CardFrame(self.body)
@@ -697,6 +760,51 @@ class FBBatchSetupView(ctk.CTkFrame):
 
     def _current_full_report_date(self) -> str:
         return self._full_selected_date.strftime("%d%m%Y")
+
+    def _open_event_calendar(self) -> None:
+        CalendarDialog(self, selected=self._event_selected_date, on_pick=self._set_event_date)
+
+    def _set_event_date(self, value: date) -> None:
+        self._event_selected_date = value
+        self._event_next_date = _next_weekday(value)
+        self._refresh_event_date_entries()
+
+    def _open_event_next_calendar(self) -> None:
+        CalendarDialog(self, selected=self._event_next_date, on_pick=self._set_event_next_date)
+
+    def _set_event_next_date(self, value: date) -> None:
+        self._event_next_date = value
+        self._refresh_event_date_entries()
+
+    def _refresh_event_date_entries(self) -> None:
+        for entry, value in (
+            (self.event_date, self._event_selected_date),
+            (self.event_next_date, self._event_next_date),
+        ):
+            entry.configure(state="normal")
+            entry.delete(0, "end")
+            entry.insert(0, _format_issue_date(value))
+            entry.configure(state="disabled")
+
+    def _sync_event_date_state(self) -> None:
+        historical_widgets = (
+            self.event_date_label,
+            self.event_date_frame,
+            self.event_next_date_label,
+            self.event_next_date_frame,
+        )
+        if self.event_latest_var.get():
+            for widget in historical_widgets:
+                widget.grid_remove()
+            return
+        for widget in historical_widgets:
+            widget.grid()
+
+    def _current_event_dates(self) -> tuple[str, str]:
+        return (
+            self._event_selected_date.strftime("%d%m%Y"),
+            self._event_next_date.strftime("%d%m%Y"),
+        )
 
     def _open_report_calendar(self) -> None:
         CalendarDialog(self, selected=self._report_selected_date, on_pick=self._set_report_date)
@@ -1085,6 +1193,15 @@ class FBBatchSetupView(ctk.CTkFrame):
         env = self.event_env.get()
         if not self._confirm_prod(env):
             return
+        latest = bool(self.event_latest_var.get())
+        event_date, next_date = self._current_event_dates()
+        if not latest and self._event_next_date <= self._event_selected_date:
+            messagebox.showerror(
+                t("common.error"),
+                t("fbbatch.event.invalid_order"),
+                parent=self,
+            )
+            return
         root = self._ensure_fbbatch_root()
         if root is None:
             return
@@ -1092,7 +1209,13 @@ class FBBatchSetupView(ctk.CTkFrame):
         credentials = self.app.config.all_credentials()
         self._run_background(
             lambda progress: run_eod_batch_event(
-                env, root, progress, credentials=credentials
+                env,
+                root,
+                progress,
+                credentials=credentials,
+                latest=latest,
+                event_date=event_date,
+                next_date=next_date,
             )
         )
 

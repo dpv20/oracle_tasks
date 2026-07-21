@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import tempfile
 import unittest
+from datetime import date
 from pathlib import Path
 from queue import Queue
 from types import SimpleNamespace
@@ -25,6 +26,8 @@ from fbbatch.runner import (  # noqa: E402
     _get_outlook_mapi_namespace,
     _java_idle_timeout_seconds,
     _java_process_label,
+    _parse_historical_event_dates,
+    _prepare_historical_event_runtime,
     _redact_process_output_for_log,
     _run_java,
     _start_outlook_application,
@@ -34,12 +37,54 @@ from ui.fbbatch_view import (  # noqa: E402
     FBBatchSetupView,
     _classic_outlook_install_url,
     _discover_draft_retry_context,
+    _next_weekday,
     _retry_context_is_valid,
     _scale_phase_progress,
 )
 
 
 class EventProgressTests(unittest.TestCase):
+    def test_historical_event_dates_require_real_processing_order(self) -> None:
+        batch_day, next_day = _parse_historical_event_dates("17072026", "20072026")
+
+        self.assertEqual(batch_day, date(2026, 7, 17))
+        self.assertEqual(next_day, date(2026, 7, 20))
+        with self.assertRaisesRegex(ValueError, "must be after"):
+            _parse_historical_event_dates("20072026", "20072026")
+
+    def test_historical_event_suggests_next_weekday(self) -> None:
+        self.assertEqual(_next_weekday(date(2026, 7, 17)), date(2026, 7, 20))
+        self.assertEqual(_next_weekday(date(2026, 7, 20)), date(2026, 7, 21))
+
+    def test_historical_event_runtime_overrides_only_the_temporary_copy(self) -> None:
+        original = (
+            "OUTPUT_FILE_PATH=output/EODBatchEvent/\n"
+            "STTM_DATES_QUERY = SELECT TODAY,PREV_WORKING_DAY FROM sttm_dates\n"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "source"
+            properties = source / "config" / "EODBatchEvent" / "EODBatchEvent.properties"
+            properties.parent.mkdir(parents=True)
+            properties.write_text(original, encoding="utf-8")
+            (source / "upload" / "EODBatchEvent" / "Template").mkdir(parents=True)
+            runtime = Path(temp_dir) / "runtime"
+
+            _prepare_historical_event_runtime(
+                source,
+                runtime,
+                date(2026, 7, 17),
+                date(2026, 7, 20),
+            )
+
+            runtime_text = (
+                runtime / "config" / "EODBatchEvent" / "EODBatchEvent.properties"
+            ).read_text(encoding="utf-8")
+            self.assertEqual(properties.read_text(encoding="utf-8"), original)
+            self.assertIn("2026-07-17 00:00:00.0", runtime_text)
+            self.assertIn("2026-07-20 00:00:00.0", runtime_text)
+            self.assertIn("FROM DUAL", runtime_text)
+            self.assertTrue((runtime / "output" / "EODBatchEvent").is_dir())
+
     def test_background_worker_queues_progress_and_completion(self) -> None:
         events: Queue[tuple[str, object]] = Queue()
         result = SimpleNamespace(ok=True, message="done")
