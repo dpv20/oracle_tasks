@@ -15,6 +15,7 @@ SRC_DIR = ROOT_DIR / "src"
 sys.path.insert(0, str(SRC_DIR))
 
 from fbbatch.runner import (  # noqa: E402
+    BatchResult,
     JAVA_DEFAULT_IDLE_TIMEOUT_SECONDS,
     JAVA_EVENT_IDLE_TIMEOUT_SECONDS,
     JAVA_MAX_RUNTIME_SECONDS,
@@ -26,11 +27,15 @@ from fbbatch.runner import (  # noqa: E402
     _get_outlook_mapi_namespace,
     _java_idle_timeout_seconds,
     _java_process_label,
+    _java_reported_failure,
+    _newest_after,
     _parse_historical_event_dates,
     _prepare_historical_event_runtime,
     _redact_process_output_for_log,
     _run_java,
+    _snapshot_html_outputs,
     _start_outlook_application,
+    run_batch_report,
 )
 from ui.fbbatch_view import (  # noqa: E402
     _DraftRetryContext,
@@ -44,6 +49,57 @@ from ui.fbbatch_view import (  # noqa: E402
 
 
 class EventProgressTests(unittest.TestCase):
+    def test_output_snapshot_never_reuses_an_unchanged_html(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            stale = output_dir / "BatchReport_12-07-2026.html"
+            stale.write_text("old", encoding="utf-8")
+            snapshot = _snapshot_html_outputs(output_dir)
+
+            self.assertIsNone(_newest_after(output_dir, snapshot))
+
+            stale.write_text("new report contents", encoding="utf-8")
+            self.assertEqual(_newest_after(output_dir, snapshot), stale)
+
+    def test_java_success_exit_is_rejected_when_output_reports_db_failure(self) -> None:
+        output = (
+            "FBConnection Unable to establish a connection to the Oracle database.\n"
+            "FBEODBatchTimingApp Exception occurred during processing.\n"
+        )
+
+        message = _java_reported_failure(output)
+
+        self.assertIn("could not connect", message)
+
+    def test_batch_report_does_not_reuse_stale_html_when_java_writes_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            output_dir = root / "CommonBatches" / "output" / "EODBATCH"
+            output_dir.mkdir(parents=True)
+            stale = output_dir / "BatchReport_12-07-2026.html"
+            stale.write_text("old", encoding="utf-8")
+            with (
+                patch(
+                    "fbbatch.runner.validate_fbbatch_root",
+                    return_value=(True, "", root),
+                ),
+                patch(
+                    "fbbatch.runner._run_java",
+                    return_value=BatchResult(True, "Completed.", exit_code=0),
+                ),
+            ):
+                result = run_batch_report(
+                    "PROD",
+                    False,
+                    "17072026",
+                    False,
+                    root,
+                )
+
+            self.assertFalse(result.ok)
+            self.assertIn("no new HTML output", result.message)
+            self.assertIsNone(result.html_path)
+
     def test_historical_event_dates_require_real_processing_order(self) -> None:
         batch_day, next_day = _parse_historical_event_dates("17072026", "20072026")
 
@@ -84,6 +140,63 @@ class EventProgressTests(unittest.TestCase):
             self.assertIn("2026-07-20 00:00:00.0", runtime_text)
             self.assertIn("FROM DUAL", runtime_text)
             self.assertTrue((runtime / "output" / "EODBatchEvent").is_dir())
+
+    def test_manual_full_report_generates_missing_historical_event(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            report_html = output_dir / "BatchReport_17-07-2026.html"
+            report_html.write_text("<html>regular batch</html>", encoding="utf-8")
+            report_image = output_dir / "summary.png"
+            report_image.write_bytes(b"image")
+            event_pdf = output_dir / "EODBatchEvent_17-07-2026.pdf"
+            event_pdf.write_bytes(b"pdf")
+            report_result = BatchResult(
+                True,
+                "ready",
+                html_path=report_html,
+                image_paths=[report_image],
+                images_dir=output_dir,
+                output_dir=output_dir,
+            )
+            event_result = BatchResult(
+                True,
+                "ready",
+                pdf_path=event_pdf,
+                output_dir=output_dir,
+            )
+            view = SimpleNamespace(_draft_retry_context=None)
+            updates: list[tuple[int, str]] = []
+
+            with (
+                patch("ui.fbbatch_view.run_batch_report", return_value=report_result),
+                patch("ui.fbbatch_view.find_event_pdf_for_report_date", return_value=None),
+                patch("ui.fbbatch_view.run_eod_batch_event", return_value=event_result) as run_event,
+                patch("ui.fbbatch_view.create_outlook_draft") as create_draft,
+            ):
+                result = FBBatchSetupView._run_full_report(
+                    view,
+                    env="PROD",
+                    latest=False,
+                    report_date="17072026",
+                    event_next_date="20072026",
+                    has_issue=False,
+                    root="FBBatchSetup",
+                    subject_template="NSSR: {DAY}",
+                    from_account="sender@example.com",
+                    to="to@example.com",
+                    cc="cc@example.com",
+                    body_template="Body {DAY}",
+                    mail_method="classic",
+                    credentials={},
+                    progress=lambda percent, message: updates.append((percent, message)),
+                )
+
+            self.assertTrue(result.ok)
+            self.assertEqual(run_event.call_args.kwargs["latest"], False)
+            self.assertEqual(run_event.call_args.kwargs["event_date"], "17072026")
+            self.assertEqual(run_event.call_args.kwargs["next_date"], "20072026")
+            self.assertEqual(create_draft.call_args.kwargs["attachments"], [event_pdf])
+            self.assertEqual(create_draft.call_args.kwargs["inline_images"], [report_image])
 
     def test_background_worker_queues_progress_and_completion(self) -> None:
         events: Queue[tuple[str, object]] = Queue()

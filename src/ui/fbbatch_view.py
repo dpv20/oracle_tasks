@@ -278,8 +278,29 @@ class FBBatchSetupView(ctk.CTkFrame):
         IconButton(inner, text=t("fbbatch.full.run"), width=180, command=self._on_generate_full_report).grid(
             row=2, column=4, sticky="e", padx=8, pady=4
         )
+        self._full_next_date = _next_weekday(self._full_selected_date)
+        self.full_next_date_label = ctk.CTkLabel(
+            inner,
+            text=t("fbbatch.event.next_date"),
+            anchor="w",
+        )
+        self.full_next_date_label.grid(row=3, column=2, sticky="w", padx=8, pady=4)
+        self.full_next_date_frame = ctk.CTkFrame(inner, fg_color="transparent")
+        self.full_next_date_frame.grid(row=3, column=3, sticky="ew", padx=8, pady=4)
+        self.full_next_date_frame.grid_columnconfigure(0, weight=1)
+        self.full_next_date = ctk.CTkEntry(self.full_next_date_frame)
+        self.full_next_date.insert(0, _format_issue_date(self._full_next_date))
+        self.full_next_date.configure(state="disabled")
+        self.full_next_date.grid(row=0, column=0, sticky="ew")
+        self.full_next_calendar_btn = ctk.CTkButton(
+            self.full_next_date_frame,
+            text=t("fbbatch.calendar"),
+            width=105,
+            command=self._open_full_next_calendar,
+        )
+        self.full_next_calendar_btn.grid(row=0, column=1, padx=(8, 0))
         mail_row = ctk.CTkFrame(inner, fg_color="transparent")
-        mail_row.grid(row=3, column=0, columnspan=5, sticky="ew", pady=(14, 0))
+        mail_row.grid(row=4, column=0, columnspan=5, sticky="ew", pady=(14, 0))
         mail_row.grid_columnconfigure(0, weight=1)
         self.mail_summary = ctk.CTkLabel(
             mail_row,
@@ -740,26 +761,50 @@ class FBBatchSetupView(ctk.CTkFrame):
 
     def _set_full_date(self, value: date) -> None:
         self._full_selected_date = value
+        self._full_next_date = _next_weekday(value)
         self.full_date.configure(state="normal")
         self.full_date.delete(0, "end")
         self.full_date.insert(0, _format_issue_date(value))
         self.full_date.configure(state="disabled")
+        self._refresh_full_next_date_entry()
         self._refresh_mail_summary()
+
+    def _open_full_next_calendar(self) -> None:
+        CalendarDialog(self, selected=self._full_next_date, on_pick=self._set_full_next_date)
+
+    def _set_full_next_date(self, value: date) -> None:
+        self._full_next_date = value
+        self._refresh_full_next_date_entry()
+
+    def _refresh_full_next_date_entry(self) -> None:
+        self.full_next_date.configure(state="normal")
+        self.full_next_date.delete(0, "end")
+        self.full_next_date.insert(0, _format_issue_date(self._full_next_date))
+        self.full_next_date.configure(state="disabled")
 
     def _sync_full_date_state(self) -> None:
         if self.full_latest_var.get():
             self._full_selected_date = date.today() - timedelta(days=1)
+            self._full_next_date = _next_weekday(self._full_selected_date)
             self.full_date.configure(state="normal")
             self.full_date.delete(0, "end")
             self.full_date.insert(0, _format_issue_date(self._full_selected_date))
             self.full_date.configure(state="disabled")
             self.full_calendar_btn.configure(state="disabled")
+            self.full_next_date_label.grid_remove()
+            self.full_next_date_frame.grid_remove()
         else:
             self.full_calendar_btn.configure(state="normal")
+            self.full_next_date_label.grid()
+            self.full_next_date_frame.grid()
+        self._refresh_full_next_date_entry()
         self._refresh_mail_summary()
 
     def _current_full_report_date(self) -> str:
         return self._full_selected_date.strftime("%d%m%Y")
+
+    def _current_full_next_date(self) -> str:
+        return self._full_next_date.strftime("%d%m%Y")
 
     def _open_event_calendar(self) -> None:
         CalendarDialog(self, selected=self._event_selected_date, on_pick=self._set_event_date)
@@ -885,11 +930,20 @@ class FBBatchSetupView(ctk.CTkFrame):
         mail_method, from_account = selected_mail
 
         latest = bool(self.full_latest_var.get())
+        event_next_date = self._current_full_next_date()
+        if not latest and self._full_next_date <= self._full_selected_date:
+            messagebox.showerror(
+                t("common.error"),
+                t("fbbatch.event.invalid_order"),
+                parent=self,
+            )
+            return
         log.info(
-            "night_shift: generate requested env=%s report_date=%s latest=%s has_issue=%s "
+            "night_shift: generate requested env=%s report_date=%s event_next_date=%s latest=%s has_issue=%s "
             "root=%s from_configured=%s to_chars=%s cc_chars=%s",
             env,
             report_date,
+            event_next_date,
             latest,
             bool(issues),
             root,
@@ -907,6 +961,7 @@ class FBBatchSetupView(ctk.CTkFrame):
                 env=env,
                 latest=latest,
                 report_date=report_date,
+                event_next_date=event_next_date,
                 has_issue=bool(issues),
                 root=root,
                 subject_template=subject_template,
@@ -1037,6 +1092,7 @@ class FBBatchSetupView(ctk.CTkFrame):
         env: str,
         latest: bool,
         report_date: str,
+        event_next_date: str,
         has_issue: bool,
         root: str,
         subject_template: str,
@@ -1119,12 +1175,36 @@ class FBBatchSetupView(ctk.CTkFrame):
             else:
                 event_pdf = find_event_pdf_for_report_date(report_date)
                 if event_pdf is None:
-                    issue_date = report_date_to_issue_date(report_date)
-                    return BatchResult(
-                        False,
-                        f"No Event PDF found for {issue_date}. The Event process only generates the latest event, so this flow will not attach a PDF from another date.",
+                    progress(50, "Event: Starting historical EOD Batch Event")
+                    event_result = run_eod_batch_event(
+                        env,
+                        root,
+                        lambda percent, message: progress(
+                            _scale_phase_progress(percent, 50, 90), f"Event: {message}"
+                        ),
+                        credentials=credentials,
+                        latest=False,
+                        event_date=report_date,
+                        next_date=event_next_date,
                     )
-                progress(90, f"Using existing Event PDF: {event_pdf.name}")
+                    log.info(
+                        "night_shift: historical event completed ok=%s message=%r pdf=%s "
+                        "output_dir=%s event_date=%s next_date=%s",
+                        event_result.ok,
+                        event_result.message,
+                        event_result.pdf_path,
+                        event_result.output_dir,
+                        report_date,
+                        event_next_date,
+                    )
+                    if not event_result.ok:
+                        return event_result
+                    event_pdf = event_result.pdf_path
+                    if not event_pdf or not event_pdf.exists():
+                        return BatchResult(False, "Historical Event PDF was not created.")
+                    progress(90, t("fbbatch.event.pdf_ready"))
+                else:
+                    progress(90, f"Using existing Event PDF: {event_pdf.name}")
         else:
             if not chile_batch_skipped:
                 progress(90, t("fbbatch.mail.event_skipped"))

@@ -415,7 +415,7 @@ def _execute_eod_batch_event(
 ) -> BatchResult:
     output_dir = root / "output" / "EODBatchEvent"
     output_dir.mkdir(parents=True, exist_ok=True)
-    before = _latest_html(output_dir)
+    before = _snapshot_html_outputs(output_dir)
     _emit_progress(progress, 2, "Starting EOD Batch Event")
     result = _run_java(
         root,
@@ -519,7 +519,7 @@ def run_batch_report(
         root = base_root / "CommonBatches"
         output_dir = root / "output" / "EODBATCH"
         output_dir.mkdir(parents=True, exist_ok=True)
-        before = _latest_html(output_dir)
+        before = _snapshot_html_outputs(output_dir)
         _emit_progress(progress, 1, "Starting EOD Batch Report")
         latest_answer = "Y" if latest else "N"
         issue_answer = "Y" if has_issue else "N"
@@ -537,6 +537,22 @@ def run_batch_report(
             progress_kind="report_issue" if has_issue else "report_no_issue",
         )
         html_path = _newest_after(output_dir, before)
+        if result.ok and not latest:
+            from datetime import datetime
+
+            expected_token = datetime.strptime(report_date, "%d%m%Y").strftime("%d-%m-%Y")
+            if html_path is None or expected_token not in html_path.stem:
+                actual = html_path.name if html_path else "no new HTML output"
+                log.error(
+                    "fbbatch_report: historical output date mismatch expected=%s actual=%s",
+                    expected_token,
+                    actual,
+                )
+                return BatchResult(
+                    False,
+                    f"Batch Report expected {expected_token}, but Java produced {actual}.",
+                    exit_code=result.exit_code,
+                )
         return _with_report_images(result, html_path, "report", "BatchReport", progress)
     except (OSError, ValueError) as exc:
         return BatchResult(False, str(exc))
@@ -1686,7 +1702,8 @@ def _run_java(
         return BatchResult(False, f"Could not start Java: {exc}")
 
     combined_output = "".join(lines)
-    ok = exit_code == 0
+    reported_failure = _java_reported_failure(combined_output)
+    ok = exit_code == 0 and not reported_failure
     elapsed = time.monotonic() - started
     if ok:
         _emit_progress(progress, 90, "Java process completed")
@@ -1699,8 +1716,26 @@ def _run_java(
             elapsed,
             _redact_process_output_for_log(_safe_tail(combined_output)),
         )
-    message = "Completed." if ok else _safe_tail(combined_output)
+    message = "Completed." if ok else (reported_failure or _safe_tail(combined_output))
     return BatchResult(ok, message, exit_code=exit_code)
+
+
+def _java_reported_failure(output: str) -> str:
+    lowered = output.lower()
+    failure_markers = (
+        (
+            "unable to establish a connection to the oracle database",
+            "Java could not connect to one of the required Oracle databases. Check the VPN and database configuration.",
+        ),
+        (
+            "exception occurred during processing",
+            "Java reported an exception while processing the report. Check the application log for details.",
+        ),
+    )
+    for marker, message in failure_markers:
+        if marker in lowered:
+            return message
+    return ""
 
 
 def _java_process_label(progress_kind: str) -> str:
@@ -2452,22 +2487,33 @@ def _find_browser() -> Path | None:
     return next((p for p in candidates if p.exists()), None)
 
 
-def _latest_html(output_dir: Path) -> Path | None:
+def _snapshot_html_outputs(output_dir: Path) -> dict[Path, tuple[int, int]]:
     if not output_dir.exists():
-        return None
-    files = list(output_dir.glob("*.html"))
-    return max(files, key=lambda p: p.stat().st_mtime, default=None)
+        return {}
+    snapshot: dict[Path, tuple[int, int]] = {}
+    for path in output_dir.glob("*.html"):
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        snapshot[path.resolve()] = (stat.st_mtime_ns, stat.st_size)
+    return snapshot
 
 
-def _newest_after(output_dir: Path, before: Path | None) -> Path | None:
-    latest = _latest_html(output_dir)
-    if latest is None:
-        return None
-    if before is None:
-        return latest
-    if latest == before and latest.stat().st_mtime <= before.stat().st_mtime:
-        return latest
-    return latest
+def _newest_after(
+    output_dir: Path,
+    before: dict[Path, tuple[int, int]],
+) -> Path | None:
+    changed: list[Path] = []
+    for path in output_dir.glob("*.html"):
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        previous = before.get(path.resolve())
+        if previous != (stat.st_mtime_ns, stat.st_size):
+            changed.append(path)
+    return max(changed, key=lambda path: path.stat().st_mtime_ns, default=None)
 
 
 def _safe_tail(text: str) -> str:
