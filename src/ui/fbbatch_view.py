@@ -278,29 +278,8 @@ class FBBatchSetupView(ctk.CTkFrame):
         IconButton(inner, text=t("fbbatch.full.run"), width=180, command=self._on_generate_full_report).grid(
             row=2, column=4, sticky="e", padx=8, pady=4
         )
-        self._full_next_date = _next_weekday(self._full_selected_date)
-        self.full_next_date_label = ctk.CTkLabel(
-            inner,
-            text=t("fbbatch.event.next_date"),
-            anchor="w",
-        )
-        self.full_next_date_label.grid(row=3, column=2, sticky="w", padx=8, pady=4)
-        self.full_next_date_frame = ctk.CTkFrame(inner, fg_color="transparent")
-        self.full_next_date_frame.grid(row=3, column=3, sticky="ew", padx=8, pady=4)
-        self.full_next_date_frame.grid_columnconfigure(0, weight=1)
-        self.full_next_date = ctk.CTkEntry(self.full_next_date_frame)
-        self.full_next_date.insert(0, _format_issue_date(self._full_next_date))
-        self.full_next_date.configure(state="disabled")
-        self.full_next_date.grid(row=0, column=0, sticky="ew")
-        self.full_next_calendar_btn = ctk.CTkButton(
-            self.full_next_date_frame,
-            text=t("fbbatch.calendar"),
-            width=105,
-            command=self._open_full_next_calendar,
-        )
-        self.full_next_calendar_btn.grid(row=0, column=1, padx=(8, 0))
         mail_row = ctk.CTkFrame(inner, fg_color="transparent")
-        mail_row.grid(row=4, column=0, columnspan=5, sticky="ew", pady=(14, 0))
+        mail_row.grid(row=3, column=0, columnspan=5, sticky="ew", pady=(14, 0))
         mail_row.grid_columnconfigure(0, weight=1)
         self.mail_summary = ctk.CTkLabel(
             mail_row,
@@ -412,7 +391,6 @@ class FBBatchSetupView(ctk.CTkFrame):
         ).grid(row=2, column=4, sticky="e", padx=8, pady=4)
 
         self._event_selected_date = date.today() - timedelta(days=1)
-        self._event_next_date = date.today()
         self.event_date_label = ctk.CTkLabel(
             inner,
             text=t("fbbatch.event.batch_date"),
@@ -435,31 +413,9 @@ class FBBatchSetupView(ctk.CTkFrame):
         )
         self.event_calendar_btn.grid(row=0, column=1, padx=(8, 0))
 
-        self.event_next_date_label = ctk.CTkLabel(
-            inner,
-            text=t("fbbatch.event.next_date"),
-            width=120,
-            anchor="w",
-        )
-        self.event_next_date_label.grid(row=4, column=0, sticky="w", pady=4)
-        self.event_next_date_frame = ctk.CTkFrame(inner, fg_color="transparent")
-        self.event_next_date_frame.grid(row=4, column=1, columnspan=3, sticky="ew", padx=8, pady=4)
-        self.event_next_date_frame.grid_columnconfigure(0, weight=1)
-        self.event_next_date = ctk.CTkEntry(self.event_next_date_frame)
-        self.event_next_date.insert(0, _format_issue_date(self._event_next_date))
-        self.event_next_date.configure(state="disabled")
-        self.event_next_date.grid(row=0, column=0, sticky="ew")
-        self.event_next_calendar_btn = ctk.CTkButton(
-            self.event_next_date_frame,
-            text=t("fbbatch.calendar"),
-            width=105,
-            command=self._open_event_next_calendar,
-        )
-        self.event_next_calendar_btn.grid(row=0, column=1, padx=(8, 0))
-
         self.event_progress_bar = ctk.CTkProgressBar(inner)
         self.event_progress_bar.set(0)
-        self.event_progress_bar.grid(row=5, column=0, columnspan=5, sticky="ew", pady=(12, 2))
+        self.event_progress_bar.grid(row=4, column=0, columnspan=5, sticky="ew", pady=(12, 2))
         self.event_progress_label = ctk.CTkLabel(
             inner,
             text="",
@@ -468,9 +424,9 @@ class FBBatchSetupView(ctk.CTkFrame):
             text_color=("gray40", "gray65"),
             font=ctk.CTkFont(size=11),
         )
-        self.event_progress_label.grid(row=6, column=0, columnspan=5, sticky="ew")
+        self.event_progress_label.grid(row=5, column=0, columnspan=5, sticky="ew")
         self.event_output_row = ctk.CTkFrame(inner, fg_color="transparent")
-        self.event_output_row.grid(row=7, column=0, columnspan=5, sticky="e", pady=(10, 0))
+        self.event_output_row.grid(row=6, column=0, columnspan=5, sticky="e", pady=(10, 0))
         self.event_open_location_btn = ctk.CTkButton(
             self.event_output_row,
             text=t("fbbatch.open_location"),
@@ -761,82 +717,41 @@ class FBBatchSetupView(ctk.CTkFrame):
 
     def _set_full_date(self, value: date) -> None:
         self._full_selected_date = value
-        self._full_next_date = _next_weekday(value)
         self.full_date.configure(state="normal")
         self.full_date.delete(0, "end")
         self.full_date.insert(0, _format_issue_date(value))
         self.full_date.configure(state="disabled")
-        self._refresh_full_next_date_entry()
         self._refresh_mail_summary()
-
-    def _open_full_next_calendar(self) -> None:
-        CalendarDialog(self, selected=self._full_next_date, on_pick=self._set_full_next_date)
-
-    def _set_full_next_date(self, value: date) -> None:
-        self._full_next_date = value
-        self._refresh_full_next_date_entry()
-
-    def _refresh_full_next_date_entry(self) -> None:
-        self.full_next_date.configure(state="normal")
-        self.full_next_date.delete(0, "end")
-        self.full_next_date.insert(0, _format_issue_date(self._full_next_date))
-        self.full_next_date.configure(state="disabled")
 
     def _sync_full_date_state(self) -> None:
         if self.full_latest_var.get():
             self._full_selected_date = date.today() - timedelta(days=1)
-            self._full_next_date = _next_weekday(self._full_selected_date)
             self.full_date.configure(state="normal")
             self.full_date.delete(0, "end")
             self.full_date.insert(0, _format_issue_date(self._full_selected_date))
             self.full_date.configure(state="disabled")
             self.full_calendar_btn.configure(state="disabled")
-            self.full_next_date_label.grid_remove()
-            self.full_next_date_frame.grid_remove()
         else:
             self.full_calendar_btn.configure(state="normal")
-            self.full_next_date_label.grid()
-            self.full_next_date_frame.grid()
-        self._refresh_full_next_date_entry()
         self._refresh_mail_summary()
 
     def _current_full_report_date(self) -> str:
         return self._full_selected_date.strftime("%d%m%Y")
-
-    def _current_full_next_date(self) -> str:
-        return self._full_next_date.strftime("%d%m%Y")
 
     def _open_event_calendar(self) -> None:
         CalendarDialog(self, selected=self._event_selected_date, on_pick=self._set_event_date)
 
     def _set_event_date(self, value: date) -> None:
         self._event_selected_date = value
-        self._event_next_date = _next_weekday(value)
-        self._refresh_event_date_entries()
-
-    def _open_event_next_calendar(self) -> None:
-        CalendarDialog(self, selected=self._event_next_date, on_pick=self._set_event_next_date)
-
-    def _set_event_next_date(self, value: date) -> None:
-        self._event_next_date = value
-        self._refresh_event_date_entries()
-
-    def _refresh_event_date_entries(self) -> None:
-        for entry, value in (
-            (self.event_date, self._event_selected_date),
-            (self.event_next_date, self._event_next_date),
-        ):
-            entry.configure(state="normal")
-            entry.delete(0, "end")
-            entry.insert(0, _format_issue_date(value))
-            entry.configure(state="disabled")
+        self.event_date.configure(state="normal")
+        self.event_date.delete(0, "end")
+        self.event_date.insert(0, _format_issue_date(value))
+        self.event_date.configure(state="disabled")
 
     def _sync_event_date_state(self) -> None:
         historical_widgets = (
             self.event_date_label,
             self.event_date_frame,
-            self.event_next_date_label,
-            self.event_next_date_frame,
         )
         if self.event_latest_var.get():
             for widget in historical_widgets:
@@ -848,7 +763,7 @@ class FBBatchSetupView(ctk.CTkFrame):
     def _current_event_dates(self) -> tuple[str, str]:
         return (
             self._event_selected_date.strftime("%d%m%Y"),
-            self._event_next_date.strftime("%d%m%Y"),
+            _next_weekday(self._event_selected_date).strftime("%d%m%Y"),
         )
 
     def _open_report_calendar(self) -> None:
@@ -930,20 +845,11 @@ class FBBatchSetupView(ctk.CTkFrame):
         mail_method, from_account = selected_mail
 
         latest = bool(self.full_latest_var.get())
-        event_next_date = self._current_full_next_date()
-        if not latest and self._full_next_date <= self._full_selected_date:
-            messagebox.showerror(
-                t("common.error"),
-                t("fbbatch.event.invalid_order"),
-                parent=self,
-            )
-            return
         log.info(
-            "night_shift: generate requested env=%s report_date=%s event_next_date=%s latest=%s has_issue=%s "
+            "night_shift: generate requested env=%s report_date=%s latest=%s has_issue=%s "
             "root=%s from_configured=%s to_chars=%s cc_chars=%s",
             env,
             report_date,
-            event_next_date,
             latest,
             bool(issues),
             root,
@@ -961,7 +867,6 @@ class FBBatchSetupView(ctk.CTkFrame):
                 env=env,
                 latest=latest,
                 report_date=report_date,
-                event_next_date=event_next_date,
                 has_issue=bool(issues),
                 root=root,
                 subject_template=subject_template,
@@ -1092,7 +997,6 @@ class FBBatchSetupView(ctk.CTkFrame):
         env: str,
         latest: bool,
         report_date: str,
-        event_next_date: str,
         has_issue: bool,
         root: str,
         subject_template: str,
@@ -1105,17 +1009,19 @@ class FBBatchSetupView(ctk.CTkFrame):
         progress,
     ) -> BatchResult:
         report_day = datetime.strptime(report_date, "%d%m%Y").date()
+        event_next_date = _next_weekday(report_day).strftime("%d%m%Y")
         include_event = report_day.weekday() not in (5, 6)
         event_pdf: Path | None = None
         log.info(
             "night_shift: workflow started env=%s report_date=%s latest=%s has_issue=%s "
-            "weekday=%s include_event_initial=%s",
+            "weekday=%s include_event_initial=%s event_next_date_auto=%s",
             env,
             report_date,
             latest,
             has_issue,
             report_day.weekday(),
             include_event,
+            event_next_date,
         )
 
         report_result = run_batch_report(
@@ -1275,13 +1181,6 @@ class FBBatchSetupView(ctk.CTkFrame):
             return
         latest = bool(self.event_latest_var.get())
         event_date, next_date = self._current_event_dates()
-        if not latest and self._event_next_date <= self._event_selected_date:
-            messagebox.showerror(
-                t("common.error"),
-                t("fbbatch.event.invalid_order"),
-                parent=self,
-            )
-            return
         root = self._ensure_fbbatch_root()
         if root is None:
             return

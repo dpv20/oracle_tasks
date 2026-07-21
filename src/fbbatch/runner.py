@@ -459,6 +459,15 @@ def _parse_historical_event_dates(event_date: str, next_date: str) -> tuple[date
     return batch_day, next_processing_day
 
 
+def _read_text_preserving_encoding(path: Path) -> tuple[str, str]:
+    raw = path.read_bytes()
+    try:
+        return raw.decode("utf-8"), "utf-8"
+    except UnicodeDecodeError:
+        log.info("fbbatch_event: reading legacy Windows-1252 properties path=%s", path)
+        return raw.decode("cp1252"), "cp1252"
+
+
 def _prepare_historical_event_runtime(
     source_root: Path,
     runtime_root: Path,
@@ -471,13 +480,14 @@ def _prepare_historical_event_runtime(
     (runtime_root / "log" / "EODBatchEvent").mkdir(parents=True, exist_ok=True)
 
     properties_path = runtime_root / "config" / "EODBatchEvent" / "EODBatchEvent.properties"
-    properties = properties_path.read_text(encoding="utf-8")
+    properties, properties_encoding = _read_text_preserving_encoding(properties_path)
+    # The legacy Java parser expects the exact text pattern
+    # ``yyyy-MM-dd HH:mm:ss.S``. Returning Oracle TIMESTAMP values is not
+    # sufficient because ResultSet.getString() may omit the trailing ``.0``.
     query = (
         "SELECT "
-        f"TO_TIMESTAMP('{next_processing_day:%Y-%m-%d} 00:00:00.0', "
-        "'YYYY-MM-DD HH24:MI:SS.FF') AS TODAY, "
-        f"TO_TIMESTAMP('{batch_day:%Y-%m-%d} 00:00:00.0', "
-        "'YYYY-MM-DD HH24:MI:SS.FF') AS PREV_WORKING_DAY FROM DUAL"
+        f"'{next_processing_day:%Y-%m-%d} 00:00:00.0' AS TODAY, "
+        f"'{batch_day:%Y-%m-%d} 00:00:00.0' AS PREV_WORKING_DAY FROM DUAL"
     )
     updated, count = re.subn(
         r"(?m)^\s*STTM_DATES_QUERY\s*=.*$",
@@ -487,7 +497,7 @@ def _prepare_historical_event_runtime(
     )
     if count != 1:
         raise ValueError("EODBatchEvent.properties does not contain STTM_DATES_QUERY.")
-    properties_path.write_text(updated, encoding="utf-8")
+    properties_path.write_text(updated, encoding=properties_encoding)
     log.info(
         "fbbatch_event: prepared historical runtime batch_date=%s next_processing_date=%s root=%s",
         batch_day.isoformat(),
@@ -1722,6 +1732,11 @@ def _run_java(
 
 def _java_reported_failure(output: str) -> str:
     lowered = output.lower()
+    if "could not be parsed at index 19" in lowered:
+        return (
+            "EOD Batch Event received an incompatible processing-date format. "
+            "Update Oracle Tasks and retry the historical report."
+        )
     failure_markers = (
         (
             "unable to establish a connection to the oracle database",

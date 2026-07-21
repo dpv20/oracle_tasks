@@ -112,8 +112,17 @@ class EventProgressTests(unittest.TestCase):
         self.assertEqual(_next_weekday(date(2026, 7, 17)), date(2026, 7, 20))
         self.assertEqual(_next_weekday(date(2026, 7, 20)), date(2026, 7, 21))
 
+    def test_standalone_historical_event_uses_automatic_next_weekday(self) -> None:
+        view = SimpleNamespace(_event_selected_date=date(2026, 7, 17))
+
+        self.assertEqual(
+            FBBatchSetupView._current_event_dates(view),
+            ("17072026", "20072026"),
+        )
+
     def test_historical_event_runtime_overrides_only_the_temporary_copy(self) -> None:
         original = (
+            "EVENT_NAMES=CUENTAS CASA QUE GENERAN LIQUIDACIÓN\n"
             "OUTPUT_FILE_PATH=output/EODBatchEvent/\n"
             "STTM_DATES_QUERY = SELECT TODAY,PREV_WORKING_DAY FROM sttm_dates\n"
         )
@@ -121,7 +130,7 @@ class EventProgressTests(unittest.TestCase):
             source = Path(temp_dir) / "source"
             properties = source / "config" / "EODBatchEvent" / "EODBatchEvent.properties"
             properties.parent.mkdir(parents=True)
-            properties.write_text(original, encoding="utf-8")
+            properties.write_bytes(original.encode("cp1252"))
             (source / "upload" / "EODBatchEvent" / "Template").mkdir(parents=True)
             runtime = Path(temp_dir) / "runtime"
 
@@ -134,10 +143,17 @@ class EventProgressTests(unittest.TestCase):
 
             runtime_text = (
                 runtime / "config" / "EODBatchEvent" / "EODBatchEvent.properties"
-            ).read_text(encoding="utf-8")
-            self.assertEqual(properties.read_text(encoding="utf-8"), original)
+            ).read_text(encoding="cp1252")
+            self.assertEqual(properties.read_text(encoding="cp1252"), original)
+            self.assertIn("LIQUIDACIÓN", runtime_text)
             self.assertIn("2026-07-17 00:00:00.0", runtime_text)
             self.assertIn("2026-07-20 00:00:00.0", runtime_text)
+            self.assertNotIn("TO_TIMESTAMP", runtime_text)
+            self.assertIn(
+                "SELECT '2026-07-20 00:00:00.0' AS TODAY, "
+                "'2026-07-17 00:00:00.0' AS PREV_WORKING_DAY FROM DUAL",
+                runtime_text,
+            )
             self.assertIn("FROM DUAL", runtime_text)
             self.assertTrue((runtime / "output" / "EODBatchEvent").is_dir())
 
@@ -178,7 +194,6 @@ class EventProgressTests(unittest.TestCase):
                     env="PROD",
                     latest=False,
                     report_date="17072026",
-                    event_next_date="20072026",
                     has_issue=False,
                     root="FBBatchSetup",
                     subject_template="NSSR: {DAY}",
