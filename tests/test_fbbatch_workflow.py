@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from queue import Queue
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -30,6 +31,7 @@ from fbbatch.runner import (  # noqa: E402
 )
 from ui.fbbatch_view import (  # noqa: E402
     _DraftRetryContext,
+    FBBatchSetupView,
     _classic_outlook_install_url,
     _discover_draft_retry_context,
     _retry_context_is_valid,
@@ -38,6 +40,74 @@ from ui.fbbatch_view import (  # noqa: E402
 
 
 class EventProgressTests(unittest.TestCase):
+    def test_background_worker_queues_progress_and_completion(self) -> None:
+        events: Queue[tuple[str, object]] = Queue()
+        result = SimpleNamespace(ok=True, message="done")
+
+        FBBatchSetupView._worker(
+            lambda progress: (progress(40, "Report: 4/10"), result)[1],
+            events,
+        )
+
+        self.assertEqual(events.get_nowait(), ("progress", (40, "Report: 4/10")))
+        self.assertEqual(events.get_nowait(), ("finish", result))
+
+    def test_background_worker_queues_failure_completion(self) -> None:
+        events: Queue[tuple[str, object]] = Queue()
+
+        with patch("ui.fbbatch_view.log.exception"):
+            FBBatchSetupView._worker(
+                lambda _progress: (_ for _ in ()).throw(RuntimeError("failed")),
+                events,
+            )
+
+        event_type, result = events.get_nowait()
+        self.assertEqual(event_type, "finish")
+        self.assertFalse(result.ok)
+        self.assertEqual(result.message, "failed")
+
+    def test_background_events_are_applied_by_ui_poller(self) -> None:
+        events: Queue[tuple[str, object]] = Queue()
+        result = SimpleNamespace(ok=True, message="done")
+        events.put(("progress", (40, "Report: 4/10")))
+        events.put(("progress", (100, "Ready")))
+        events.put(("finish", result))
+        view = SimpleNamespace(
+            _worker_events=events,
+            _set_progress=Mock(),
+            _finish=Mock(),
+            after=Mock(),
+        )
+
+        FBBatchSetupView._poll_worker_events(view, events)
+
+        self.assertEqual(
+            view._set_progress.call_args_list,
+            [
+                unittest.mock.call(40, "Report: 4/10"),
+                unittest.mock.call(100, "Ready"),
+            ],
+        )
+        view._finish.assert_called_once_with(result)
+        view.after.assert_not_called()
+        self.assertIsNone(view._worker_events)
+
+    def test_graph_settings_button_only_shows_for_graph_method(self) -> None:
+        view = SimpleNamespace(
+            _current_mail_method=Mock(return_value="new"),
+            graph_settings_btn=Mock(),
+        )
+
+        FBBatchSetupView._sync_mail_method_actions(view)
+        view.graph_settings_btn.grid_remove.assert_called_once_with()
+        view.graph_settings_btn.grid.assert_not_called()
+
+        view.graph_settings_btn.reset_mock()
+        view._current_mail_method.return_value = "graph"
+        FBBatchSetupView._sync_mail_method_actions(view)
+        view.graph_settings_btn.grid.assert_called_once_with()
+        view.graph_settings_btn.grid_remove.assert_not_called()
+
     def test_classic_outlook_install_page_matches_app_language(self) -> None:
         self.assertIn("/es-es/", _classic_outlook_install_url("es"))
         self.assertIn("/en-us/", _classic_outlook_install_url("en"))

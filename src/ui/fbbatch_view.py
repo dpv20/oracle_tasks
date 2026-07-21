@@ -202,6 +202,7 @@ class FBBatchSetupView(ctk.CTkFrame):
         self._event_output_dir: Path | None = None
         self._report_output_dir: Path | None = None
         self._draft_retry_context: _DraftRetryContext | None = None
+        self._worker_events: queue.Queue[tuple[str, object]] | None = None
         self._active_progress = "event"
 
         header = ctk.CTkFrame(self, fg_color="transparent")
@@ -281,12 +282,13 @@ class FBBatchSetupView(ctk.CTkFrame):
             text_color=("gray40", "gray65"),
         )
         self.mail_summary.grid(row=0, column=0, sticky="ew")
-        ctk.CTkButton(
+        self.graph_settings_btn = ctk.CTkButton(
             mail_row,
             text=t("fbbatch.graph.settings"),
             width=175,
             command=self._open_graph_settings,
-        ).grid(row=0, column=1, padx=(12, 0))
+        )
+        self.graph_settings_btn.grid(row=0, column=1, padx=(12, 0))
         IconButton(
             mail_row,
             text=t("fbbatch.mail.edit"),
@@ -313,14 +315,15 @@ class FBBatchSetupView(ctk.CTkFrame):
         )
         self.mail_method_control.set(selected_label)
         self.mail_method_control.pack(side="left", padx=(10, 0))
-        ctk.CTkButton(
-            method_row,
+        self.full_output_row = ctk.CTkFrame(inner, fg_color="transparent")
+        self.full_output_row.grid(row=7, column=0, columnspan=5, sticky="ew", pady=(10, 0))
+        self.install_classic_outlook_btn = ctk.CTkButton(
+            self.full_output_row,
             text=t("fbbatch.mail.install_classic"),
             width=175,
             command=self._open_classic_outlook_install_page,
-        ).pack(side="right")
-        self.full_output_row = ctk.CTkFrame(inner, fg_color="transparent")
-        self.full_output_row.grid(row=7, column=0, columnspan=5, sticky="e", pady=(10, 0))
+        )
+        self.install_classic_outlook_btn.pack(side="left", padx=5)
         self.full_open_location_btn = ctk.CTkButton(
             self.full_output_row,
             text=t("fbbatch.open_location"),
@@ -346,6 +349,7 @@ class FBBatchSetupView(ctk.CTkFrame):
         inner.grid_columnconfigure(1, weight=1)
         inner.grid_columnconfigure(3, weight=1)
         self._sync_full_date_state()
+        self._sync_mail_method_actions()
         self._refresh_mail_summary()
 
     def _build_event_card(self) -> None:
@@ -614,7 +618,14 @@ class FBBatchSetupView(ctk.CTkFrame):
             "night_shift: mail draft method changed method=%s",
             method,
         )
+        self._sync_mail_method_actions()
         self._refresh_mail_summary()
+
+    def _sync_mail_method_actions(self) -> None:
+        if self._current_mail_method() == "graph":
+            self.graph_settings_btn.grid()
+        else:
+            self.graph_settings_btn.grid_remove()
 
     def _selected_mail_settings(self, outlook_sender: str) -> tuple[str, str] | None:
         method = self._current_mail_method()
@@ -1177,18 +1188,56 @@ class FBBatchSetupView(ctk.CTkFrame):
         self._progress_widgets()[0].set(0)
         self._progress_widgets()[1].configure(text=t("fbbatch.progress.starting"))
         self.status_label.configure(text="")
-        threading.Thread(target=self._worker, args=(work,), daemon=True).start()
+        worker_events: queue.Queue[tuple[str, object]] = queue.Queue()
+        self._worker_events = worker_events
+        self.after(50, lambda events=worker_events: self._poll_worker_events(events))
+        threading.Thread(
+            target=self._worker,
+            args=(work, worker_events),
+            daemon=True,
+        ).start()
 
-    def _worker(self, work) -> None:
+    @staticmethod
+    def _worker(work, worker_events: queue.Queue[tuple[str, object]]) -> None:
+        def report_progress(percent: int, message: str) -> None:
+            worker_events.put(("progress", (percent, message)))
+
         try:
-            result = work(self._on_progress)
+            result = work(report_progress)
         except Exception as exc:
             log.exception("FBBatchSetup background task failed")
             result = BatchResult(False, str(exc))
-        self.after(0, lambda r=result: self._finish(r))
+        worker_events.put(("finish", result))
 
-    def _on_progress(self, percent: int, message: str) -> None:
-        self.after(0, lambda p=percent, m=message: self._set_progress(p, m))
+    def _poll_worker_events(
+        self,
+        worker_events: queue.Queue[tuple[str, object]],
+    ) -> None:
+        if worker_events is not self._worker_events:
+            return
+
+        while True:
+            try:
+                event_type, payload = worker_events.get_nowait()
+            except queue.Empty:
+                break
+
+            if event_type == "progress":
+                percent, message = payload
+                self._set_progress(int(percent), str(message))
+                continue
+
+            if event_type == "finish":
+                self._worker_events = None
+                result = payload
+                log.info(
+                    "FBBatchSetup UI received background completion ok=%s",
+                    getattr(result, "ok", False),
+                )
+                self._finish(result)
+                return
+
+        self.after(50, lambda events=worker_events: self._poll_worker_events(events))
 
     def _set_progress(self, percent: int, message: str) -> None:
         bar, label = self._progress_widgets()
