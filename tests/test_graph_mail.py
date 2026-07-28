@@ -113,6 +113,7 @@ class GraphMailTests(unittest.TestCase):
             document, items = _build_html_body("Hello\nWorld", [image])
 
         self.assertIn("Hello<br>World", document)
+        self.assertNotIn("Confidential - Oracle Restricted", document)
         self.assertEqual(len(items), 1)
         self.assertIn(f"cid:{items[0][1]}", document)
 

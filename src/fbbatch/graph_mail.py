@@ -523,7 +523,6 @@ def _build_html_body(body_text: str, images: list[Path]) -> tuple[str, list[tupl
         inline_items.append((image, content_id))
     document = (
         "<html><body>"
-        "<p>Confidential - Oracle Restricted \\Including External Recipients</p>"
         f"<div>{body_lines}</div><br>"
         + "".join(image_html)
         + "</body></html>"

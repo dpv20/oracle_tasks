@@ -945,7 +945,6 @@ def _create_classic_outlook_draft(
         body_html = "<br>".join(html.escape(line).replace(" ", "&nbsp;") for line in body_text.splitlines())
         mail.HTMLBody = (
             "<html><body>"
-            "<p>Confidential - Oracle Restricted \\Including External Recipients</p>"
             f"<div>{body_html}</div><br>"
             f"{inline_image_html}"
             + "</body></html>"

@@ -186,10 +186,7 @@ def create_new_outlook_draft(
         stage = "find-body-editor"
         body = _find_body_editor(compose_window)
 
-        message_text = (
-            "Confidential - Oracle Restricted \\Including External Recipients\r\n\r\n"
-            f"{body_text.strip()}\r\n\r\n"
-        )
+        message_text = f"{body_text.strip()}\r\n\r\n"
         stage = "fill-body"
         _fill_body(body, message_text, keyboard)
 
@@ -1056,7 +1053,13 @@ def _fill_body(body, message_text: str, keyboard) -> None:
     _set_clipboard_text(message_text)
     keyboard.send_keys("^v")
     log.info("new_outlook_draft: body paste sent chars=%s", len(message_text))
-    marker = "Confidential - Oracle Restricted"
+    marker = next(
+        (line.strip() for line in message_text.splitlines() if line.strip()),
+        "",
+    )[:80]
+    if not marker:
+        log.info("new_outlook_draft: empty body paste completed")
+        return
     deadline = time.monotonic() + 4.0
     while time.monotonic() < deadline:
         if marker.casefold() in body.window_text().casefold():
