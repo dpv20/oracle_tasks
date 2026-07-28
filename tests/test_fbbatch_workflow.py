@@ -3,7 +3,7 @@ from __future__ import annotations
 import sys
 import tempfile
 import unittest
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from queue import Queue
 from types import SimpleNamespace
@@ -19,6 +19,9 @@ from fbbatch.runner import (  # noqa: E402
     JAVA_DEFAULT_IDLE_TIMEOUT_SECONDS,
     JAVA_EVENT_IDLE_TIMEOUT_SECONDS,
     JAVA_MAX_RUNTIME_SECONDS,
+    ISSUE_KIND_BATCH,
+    ISSUE_KIND_FIELD,
+    ISSUE_KIND_OTHER,
     _JavaProgress,
     _accept_outlook_profile_dialog,
     _click_outlook_profile_ok_native,
@@ -35,6 +38,7 @@ from fbbatch.runner import (  # noqa: E402
     _run_java,
     _snapshot_html_outputs,
     _start_outlook_application,
+    issue_routing_flags,
     run_batch_report,
 )
 from ui.fbbatch_view import (  # noqa: E402
@@ -99,6 +103,79 @@ class EventProgressTests(unittest.TestCase):
             self.assertFalse(result.ok)
             self.assertIn("no new HTML output", result.message)
             self.assertIsNone(result.html_path)
+
+    def test_saved_incidents_are_routed_to_the_non_eod_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "CommonBatches" / "output" / "EODBATCH").mkdir(parents=True)
+            completed = BatchResult(True, "Completed.", exit_code=0)
+            with (
+                patch(
+                    "fbbatch.runner.validate_fbbatch_root",
+                    return_value=(True, "", root),
+                ),
+                patch("fbbatch.runner._run_java", return_value=completed) as run_java,
+                patch("fbbatch.runner._with_report_images", return_value=completed),
+            ):
+                run_batch_report(
+                    "PROD",
+                    True,
+                    "23072026",
+                    False,
+                    root,
+                    has_other_issue=True,
+                )
+
+            self.assertEqual(run_java.call_args.args[2], "PROD\nY\nN\nY\n")
+            self.assertEqual(run_java.call_args.kwargs["progress_kind"], "report_issue")
+
+    def test_batch_incident_marks_the_batch_as_having_problems(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "CommonBatches" / "output" / "EODBATCH").mkdir(parents=True)
+            completed = BatchResult(True, "Completed.", exit_code=0)
+            with (
+                patch(
+                    "fbbatch.runner.validate_fbbatch_root",
+                    return_value=(True, "", root),
+                ),
+                patch("fbbatch.runner._run_java", return_value=completed) as run_java,
+                patch("fbbatch.runner._with_report_images", return_value=completed),
+            ):
+                run_batch_report("PROD", True, "23072026", True, root)
+
+            self.assertEqual(run_java.call_args.args[2], "PROD\nY\nY\n")
+            self.assertEqual(run_java.call_args.kwargs["progress_kind"], "report_issue")
+
+    def test_issue_routing_defaults_old_records_to_other_issues(self) -> None:
+        self.assertEqual(issue_routing_flags([{"DATE": "23-JUL-26"}]), (False, True))
+        self.assertEqual(
+            issue_routing_flags(
+                [
+                    {ISSUE_KIND_FIELD: ISSUE_KIND_BATCH},
+                    {ISSUE_KIND_FIELD: ISSUE_KIND_OTHER},
+                ]
+            ),
+            (True, True),
+        )
+
+    def test_report_without_incidents_answers_no_to_both_issue_prompts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "CommonBatches" / "output" / "EODBATCH").mkdir(parents=True)
+            completed = BatchResult(True, "Completed.", exit_code=0)
+            with (
+                patch(
+                    "fbbatch.runner.validate_fbbatch_root",
+                    return_value=(True, "", root),
+                ),
+                patch("fbbatch.runner._run_java", return_value=completed) as run_java,
+                patch("fbbatch.runner._with_report_images", return_value=completed),
+            ):
+                run_batch_report("PROD", True, "23072026", False, root)
+
+            self.assertEqual(run_java.call_args.args[2], "PROD\nY\nN\nN\n")
+            self.assertEqual(run_java.call_args.kwargs["progress_kind"], "report_no_issue")
 
     def test_historical_event_dates_require_real_processing_order(self) -> None:
         batch_day, next_day = _parse_historical_event_dates("17072026", "20072026")
@@ -194,7 +271,8 @@ class EventProgressTests(unittest.TestCase):
                     env="PROD",
                     latest=False,
                     report_date="17072026",
-                    has_issue=False,
+                    has_batch_issue=False,
+                    has_other_issue=False,
                     root="FBBatchSetup",
                     subject_template="NSSR: {DAY}",
                     from_account="sender@example.com",
@@ -224,6 +302,117 @@ class EventProgressTests(unittest.TestCase):
 
         self.assertEqual(events.get_nowait(), ("progress", (40, "Report: 4/10")))
         self.assertEqual(events.get_nowait(), ("finish", result))
+
+    def test_simple_report_page_is_shown_without_building_a_second_workflow(self) -> None:
+        view = SimpleNamespace(
+            report_body=Mock(),
+            advanced_body=Mock(),
+            _report_page_labels={"Report": "report", "Advanced report": "advanced"},
+            _sync_simple_report_controls=Mock(),
+        )
+
+        FBBatchSetupView._show_report_page(view, "Report")
+
+        view.report_body.pack.assert_called_once_with(
+            fill="both",
+            expand=True,
+            padx=20,
+            pady=(0, 20),
+        )
+        view.advanced_body.pack.assert_not_called()
+        view._sync_simple_report_controls.assert_called_once_with()
+
+    def test_simple_report_generation_uses_the_selected_date(self) -> None:
+        view = SimpleNamespace(
+            _sync_full_date_state=Mock(),
+            _on_generate_full_report=Mock(),
+        )
+
+        FBBatchSetupView._on_generate_simple_report(view)
+
+        view._sync_full_date_state.assert_called_once_with()
+        view._on_generate_full_report.assert_called_once_with()
+
+    def test_showing_night_shift_refreshes_enabled_latest_dates(self) -> None:
+        view = SimpleNamespace(
+            _report_page_labels={"Report": "report", "Advanced report": "advanced"},
+            report_page_control=SimpleNamespace(get=lambda: "Advanced report"),
+            full_latest_var=SimpleNamespace(get=lambda: True),
+            latest_var=SimpleNamespace(get=lambda: True),
+            event_latest_var=SimpleNamespace(get=lambda: True),
+            _sync_full_date_state=Mock(),
+            _sync_report_date_state=Mock(),
+            _set_event_date=Mock(),
+            _sync_event_date_state=Mock(),
+            _sync_simple_report_controls=Mock(),
+        )
+
+        FBBatchSetupView.on_show(view)
+
+        view._sync_full_date_state.assert_called_once_with()
+        view._sync_report_date_state.assert_called_once_with()
+        view._set_event_date.assert_called_once_with(date.today() - timedelta(days=1))
+        view._sync_event_date_state.assert_called_once_with()
+        view._sync_simple_report_controls.assert_called_once_with()
+
+    def test_showing_night_shift_preserves_manual_dates(self) -> None:
+        view = SimpleNamespace(
+            _report_page_labels={"Report": "report", "Advanced report": "advanced"},
+            report_page_control=SimpleNamespace(get=lambda: "Advanced report"),
+            full_latest_var=SimpleNamespace(get=lambda: False),
+            latest_var=SimpleNamespace(get=lambda: False),
+            event_latest_var=SimpleNamespace(get=lambda: False),
+            _sync_full_date_state=Mock(),
+            _sync_report_date_state=Mock(),
+            _set_event_date=Mock(),
+            _sync_event_date_state=Mock(),
+            _sync_simple_report_controls=Mock(),
+        )
+
+        FBBatchSetupView.on_show(view)
+
+        view._sync_full_date_state.assert_not_called()
+        view._sync_report_date_state.assert_not_called()
+        view._set_event_date.assert_not_called()
+        view._sync_event_date_state.assert_called_once_with()
+        view._sync_simple_report_controls.assert_called_once_with()
+
+    def test_showing_simple_report_resets_its_date_to_latest(self) -> None:
+        full_latest_var = Mock()
+        full_latest_var.get.return_value = False
+        view = SimpleNamespace(
+            _report_page_labels={"Report": "report", "Advanced report": "advanced"},
+            report_page_control=SimpleNamespace(get=lambda: "Report"),
+            full_latest_var=full_latest_var,
+            latest_var=SimpleNamespace(get=lambda: False),
+            event_latest_var=SimpleNamespace(get=lambda: False),
+            _sync_full_date_state=Mock(),
+            _sync_report_date_state=Mock(),
+            _set_event_date=Mock(),
+            _sync_event_date_state=Mock(),
+            _sync_simple_report_controls=Mock(),
+        )
+
+        FBBatchSetupView.on_show(view)
+
+        full_latest_var.set.assert_called_once_with(True)
+        view._sync_full_date_state.assert_called_once_with()
+
+    def test_simple_new_issue_uses_the_full_report_date_and_type_selector(self) -> None:
+        view = SimpleNamespace(
+            _current_full_report_date=Mock(return_value="17072026"),
+            _sync_all_issue_statuses=Mock(),
+        )
+
+        with patch("ui.fbbatch_view.IssueEditDialog") as dialog:
+            FBBatchSetupView._new_simple_issue(view)
+
+        dialog.assert_called_once_with(
+            view,
+            issue_date="17-JUL-26",
+            issue_kind=ISSUE_KIND_OTHER,
+            on_saved=view._sync_all_issue_statuses,
+        )
 
     def test_background_worker_queues_failure_completion(self) -> None:
         events: Queue[tuple[str, object]] = Queue()

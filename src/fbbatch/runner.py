@@ -109,6 +109,18 @@ ISSUE_FIELDS = (
     "FURTHER_ACTION_REQUIRED",
     "PROCESS_END_TIME",
 )
+ISSUE_KIND_FIELD = "ISSUE_KIND"
+ISSUE_KIND_BATCH = "BATCH"
+ISSUE_KIND_OTHER = "OTHER"
+
+
+def normalize_issue_kind(value: object) -> str:
+    return ISSUE_KIND_BATCH if str(value or "").strip().upper() == ISSUE_KIND_BATCH else ISSUE_KIND_OTHER
+
+
+def issue_routing_flags(issues: list[dict[str, str]]) -> tuple[bool, bool]:
+    kinds = {normalize_issue_kind(issue.get(ISSUE_KIND_FIELD)) for issue in issues}
+    return ISSUE_KIND_BATCH in kinds, ISSUE_KIND_OTHER in kinds
 
 
 def resolve_fbbatch_root(configured_root: str | Path | None = None) -> Path:
@@ -511,10 +523,11 @@ def run_batch_report(
     env: str,
     latest: bool,
     report_date: str,
-    has_issue: bool,
+    has_batch_issue: bool,
     fbbatch_root: str | Path | None = None,
     progress: ProgressCallback | None = None,
     *,
+    has_other_issue: bool = False,
     credentials: dict | None = None,
 ) -> BatchResult:
     ok, msg, base_root = validate_fbbatch_root(fbbatch_root)
@@ -532,19 +545,26 @@ def run_batch_report(
         before = _snapshot_html_outputs(output_dir)
         _emit_progress(progress, 1, "Starting EOD Batch Report")
         latest_answer = "Y" if latest else "N"
-        issue_answer = "Y" if has_issue else "N"
+        batch_issue_answer = "Y" if has_batch_issue else "N"
+        other_issue_answer = "Y" if has_other_issue else "N"
         lines = [env, latest_answer]
         if not latest:
             lines.append(report_date)
-        lines.append(issue_answer)
-        if not has_issue:
-            lines.append("N")
+        lines.append(batch_issue_answer)
+        if not has_batch_issue:
+            lines.append(other_issue_answer)
+        log.info(
+            "fbbatch_report: issue routing batch_issue=%s other_issue=%s other_prompt_sent=%s",
+            batch_issue_answer,
+            other_issue_answer,
+            not has_batch_issue,
+        )
         result = _run_java(
             root,
             "com.fellabela.custom.common.eodbatch.FBEODBatchTimingApp",
             "\n".join(lines) + "\n",
             progress=progress,
-            progress_kind="report_issue" if has_issue else "report_no_issue",
+            progress_kind="report_issue" if has_batch_issue or has_other_issue else "report_no_issue",
         )
         html_path = _newest_after(output_dir, before)
         if result.ok and not latest:
@@ -603,7 +623,9 @@ def load_saved_issues() -> list[dict[str, str]]:
         if isinstance(item, dict) and isinstance(item.get("name"), str):
             issue = item.get("issue")
             if isinstance(issue, dict):
-                out.append({"name": item["name"], "issue": {k: str(v) for k, v in issue.items()}})
+                normalized = {k: str(v) for k, v in issue.items()}
+                normalized[ISSUE_KIND_FIELD] = normalize_issue_kind(normalized.get(ISSUE_KIND_FIELD))
+                out.append({"name": item["name"], "issue": normalized})
     return out
 
 
@@ -613,7 +635,9 @@ def save_issue_template(name: str, issue: dict[str, str]) -> None:
     if not name:
         raise ValueError("Issue name is required")
     saved = [item for item in load_saved_issues() if item["name"].lower() != name.lower()]
-    saved.append({"name": name, "issue": {field: issue.get(field, "") for field in ISSUE_FIELDS}})
+    stored_issue = {field: issue.get(field, "") for field in ISSUE_FIELDS}
+    stored_issue[ISSUE_KIND_FIELD] = normalize_issue_kind(issue.get(ISSUE_KIND_FIELD))
+    saved.append({"name": name, "issue": stored_issue})
     saved.sort(key=lambda item: item["name"].lower())
     SAVED_ISSUES_FILE.write_text(json.dumps(saved, indent=2, ensure_ascii=False), encoding="utf-8")
 

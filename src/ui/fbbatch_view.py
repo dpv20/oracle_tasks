@@ -19,13 +19,18 @@ from fbbatch.runner import (
     BatchResult,
     FBBATCH_OUTPUT_DIR,
     ISSUE_FIELDS,
+    ISSUE_KIND_BATCH,
+    ISSUE_KIND_FIELD,
+    ISSUE_KIND_OTHER,
     check_falabella_vpn,
     create_outlook_draft,
     delete_issue_template,
     default_mail_body,
     find_event_pdf_for_report_date,
+    issue_routing_flags,
     issues_for_date,
     load_saved_issues,
+    normalize_issue_kind,
     render_mail_template,
     report_indicates_chile_batch_skipped,
     report_date_to_issue_date,
@@ -211,34 +216,203 @@ class FBBatchSetupView(ctk.CTkFrame):
         self._draft_retry_context: _DraftRetryContext | None = None
         self._worker_events: queue.Queue[tuple[str, object]] | None = None
         self._active_progress = "event"
+        self.full_env_var = ctk.StringVar(value=ENVIRONMENTS[0])
 
         header = ctk.CTkFrame(self, fg_color="transparent")
         header.pack(side="top", fill="x", padx=20, pady=(20, 10))
+        header.grid_columnconfigure(0, weight=1)
+        header.grid_columnconfigure(2, weight=1)
         IconButton(
             header, text=f"< {t('common.back')}", width=100,
             command=lambda: app.show_view("home"),
-        ).pack(side="left")
+        ).grid(row=0, column=0, sticky="w")
         ctk.CTkLabel(
             header, text="☾  " + t("fbbatch.title"),
             font=ctk.CTkFont(size=18, weight="bold"),
-        ).pack(side="left", padx=15)
+        ).grid(row=0, column=2, sticky="e")
 
-        self.body = ctk.CTkScrollableFrame(self, fg_color="transparent")
-        self.body.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+        self._report_page_labels = {
+            t("fbbatch.page.report"): "report",
+            t("fbbatch.page.advanced"): "advanced",
+        }
+        self.report_page_control = ctk.CTkSegmentedButton(
+            header,
+            values=list(self._report_page_labels),
+            command=self._show_report_page,
+        )
+        self.report_page_control.grid(row=0, column=1)
 
         self.status_label = ctk.CTkLabel(
-            self.body,
+            self,
             text="",
             anchor="w",
             justify="left",
             font=ctk.CTkFont(family="Consolas", size=12),
             text_color=("gray35", "gray70"),
         )
-        self.status_label.pack(fill="x")
+        self.status_label.pack(fill="x", padx=20)
 
+        self.advanced_body = ctk.CTkScrollableFrame(self, fg_color="transparent")
+        self.body = self.advanced_body
         self._build_generate_report_card()
-        self._build_event_card()
         self._build_report_card()
+        self._build_event_card()
+
+        self.report_body = ctk.CTkScrollableFrame(self, fg_color="transparent")
+        self._build_simple_report_card()
+
+        default_page = t("fbbatch.page.report")
+        self.report_page_control.set(default_page)
+        self._show_report_page(default_page)
+
+    def on_show(self) -> None:
+        latest_date = date.today() - timedelta(days=1)
+        simple_report_active = (
+            self._report_page_labels.get(self.report_page_control.get()) == "report"
+        )
+        if simple_report_active:
+            self.full_latest_var.set(True)
+            self._sync_full_date_state()
+        elif self.full_latest_var.get():
+            self._sync_full_date_state()
+        if self.latest_var.get():
+            self._sync_report_date_state()
+        if self.event_latest_var.get():
+            self._set_event_date(latest_date)
+        self._sync_event_date_state()
+        self._sync_simple_report_controls()
+
+    def _show_report_page(self, selected_label: str) -> None:
+        self.report_body.pack_forget()
+        self.advanced_body.pack_forget()
+        if self._report_page_labels.get(selected_label) == "advanced":
+            self.advanced_body.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+            return
+        self._sync_simple_report_controls()
+        self.report_body.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+
+    def _build_simple_report_card(self) -> None:
+        card = CardFrame(self.report_body)
+        card.pack(fill="x", pady=(0, 12))
+        inner = ctk.CTkFrame(card, fg_color="transparent")
+        inner.pack(fill="x", padx=20, pady=18)
+        inner.grid_columnconfigure(1, weight=1)
+        inner.grid_columnconfigure(3, weight=1)
+
+        SectionLabel(inner, text=t("fbbatch.page.report")).grid(
+            row=0, column=0, columnspan=4, sticky="w"
+        )
+
+        ctk.CTkLabel(
+            inner,
+            text=t("fbbatch.env"),
+            width=120,
+            anchor="w",
+        ).grid(row=1, column=0, sticky="w", pady=(18, 8))
+        self.simple_env = ctk.CTkOptionMenu(
+            inner,
+            values=list(ENVIRONMENTS),
+            variable=self.full_env_var,
+        )
+        self.simple_env.grid(row=1, column=1, sticky="ew", padx=(8, 28), pady=(18, 8))
+
+        ctk.CTkLabel(
+            inner,
+            text=t("fbbatch.simple.date"),
+            width=90,
+            anchor="w",
+        ).grid(row=1, column=2, sticky="w", pady=(18, 8))
+        simple_date_frame = ctk.CTkFrame(inner, fg_color="transparent")
+        simple_date_frame.grid(row=1, column=3, sticky="ew", pady=(18, 8))
+        simple_date_frame.grid_columnconfigure(0, weight=1)
+        self.simple_date = ctk.CTkEntry(simple_date_frame)
+        self.simple_date.grid(row=0, column=0, sticky="ew")
+        self.simple_date.configure(state="disabled")
+        ctk.CTkButton(
+            simple_date_frame,
+            text=t("fbbatch.calendar"),
+            width=105,
+            command=self._open_simple_calendar,
+        ).grid(row=0, column=1, padx=(8, 0))
+
+        issue_row = ctk.CTkFrame(inner, fg_color="transparent")
+        issue_row.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(10, 8))
+        ctk.CTkButton(
+            issue_row,
+            text=t("fbbatch.issue.new"),
+            width=160,
+            command=self._new_simple_issue,
+        ).pack(side="left")
+        self.simple_issue_status = ctk.CTkLabel(
+            issue_row,
+            text="",
+            anchor="w",
+            justify="left",
+            text_color=("gray40", "gray65"),
+        )
+        self.simple_issue_status.pack(side="left", fill="x", expand=True, padx=(14, 0))
+
+        action_row = ctk.CTkFrame(inner, fg_color="transparent")
+        action_row.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(14, 4))
+        action_row.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(
+            action_row,
+            text=t("fbbatch.mail.method"),
+            width=120,
+            anchor="w",
+        ).grid(row=0, column=0, sticky="w")
+        self.simple_mail_method_control = ctk.CTkSegmentedButton(
+            action_row,
+            values=list(self._mail_method_labels),
+            command=self._save_simple_mail_method,
+        )
+        self.simple_mail_method_control.set(self.mail_method_control.get())
+        self.simple_mail_method_control.grid(row=0, column=1, sticky="w", padx=(8, 20))
+        ctk.CTkButton(
+            action_row,
+            text=t("fbbatch.full.run"),
+            width=240,
+            height=46,
+            font=ctk.CTkFont(size=14, weight="bold"),
+            command=self._on_generate_simple_report,
+        ).grid(row=0, column=2, sticky="e")
+
+        self.simple_progress_bar = ctk.CTkProgressBar(inner)
+        self.simple_progress_bar.set(0)
+        self.simple_progress_bar.grid(
+            row=4, column=0, columnspan=4, sticky="ew", pady=(16, 2)
+        )
+        self.simple_progress_label = ctk.CTkLabel(
+            inner,
+            text="",
+            anchor="w",
+            text_color=("gray40", "gray65"),
+            font=ctk.CTkFont(size=11),
+        )
+        self.simple_progress_label.grid(
+            row=5, column=0, columnspan=4, sticky="ew"
+        )
+        self.simple_progress_bar.grid_remove()
+        self.simple_progress_label.grid_remove()
+
+        output_row = ctk.CTkFrame(inner, fg_color="transparent")
+        output_row.grid(row=6, column=0, columnspan=4, sticky="e", pady=(16, 0))
+        self.simple_retry_draft_btn = ctk.CTkButton(
+            output_row,
+            text=t("fbbatch.mail.retry"),
+            width=170,
+            command=self._on_retry_draft,
+        )
+        self.simple_retry_draft_btn.pack(side="left", padx=5)
+        self.simple_open_location_btn = ctk.CTkButton(
+            output_row,
+            text=t("fbbatch.open_location"),
+            width=170,
+            state="disabled",
+            command=lambda: self._open_path(self._full_output_dir),
+        )
+        self.simple_open_location_btn.pack(side="left", padx=5)
+        self._sync_simple_report_controls()
 
     def _build_generate_report_card(self) -> None:
         card = CardFrame(self.body)
@@ -254,7 +428,11 @@ class FBBatchSetupView(ctk.CTkFrame):
             text_color=("gray40", "gray65"),
         ).grid(row=1, column=0, columnspan=5, sticky="ew", pady=(4, 10))
         ctk.CTkLabel(inner, text=t("fbbatch.env"), width=120, anchor="w").grid(row=2, column=0, sticky="w", pady=4)
-        self.full_env = ctk.CTkOptionMenu(inner, values=list(ENVIRONMENTS))
+        self.full_env = ctk.CTkOptionMenu(
+            inner,
+            values=list(ENVIRONMENTS),
+            variable=self.full_env_var,
+        )
         self.full_env.grid(row=2, column=1, sticky="ew", padx=8, pady=4)
         self.full_latest_var = ctk.BooleanVar(value=True)
         ctk.CTkCheckBox(inner, text=t("fbbatch.report.latest"), variable=self.full_latest_var, command=self._sync_full_date_state).grid(
@@ -495,17 +673,23 @@ class FBBatchSetupView(ctk.CTkFrame):
             inner,
             fg_color="transparent",
         )
-        issue_actions.grid(row=4, column=0, columnspan=2, sticky="w", pady=(16, 0))
+        issue_actions.grid(row=4, column=0, columnspan=3, sticky="w", pady=(16, 0))
         IconButton(
             issue_actions,
-            text=t("fbbatch.issue.new"),
+            text=t("fbbatch.issue.new_batch"),
             width=160,
-            command=self._new_issue,
+            command=lambda: self._new_issue(ISSUE_KIND_BATCH),
         ).pack(side="left")
         IconButton(
             issue_actions,
-            text=t("fbbatch.issue.view_saved"),
+            text=t("fbbatch.issue.new_other"),
             width=160,
+            command=lambda: self._new_issue(ISSUE_KIND_OTHER),
+        ).pack(side="left", padx=(8, 0))
+        IconButton(
+            issue_actions,
+            text=t("fbbatch.issue.view_saved"),
+            width=140,
             command=self._view_issues,
         ).pack(side="left", padx=(8, 0))
 
@@ -648,6 +832,9 @@ class FBBatchSetupView(ctk.CTkFrame):
 
     def _save_mail_method(self, selected_label: str) -> None:
         method = self._mail_method_labels.get(selected_label, "new")
+        self.mail_method_control.set(selected_label)
+        if hasattr(self, "simple_mail_method_control"):
+            self.simple_mail_method_control.set(selected_label)
         self.app.config.update(
             {
                 "fbbatch_mail_method": method,
@@ -660,6 +847,9 @@ class FBBatchSetupView(ctk.CTkFrame):
         )
         self._sync_mail_method_actions()
         self._refresh_mail_summary()
+
+    def _save_simple_mail_method(self, selected_label: str) -> None:
+        self._save_mail_method(selected_label)
 
     def _sync_mail_method_actions(self) -> None:
         if self._current_mail_method() == "graph":
@@ -699,21 +889,47 @@ class FBBatchSetupView(ctk.CTkFrame):
         self.app.config.set("fbbatch_mail_body", values["body_template"].strip())
         self._refresh_mail_summary()
 
-    def _new_issue(self) -> None:
+    def _new_issue(self, issue_kind: str) -> None:
         issue_date = self._current_report_issue_date()
         if issue_date is None:
             issue_date = (datetime.now() - timedelta(days=1)).strftime("%d-%b-%y").upper()
-        IssueEditDialog(self, issue_date=issue_date, on_saved=self._sync_report_issue_status)
+        IssueEditDialog(
+            self,
+            issue_date=issue_date,
+            issue_kind=issue_kind,
+            on_saved=self._sync_all_issue_statuses,
+        )
 
     def _view_issues(self) -> None:
         issue_date = self._current_report_issue_date()
         if issue_date is None:
             messagebox.showerror(t("common.error"), t("fbbatch.report.issue_date_invalid"), parent=self)
             return
-        IssueListDialog(self, issue_date=issue_date, on_changed=self._sync_report_issue_status)
+        IssueListDialog(self, issue_date=issue_date, on_changed=self._sync_all_issue_statuses)
+
+    def _new_simple_issue(self) -> None:
+        issue_date = report_date_to_issue_date(self._current_full_report_date())
+        IssueEditDialog(
+            self,
+            issue_date=issue_date,
+            issue_kind=ISSUE_KIND_OTHER,
+            on_saved=self._sync_all_issue_statuses,
+        )
+
+    def _sync_all_issue_statuses(self) -> None:
+        self._sync_report_issue_status()
+        self._sync_simple_issue_status()
 
     def _open_full_calendar(self) -> None:
         CalendarDialog(self, selected=self._full_selected_date, on_pick=self._set_full_date)
+
+    def _open_simple_calendar(self) -> None:
+        CalendarDialog(self, selected=self._full_selected_date, on_pick=self._set_simple_date)
+
+    def _set_simple_date(self, value: date) -> None:
+        self.full_latest_var.set(False)
+        self._set_full_date(value)
+        self._sync_full_date_state()
 
     def _set_full_date(self, value: date) -> None:
         self._full_selected_date = value
@@ -721,6 +937,8 @@ class FBBatchSetupView(ctk.CTkFrame):
         self.full_date.delete(0, "end")
         self.full_date.insert(0, _format_issue_date(value))
         self.full_date.configure(state="disabled")
+        self._update_simple_date_entry()
+        self._sync_simple_issue_status()
         self._refresh_mail_summary()
 
     def _sync_full_date_state(self) -> None:
@@ -733,7 +951,30 @@ class FBBatchSetupView(ctk.CTkFrame):
             self.full_calendar_btn.configure(state="disabled")
         else:
             self.full_calendar_btn.configure(state="normal")
+        self._update_simple_date_entry()
+        self._sync_simple_issue_status()
         self._refresh_mail_summary()
+
+    def _update_simple_date_entry(self) -> None:
+        if not hasattr(self, "simple_date"):
+            return
+        self.simple_date.configure(state="normal")
+        self.simple_date.delete(0, "end")
+        self.simple_date.insert(0, _format_issue_date(self._full_selected_date))
+        self.simple_date.configure(state="disabled")
+
+    def _sync_simple_report_controls(self) -> None:
+        if not hasattr(self, "simple_date"):
+            return
+        self._update_simple_date_entry()
+        self.simple_mail_method_control.set(self.mail_method_control.get())
+        self._sync_simple_issue_status()
+        location_state = (
+            "normal"
+            if self._full_output_dir and self._full_output_dir.exists()
+            else "disabled"
+        )
+        self.simple_open_location_btn.configure(state=location_state)
 
     def _current_full_report_date(self) -> str:
         return self._full_selected_date.strftime("%d%m%Y")
@@ -807,9 +1048,40 @@ class FBBatchSetupView(ctk.CTkFrame):
             self.report_issue_status.configure(text=t("fbbatch.report.issue_date_invalid"))
             return
         matches = issues_for_date(issue_date)
-        self.report_issue_status.configure(
-            text=t("fbbatch.report.issue_status", date=issue_date, n=len(matches))
+        batch_count = sum(
+            normalize_issue_kind(issue.get(ISSUE_KIND_FIELD)) == ISSUE_KIND_BATCH
+            for issue in matches
         )
+        self.report_issue_status.configure(
+            text=t(
+                "fbbatch.report.issue_status_typed",
+                date=issue_date,
+                batch=batch_count,
+                other=len(matches) - batch_count,
+            )
+        )
+
+    def _sync_simple_issue_status(self) -> None:
+        if not hasattr(self, "simple_issue_status"):
+            return
+        issue_date = report_date_to_issue_date(self._current_full_report_date())
+        matches = issues_for_date(issue_date)
+        batch_count = sum(
+            normalize_issue_kind(issue.get(ISSUE_KIND_FIELD)) == ISSUE_KIND_BATCH
+            for issue in matches
+        )
+        self.simple_issue_status.configure(
+            text=t(
+                "fbbatch.report.issue_status_typed",
+                date=issue_date,
+                batch=batch_count,
+                other=len(matches) - batch_count,
+            )
+        )
+
+    def _on_generate_simple_report(self) -> None:
+        self._sync_full_date_state()
+        self._on_generate_full_report()
 
     def _on_generate_full_report(self) -> None:
         mail_values = self._mail_values_for_current_date()
@@ -832,6 +1104,7 @@ class FBBatchSetupView(ctk.CTkFrame):
         report_date = self._current_full_report_date()
         issue_date = report_date_to_issue_date(report_date)
         issues = issues_for_date(issue_date)
+        has_batch_issue, has_other_issue = issue_routing_flags(issues)
         write_issue_properties(issues, root)
 
         subject_template = mail_values["subject_template"]
@@ -846,12 +1119,14 @@ class FBBatchSetupView(ctk.CTkFrame):
 
         latest = bool(self.full_latest_var.get())
         log.info(
-            "night_shift: generate requested env=%s report_date=%s latest=%s has_issue=%s "
+            "night_shift: generate requested env=%s report_date=%s latest=%s "
+            "has_batch_issue=%s has_other_issue=%s "
             "root=%s from_configured=%s to_chars=%s cc_chars=%s",
             env,
             report_date,
             latest,
-            bool(issues),
+            has_batch_issue,
+            has_other_issue,
             root,
             bool(from_account),
             len(to),
@@ -867,7 +1142,8 @@ class FBBatchSetupView(ctk.CTkFrame):
                 env=env,
                 latest=latest,
                 report_date=report_date,
-                has_issue=bool(issues),
+                has_batch_issue=has_batch_issue,
+                has_other_issue=has_other_issue,
                 root=root,
                 subject_template=subject_template,
                 from_account=from_account,
@@ -997,7 +1273,8 @@ class FBBatchSetupView(ctk.CTkFrame):
         env: str,
         latest: bool,
         report_date: str,
-        has_issue: bool,
+        has_batch_issue: bool,
+        has_other_issue: bool,
         root: str,
         subject_template: str,
         from_account: str,
@@ -1013,12 +1290,14 @@ class FBBatchSetupView(ctk.CTkFrame):
         include_event = report_day.weekday() not in (5, 6)
         event_pdf: Path | None = None
         log.info(
-            "night_shift: workflow started env=%s report_date=%s latest=%s has_issue=%s "
+            "night_shift: workflow started env=%s report_date=%s latest=%s "
+            "has_batch_issue=%s has_other_issue=%s "
             "weekday=%s include_event_initial=%s event_next_date_auto=%s",
             env,
             report_date,
             latest,
-            has_issue,
+            has_batch_issue,
+            has_other_issue,
             report_day.weekday(),
             include_event,
             event_next_date,
@@ -1028,11 +1307,12 @@ class FBBatchSetupView(ctk.CTkFrame):
             env,
             latest,
             report_date,
-            has_issue,
+            has_batch_issue,
             root,
             lambda percent, message: progress(
                 _scale_phase_progress(percent, 0, 50), f"Report: {message}"
             ),
+            has_other_issue=has_other_issue,
             credentials=credentials,
         )
         log.info(
@@ -1209,7 +1489,7 @@ class FBBatchSetupView(ctk.CTkFrame):
             return
         issue_date = report_date_to_issue_date(report_date)
         issues = issues_for_date(issue_date)
-        has_issue = bool(issues)
+        has_batch_issue, has_other_issue = issue_routing_flags(issues)
         root = self._ensure_fbbatch_root()
         if root is None:
             return
@@ -1221,9 +1501,10 @@ class FBBatchSetupView(ctk.CTkFrame):
                 env,
                 latest,
                 report_date,
-                has_issue,
+                has_batch_issue,
                 root,
                 progress,
+                has_other_issue=has_other_issue,
                 credentials=credentials,
             )
         )
@@ -1262,6 +1543,8 @@ class FBBatchSetupView(ctk.CTkFrame):
             return
         self._running = True
         self.full_retry_draft_btn.configure(state="disabled")
+        if hasattr(self, "simple_retry_draft_btn"):
+            self.simple_retry_draft_btn.configure(state="disabled")
         self._last_pdf = None
         self._last_html = None
         self._last_images_dir = None
@@ -1284,11 +1567,16 @@ class FBBatchSetupView(ctk.CTkFrame):
             self._event_output_dir = None
             self._report_output_dir = None
             self.full_open_location_btn.configure(state="disabled")
+            if hasattr(self, "simple_open_location_btn"):
+                self.simple_open_location_btn.configure(state="disabled")
             self.event_open_location_btn.configure(state="disabled")
             self.report_open_location_btn.configure(state="disabled")
         self._show_progress(self._active_progress)
         self._progress_widgets()[0].set(0)
         self._progress_widgets()[1].configure(text=t("fbbatch.progress.starting"))
+        if self._active_progress == "full" and hasattr(self, "simple_progress_bar"):
+            self.simple_progress_bar.set(0)
+            self.simple_progress_label.configure(text=t("fbbatch.progress.starting"))
         self.status_label.configure(text="")
         worker_events: queue.Queue[tuple[str, object]] = queue.Queue()
         self._worker_events = worker_events
@@ -1343,8 +1631,13 @@ class FBBatchSetupView(ctk.CTkFrame):
 
     def _set_progress(self, percent: int, message: str) -> None:
         bar, label = self._progress_widgets()
-        bar.set(max(0, min(100, percent)) / 100)
-        label.configure(text=f"{percent}% - {message}")
+        value = max(0, min(100, percent)) / 100
+        text = f"{percent}% - {message}"
+        bar.set(value)
+        label.configure(text=text)
+        if self._active_progress == "full" and hasattr(self, "simple_progress_bar"):
+            self.simple_progress_bar.set(value)
+            self.simple_progress_label.configure(text=text)
 
     def _progress_widgets(self):
         if self._active_progress == "full":
@@ -1357,6 +1650,9 @@ class FBBatchSetupView(ctk.CTkFrame):
         if target == "full":
             self.full_progress_bar.grid()
             self.full_progress_label.grid()
+            if hasattr(self, "simple_progress_bar"):
+                self.simple_progress_bar.grid()
+                self.simple_progress_label.grid()
             return
         if target == "report":
             self.report_progress_bar.grid()
@@ -1369,6 +1665,9 @@ class FBBatchSetupView(ctk.CTkFrame):
         if target == "full":
             self.full_progress_bar.grid_remove()
             self.full_progress_label.grid_remove()
+            if hasattr(self, "simple_progress_bar"):
+                self.simple_progress_bar.grid_remove()
+                self.simple_progress_label.grid_remove()
             return
         if target == "report":
             self.report_progress_bar.grid_remove()
@@ -1380,6 +1679,8 @@ class FBBatchSetupView(ctk.CTkFrame):
     def _finish(self, result: BatchResult) -> None:
         self._running = False
         self.full_retry_draft_btn.configure(state="normal")
+        if hasattr(self, "simple_retry_draft_btn"):
+            self.simple_retry_draft_btn.configure(state="normal")
         self._last_html = result.html_path
         self._last_pdf = result.pdf_path
         self._last_images_dir = result.images_dir
@@ -1388,6 +1689,8 @@ class FBBatchSetupView(ctk.CTkFrame):
             self._set_progress(100, t("fbbatch.progress.done"))
         else:
             self._progress_widgets()[1].configure(text=t("fbbatch.progress.failed"))
+            if self._active_progress == "full" and hasattr(self, "simple_progress_label"):
+                self.simple_progress_label.configure(text=t("fbbatch.progress.failed"))
         self.status_label.configure(text="" if result.ok else result.message, text_color=color)
         if self._active_progress == "event":
             self._event_pdf = result.pdf_path
@@ -1415,6 +1718,8 @@ class FBBatchSetupView(ctk.CTkFrame):
                 self.report_open_location_btn.configure(state="normal")
             if self._full_output_dir and self._full_output_dir.exists():
                 self.full_open_location_btn.configure(state="normal")
+                if hasattr(self, "simple_open_location_btn"):
+                    self.simple_open_location_btn.configure(state="normal")
             if result.ok:
                 messagebox.showinfo(
                     t("fbbatch.mail.ready_title"),
@@ -1808,17 +2113,43 @@ class MailSettingsDialog(ctk.CTkToplevel):
 
 
 class IssueEditDialog(ctk.CTkToplevel):
-    def __init__(self, master, *, issue_date: str, on_saved, issue: dict[str, str] | None = None, saved_name: str | None = None):
+    def __init__(
+        self,
+        master,
+        *,
+        issue_date: str,
+        on_saved,
+        issue_kind: str = ISSUE_KIND_OTHER,
+        issue: dict[str, str] | None = None,
+        saved_name: str | None = None,
+    ):
         super().__init__(master)
         self.on_saved = on_saved
         self._initial_issue = issue or {}
+        self._issue_kind = normalize_issue_kind(
+            self._initial_issue.get(ISSUE_KIND_FIELD) or issue_kind
+        )
         self._saved_name = saved_name
         self._text_placeholders: dict[str, str] = {}
         self._text_has_placeholder: set[str] = set()
         self._selected_date = _parse_issue_date(self._initial_issue.get("DATE") or issue_date)
         self._calendar_open = False
 
-        self.title(t("fbbatch.issue.edit") if saved_name else t("fbbatch.issue.new"))
+        kind_label = t(
+            "fbbatch.issue.kind_batch"
+            if self._issue_kind == ISSUE_KIND_BATCH
+            else "fbbatch.issue.kind_other"
+        )
+        dialog_title = (
+            t("fbbatch.issue.edit_typed", kind=kind_label)
+            if saved_name
+            else t(
+                "fbbatch.issue.new_batch"
+                if self._issue_kind == ISSUE_KIND_BATCH
+                else "fbbatch.issue.new_other"
+            )
+        )
+        self.title(dialog_title)
         self.transient(master.winfo_toplevel())
         self.geometry("980x560")
         self.minsize(820, 500)
@@ -1830,7 +2161,7 @@ class IssueEditDialog(ctk.CTkToplevel):
         wrap.grid_rowconfigure(1, weight=1)
         ctk.CTkLabel(
             wrap,
-            text=t("fbbatch.issue.edit") if saved_name else t("fbbatch.issue.new"),
+            text=dialog_title,
             font=ctk.CTkFont(size=18, weight="bold"),
             anchor="w",
         ).grid(row=0, column=0, sticky="ew", pady=(0, 10))
@@ -1839,8 +2170,29 @@ class IssueEditDialog(ctk.CTkToplevel):
         form.grid(row=1, column=0, sticky="nsew")
         self.widgets: dict[str, object] = {}
         labels = _issue_labels()
+        self._issue_kind_labels = {
+            t("fbbatch.issue.kind_batch"): ISSUE_KIND_BATCH,
+            t("fbbatch.issue.kind_other"): ISSUE_KIND_OTHER,
+        }
+        ctk.CTkLabel(
+            form,
+            text=t("fbbatch.issue.kind"),
+            anchor="w",
+            width=170,
+        ).grid(row=0, column=0, sticky="nw", padx=(0, 8), pady=5)
+        self.issue_kind_control = ctk.CTkSegmentedButton(
+            form,
+            values=list(self._issue_kind_labels),
+        )
+        selected_kind_label = next(
+            label
+            for label, value in self._issue_kind_labels.items()
+            if value == self._issue_kind
+        )
+        self.issue_kind_control.set(selected_kind_label)
+        self.issue_kind_control.grid(row=0, column=1, sticky="w", pady=5)
 
-        for row, field in enumerate(ISSUE_FIELDS):
+        for row, field in enumerate(ISSUE_FIELDS, start=1):
             ctk.CTkLabel(form, text=labels[field], anchor="w", width=170).grid(
                 row=row, column=0, sticky="nw", padx=(0, 8), pady=5
             )
@@ -1960,7 +2312,9 @@ class IssueEditDialog(ctk.CTkToplevel):
         self.destroy()
 
     def _collect_issue(self) -> dict[str, str]:
-        issue: dict[str, str] = {}
+        issue: dict[str, str] = {
+            ISSUE_KIND_FIELD: self._issue_kind_labels[self.issue_kind_control.get()]
+        }
         for field, widget in self.widgets.items():
             if isinstance(widget, ctk.CTkTextbox):
                 issue[field] = "" if field in self._text_has_placeholder else widget.get("1.0", "end").strip()
@@ -2065,9 +2419,14 @@ class IssueListDialog(ctk.CTkToplevel):
             country = str(issue.get("COUNTRY", ""))
             failure = str(issue.get("TYPE_OF_FAILURE", ""))
             details = str(issue.get("ISSUE_DETAILS", ""))
+            kind_label = t(
+                "fbbatch.issue.kind_batch"
+                if normalize_issue_kind(issue.get(ISSUE_KIND_FIELD)) == ISSUE_KIND_BATCH
+                else "fbbatch.issue.kind_other"
+            )
             label = ctk.CTkLabel(
                 row,
-                text=f"{country} - {failure}\n{details}",
+                text=f"{kind_label} | {country} - {failure}\n{details}",
                 anchor="w",
                 justify="left",
                 wraplength=500,
