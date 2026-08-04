@@ -190,6 +190,56 @@ def _cancelled_result(account: str, output_path: Path | None = None) -> CLAccoun
     return CLAccountResult(account, SpoolCLStatus.CANCELLED, output_path=output_path, error="Cancelled")
 
 
+_SQLCL_ERROR_CODE_RE = re.compile(r"\b(?:ORA|SP2|TNS)-\d{4,5}\b", re.IGNORECASE)
+_JAVA_NATIVE_WARNING_MARKERS = (
+    "restricted method",
+    "restricted methods",
+    "enable-native-access",
+    "java.lang.system::load",
+)
+
+
+def _is_java_native_access_warning(line: str) -> bool:
+    lowered = line.strip().lower()
+    return lowered.startswith("warning:") and any(
+        marker in lowered for marker in _JAVA_NATIVE_WARNING_MARKERS
+    )
+
+
+def _sqlcl_failure_message(result: RunResult) -> str:
+    """Return the useful SQLcl error instead of a harmless Java launcher warning."""
+    lines = [
+        line.strip()
+        for stream in (result.stdout, result.stderr)
+        for line in (stream or "").splitlines()
+        if line.strip() and not _is_java_native_access_warning(line)
+    ]
+    coded_errors = [line for line in lines if _SQLCL_ERROR_CODE_RE.search(line)]
+    if coded_errors:
+        return coded_errors[-1][:240]
+
+    explicit_errors = [
+        line for line in lines
+        if "error" in line.lower() or "failed" in line.lower()
+    ]
+    if explicit_errors:
+        return explicit_errors[-1][:240]
+    if lines:
+        return lines[-1][:240]
+    return f"SQLcl exited with code {result.exit_code}"
+
+
+def _log_sqlcl_failure(stage: str, account: str, result: RunResult) -> None:
+    log.error(
+        "SQLcl %s failed: account=%s exit_code=%s stdout_tail=%r stderr_tail=%r",
+        stage,
+        account,
+        result.exit_code,
+        (result.stdout or "")[-4000:],
+        (result.stderr or "")[-4000:],
+    )
+
+
 class SpoolCLEngine:
     """EXTRACT_ONLY: run the country template against a source DB.
 
@@ -328,8 +378,8 @@ class SpoolCLEngine:
             return r
 
         if not result.ok:
-            tail = (result.stderr or result.stdout or "").strip().splitlines()
-            err = tail[-1][:240] if tail else f"exit {result.exit_code}"
+            _log_sqlcl_failure("extract", status_account, result)
+            err = _sqlcl_failure_message(result)
             r = CLAccountResult(status_account, SpoolCLStatus.ERROR, error=err)
             if on_status:
                 on_status(status_account, r.status, r.error)
@@ -479,8 +529,8 @@ class SpoolCLEngine:
             return r
 
         if not result.ok:
-            tail = (result.stderr or result.stdout or "").strip().splitlines()
-            err = tail[-1][:240] if tail else f"exit {result.exit_code}"
+            _log_sqlcl_failure("apply", account, result)
+            err = _sqlcl_failure_message(result)
             r = CLAccountResult(account, SpoolCLStatus.ERROR, output_path=spool_path, error=err)
             if on_status:
                 on_status(account, r.status, r.error)

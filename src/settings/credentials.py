@@ -44,6 +44,7 @@ TNS_TO_COUNTRY = {
     # Chile
     "CHILE_DEV": "chile",
     "CHILE_QA_19C": "chile",
+    "FXBFCL_19C_QA": "chile",
     "CHILE_QA4_OCI": "chile",
     "BUP_QA_CL": "chile",
     "BUP_CL_2024": "chile",

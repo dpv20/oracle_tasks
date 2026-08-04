@@ -277,6 +277,15 @@ class SpoolsSavingsView(ctk.CTkFrame):
         )
         self.back_to_accounts_btn.pack(side="right")
 
+        self.reset_results_btn = ctk.CTkButton(
+            results_header_row,
+            text=t("spools_savings.reset"),
+            width=100,
+            height=28,
+            command=self._on_reset,
+        )
+        self.reset_results_btn.pack(side="right", padx=(0, 8))
+
         self.result_detail_label = ctk.CTkLabel(
             results_inner,
             text="",
@@ -298,6 +307,10 @@ class SpoolsSavingsView(ctk.CTkFrame):
 
         self._apply_mode_visibility()
         self._refresh_db_options()
+
+    def on_show(self) -> None:
+        if not self._running:
+            self._refresh_db_options()
 
     def _current_mode(self) -> str:
         mode = self.mode_segment.get()
@@ -389,34 +402,84 @@ class SpoolsSavingsView(ctk.CTkFrame):
         self.accounts_card.pack_forget()
         self.results_card.pack(side="top", fill="both", expand=True, padx=25, pady=(0, 15), before=self.actions_frame)
 
+    def _on_reset(self) -> None:
+        if self._running:
+            return
+        self._run_id += 1
+        self._completed_steps = 0
+        self._active_summary_phase = None
+        self._cancel_event = None
+        self.account_entry.delete(0, "end")
+        self._pending_accounts.clear()
+        self._inject_flags.clear()
+        self._existing_spool_path = None
+        self.existing_spool_var.set("")
+        self._render_pending_accounts()
+        for widget in self.results_frame.winfo_children():
+            widget.destroy()
+        self._status_rows.clear()
+        self.result_detail_label.configure(text="")
+        self.summary_label.configure(text="")
+        self._refresh_db_options()
+        self._apply_mode_visibility()
+        self._set_run_button_running(False)
+
     def _selected_country_id(self) -> str | None:
         return self._country_lookup.get(self.country_var.get())
 
     def _refresh_db_options(self) -> None:
         country = self._selected_country_id()
         self._refresh_open_folder_button()
+        previous_source = self._selected_db()
+        previous_destination = self._selected_dest_db()
         labels: list[str] = []
         dest_labels: list[str] = []
         self._db_lookup = {}
         self._dest_db_lookup = {}
         if country:
-            for env in _ENV_DISPLAY_ORDER:
-                for db in dbs.databases_for(country, env=env):
-                    tag = _ENV_TAG.get(env, env.upper())
-                    label = f"{tag}  ·  {db['label']}  ·  {db['id']}"
-                    labels.append(label)
-                    self._db_lookup[label] = db
-            for env in _DEST_ENV_DISPLAY_ORDER:
-                for db in dbs.databases_for(country, env=env):
-                    tag = _ENV_TAG.get(env, env.upper())
-                    label = f"{tag}  ·  {db['label']}  ·  {db['id']}"
-                    dest_labels.append(label)
-                    self._dest_db_lookup[label] = db
+            credentials = self.app.config.all_credentials()
+            for db in dbs.configured_databases(credentials, country, _ENV_DISPLAY_ORDER):
+                label = self._db_option_label(db)
+                labels.append(label)
+                self._db_lookup[label] = db
+            for db in dbs.configured_databases(credentials, country, _DEST_ENV_DISPLAY_ORDER):
+                label = self._db_option_label(db)
+                dest_labels.append(label)
+                self._dest_db_lookup[label] = db
 
         self.db_menu.configure(values=labels or ["—"])
-        self.db_var.set(labels[0] if labels else "—")
+        self.db_var.set(
+            self._matching_db_label(self._db_lookup, previous_source)
+            or (labels[0] if labels else "—")
+        )
         self.dest_db_menu.configure(values=dest_labels or ["-"])
-        self.dest_db_var.set(dest_labels[0] if dest_labels else "-")
+        self.dest_db_var.set(
+            self._matching_db_label(self._dest_db_lookup, previous_destination)
+            or (dest_labels[0] if dest_labels else "-")
+        )
+
+    @staticmethod
+    def _db_option_label(db: dict) -> str:
+        env = str(db.get("env") or "")
+        tag = _ENV_TAG.get(env, env.upper())
+        login = f"  ·  {db['credential_label']}" if db.get("credential_count", 1) > 1 else ""
+        return f"{tag}  ·  {db['label']}  ·  {db['id']}{login}"
+
+    @staticmethod
+    def _matching_db_label(options: dict[str, dict], previous: dict | None) -> str | None:
+        if previous is None:
+            return None
+        previous_key = (
+            str(previous.get("id") or "").upper(),
+            str(previous.get("credential_key") or "").upper(),
+        )
+        return next((
+            label for label, db in options.items()
+            if (
+                str(db.get("id") or "").upper(),
+                str(db.get("credential_key") or "").upper(),
+            ) == previous_key
+        ), None)
 
     def _selected_db(self) -> dict | None:
         return self._db_lookup.get(self.db_var.get())
@@ -758,6 +821,8 @@ class SpoolsSavingsView(ctk.CTkFrame):
         self.run_btn.configure(text=t(key))
 
     def _set_run_button_running(self, running: bool) -> None:
+        if hasattr(self, "reset_results_btn"):
+            self.reset_results_btn.configure(state="disabled" if running else "normal")
         if running:
             if hasattr(self, "serial_accounts_check"):
                 self.serial_accounts_check.configure(state="disabled")
@@ -836,14 +901,20 @@ class SpoolsSavingsView(ctk.CTkFrame):
             messagebox.showerror(t("common.error"), t("spools_savings.no_sqlcl"), parent=self)
             return
 
-        source_cred = self._credential_for_db(country, db["id"])
+        source_cred = self._credential_for_db(
+            country, db.get("database_key") or db["id"], db.get("credential_key")
+        )
         if not source_cred:
             messagebox.showerror(t("common.error"), t("spools_savings.no_creds", db=db["id"]), parent=self)
             return
 
         dest_connection = ""
         if inject_accounts and dest_db:
-            dest_cred = self._credential_for_db(country, dest_db["id"])
+            dest_cred = self._credential_for_db(
+                country,
+                dest_db.get("database_key") or dest_db["id"],
+                dest_db.get("credential_key"),
+            )
             if not dest_cred:
                 messagebox.showerror(t("common.error"), t("spools_savings.no_creds", db=dest_db["id"]), parent=self)
                 return
@@ -931,7 +1002,11 @@ class SpoolsSavingsView(ctk.CTkFrame):
         if not sqlcl_path or not os.path.exists(sqlcl_path):
             messagebox.showerror(t("common.error"), t("spools_savings.no_sqlcl"), parent=self)
             return
-        dest_cred = self._credential_for_db(country, dest_db["id"])
+        dest_cred = self._credential_for_db(
+            country,
+            dest_db.get("database_key") or dest_db["id"],
+            dest_db.get("credential_key"),
+        )
         if not dest_cred:
             messagebox.showerror(t("common.error"), t("spools_savings.no_creds", db=dest_db["id"]), parent=self)
             return
@@ -980,9 +1055,16 @@ class SpoolsSavingsView(ctk.CTkFrame):
             row.pack(fill="x", padx=4, pady=2)
             self._status_rows[acc] = row
 
-    def _credential_for_db(self, country: str, db_id: str) -> dict | None:
-        cred = self.app.config.get_credential(country, db_id)
+    def _credential_for_db(
+        self,
+        country: str,
+        db_id: str,
+        credential_key: str | None = None,
+    ) -> dict | None:
+        cred = self.app.config.get_credential(country, db_id, credential_key)
         if cred is None:
+            if credential_key:
+                return None
             by_login = self.app.config.all_credentials().get(country, {}).get(db_id.upper(), {})
             cred = next(iter(by_login.values()), None)
         return cred
@@ -994,7 +1076,7 @@ class SpoolsSavingsView(ctk.CTkFrame):
             cred.get("user", ""),
             cred.get("schema") or None,
             password,
-            tns,
+            cred.get("tns") or tns,
         )
 
     def _post_ui(self, callback) -> bool:
