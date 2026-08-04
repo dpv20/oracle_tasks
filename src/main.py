@@ -8,6 +8,7 @@ Responsibilities:
 """
 import os
 import sys
+import threading
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -65,6 +66,13 @@ def main() -> None:
 
     from infra.logger import setup_logger
     setup_logger()
+
+    from infra.spool_retention import cleanup_managed_spools
+    threading.Thread(
+        target=cleanup_managed_spools,
+        name="spool-retention",
+        daemon=True,
+    ).start()
 
     from ui.app import OracleTasksApp
     OracleTasksApp(start_hidden="--background" in sys.argv[1:]).run()

@@ -32,6 +32,7 @@ from pathlib import Path
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
 
+from infra.spool_retention import cleanup_extract_archives
 from i18n import t
 from settings.config import decrypt_password
 from settings.credentials import to_sqlcl_arg
@@ -241,8 +242,22 @@ class SpoolsCLView(ctk.CTkFrame):
         ).pack(side="left", padx=4)
 
         # ── pending accounts list ──
-        self.pending_header = SectionLabel(accounts_inner, text=t("spools_cl.accounts_summary", n=0))
-        self.pending_header.pack(anchor="w", padx=6, pady=(10, 4))
+        self.pending_header_row = ctk.CTkFrame(accounts_inner, fg_color="transparent")
+        self.pending_header_row.pack(fill="x", padx=6, pady=(10, 4))
+        self.pending_header = SectionLabel(
+            self.pending_header_row,
+            text=t("spools_cl.accounts_summary", n=0),
+        )
+        self.pending_header.pack(side="left")
+        self.clear_all_btn = ctk.CTkButton(
+            self.pending_header_row,
+            text=t("spools_cl.clear_all"),
+            width=110,
+            height=28,
+            state="disabled",
+            command=self._clear_pending_accounts,
+        )
+        self.clear_all_btn.pack(side="right")
 
         self.account_split = ctk.CTkFrame(accounts_inner, fg_color="transparent")
         self.account_split.pack(fill="both", expand=True, padx=4, pady=(0, 4))
@@ -1040,9 +1055,16 @@ class SpoolsCLView(ctk.CTkFrame):
             self._render_extract_row(self.extract_only_frame, acc)
         for acc in inject_accounts:
             self._render_inject_row(self.inject_frame, acc)
+        self._refresh_clear_all_button()
         self._refresh_run_button()
         self.after_idle(self._sync_account_list_widths)
         self.after(50, self._sync_account_list_widths)
+
+    def _refresh_clear_all_button(self) -> None:
+        if not hasattr(self, "clear_all_btn"):
+            return
+        state = "normal" if self._pending_accounts and not self._running else "disabled"
+        self.clear_all_btn.configure(state=state)
 
     def _bind_account_list_resize(self) -> None:
         for frame in (self.extract_only_frame, self.inject_frame):
@@ -1138,6 +1160,7 @@ class SpoolsCLView(ctk.CTkFrame):
         self.run_btn.configure(text=t(key))
 
     def _set_run_button_running(self, running: bool) -> None:
+        self._refresh_clear_all_button()
         if hasattr(self, "reset_results_btn"):
             self.reset_results_btn.configure(state="disabled" if running else "normal")
         if running:
@@ -1219,6 +1242,8 @@ class SpoolsCLView(ctk.CTkFrame):
             if not selected_dir:
                 return
             extract_archive_dir = Path(selected_dir)
+            archive_prefix = "CMR_Spools_" if spool_kind == SPOOL_KIND_CMR else "CL_Spools_"
+            cleanup_extract_archives(extract_archive_dir, (archive_prefix,))
         sqlcl_path = (self.app.config.get("sqlcl_path") or "").strip()
         if not sqlcl_path or not os.path.exists(sqlcl_path):
             messagebox.showerror(t("common.error"), t("spools_cl.no_sqlcl"), parent=self)

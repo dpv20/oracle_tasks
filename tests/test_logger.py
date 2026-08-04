@@ -4,6 +4,7 @@ import logging
 import sys
 import tempfile
 import unittest
+from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from unittest.mock import patch
@@ -76,6 +77,91 @@ class LoggerTests(unittest.TestCase):
 
         self.assertFalse(backup_exists)
         self.assertEqual(contents, "")
+
+    def test_prune_old_log_records_keeps_only_last_ninety_days(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_file = Path(temp_dir) / "app.log"
+            backup = log_file.with_name("app.log.1")
+            log_file.write_text(
+                "2026-04-01 08:00:00,000 [ERROR] old: old active record\n"
+                "Traceback from the old record\n"
+                "2026-08-01 09:00:00,000 [INFO] current: recent record\n"
+                "Recent continuation\n",
+                encoding="utf-8",
+            )
+            backup.write_text(
+                "2026-03-01 07:00:00,000 [INFO] old: old backup record\n",
+                encoding="utf-8",
+            )
+
+            with (
+                patch.object(logger_module, "LOG_FILE", log_file),
+                patch.object(logger_module, "LOG_BACKUP_COUNT", 1),
+            ):
+                kept, removed = logger_module.prune_old_log_records(
+                    now=datetime(2026, 8, 4, 12, 0, 0)
+                )
+
+            contents = log_file.read_text(encoding="utf-8")
+
+        self.assertNotIn("old active record", contents)
+        self.assertNotIn("Traceback from the old record", contents)
+        self.assertIn("recent record", contents)
+        self.assertIn("Recent continuation", contents)
+        self.assertFalse(backup.exists())
+        self.assertEqual(kept, 1)
+        self.assertEqual(removed, 2)
+
+    def test_prune_old_log_records_keeps_exactly_ninety_days(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_file = Path(temp_dir) / "app.log"
+            log_file.write_text(
+                "2026-05-06 12:00:00,000 [INFO] boundary: keep me\n",
+                encoding="utf-8",
+            )
+
+            with (
+                patch.object(logger_module, "LOG_FILE", log_file),
+                patch.object(logger_module, "LOG_BACKUP_COUNT", 0),
+            ):
+                kept, removed = logger_module.prune_old_log_records(
+                    now=datetime(2026, 8, 4, 12, 0, 0)
+                )
+
+            contents = log_file.read_text(encoding="utf-8")
+
+        self.assertIn("keep me", contents)
+        self.assertEqual(kept, 1)
+        self.assertEqual(removed, 0)
+
+    def test_prune_open_active_log_keeps_handler_usable(self) -> None:
+        root = logging.getLogger()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_file = Path(temp_dir) / "app.log"
+            log_file.write_text(
+                "2026-01-01 08:00:00,000 [INFO] old: remove me\n"
+                "2026-08-01 08:00:00,000 [INFO] recent: keep me\n",
+                encoding="utf-8",
+            )
+            handler = RotatingFileHandler(log_file, encoding="utf-8")
+            handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+            root.addHandler(handler)
+            try:
+                with (
+                    patch.object(logger_module, "LOG_FILE", log_file),
+                    patch.object(logger_module, "LOG_BACKUP_COUNT", 0),
+                ):
+                    logger_module.prune_old_log_records(now=datetime(2026, 8, 4, 12, 0, 0))
+                root.warning("after retention")
+                handler.flush()
+                contents = log_file.read_text(encoding="utf-8")
+            finally:
+                root.removeHandler(handler)
+                handler.close()
+
+        self.assertNotIn("remove me", contents)
+        self.assertIn("keep me", contents)
+        self.assertIn("after retention", contents)
 
 
 if __name__ == "__main__":
