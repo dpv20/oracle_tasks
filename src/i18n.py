@@ -21,8 +21,8 @@ T: dict[str, dict[str, str]] = {
         "tray.exit": "Exit",
 
         # Home view
-        "home.spools_cl_button": "Consumer Lending",
-        "home.savings_button": "Spools / Savings Accounts",
+        "home.spools_cl_button": "Spool CL\n(Consumer lending)",
+        "home.savings_button": "Spool CASA\n(Current And Saving Account)",
         "home.savings_coming_soon": "Spools / Savings Accounts is not available yet.",
         "home.create_branch_button": "Create Falabella Branch",
         "home.create_branch_coming_soon": "Create Falabella Branch is not available yet.",
@@ -37,7 +37,7 @@ T: dict[str, dict[str, str]] = {
         "update.installing": "Installing update...",
 
         # Spools CL view
-        "spools_cl.title": "Spools / CL Accounts",
+        "spools_cl.title": "Spool CL\n(Consumer lending)",
         "spools_cl.coming_soon": "Spools workflow — implemented in Phase 3.",
         "spools_cl.mode": "Mode",
         "spools_cl.mode.extract": "Extract / Apply",
@@ -123,7 +123,7 @@ T: dict[str, dict[str, str]] = {
         "spools_cl.confirm_apply_existing": "You are about to apply {n} spool file(s) into:\n   {db}\n\nFiles:\n   {files}\n\nThis will modify destination data. Continue?",
 
         # Spools Savings view
-        "spools_savings.title": "Spools / Savings Accounts",
+        "spools_savings.title": "Spool CASA\n(Current And Saving Account)",
         "spools_savings.mode": "Mode",
         "spools_savings.mode.extract": "Extract / Apply",
         "spools_savings.mode.extract_only": "Extract only",
@@ -317,6 +317,9 @@ T: dict[str, dict[str, str]] = {
         "logs.exported": "Logs exported to:\n{path}",
         "logs.clear_confirm": "Delete the active log and all rotated log history?",
         "logs.cleared": "The application logs were cleared.",
+        "reset_app.button": "Restart app",
+        "reset_app.title": "Restart application",
+        "reset_app.failed": "Oracle Tasks could not be restarted. Close and reopen it manually.",
 
         # Settings → About
         "settings.about.version": "Version",
@@ -511,8 +514,8 @@ T: dict[str, dict[str, str]] = {
         "tray.exit": "Salir",
 
         # Home view
-        "home.spools_cl_button": "Consumer Lending",
-        "home.savings_button": "Spools / Savings Accounts",
+        "home.spools_cl_button": "Spool CL\n(Consumer lending)",
+        "home.savings_button": "Spool CASA\n(Current And Saving Account)",
         "home.savings_coming_soon": "Spools / Savings Accounts todavía no está disponible.",
         "home.create_branch_button": "Crear Sucursal Falabella",
         "home.create_branch_coming_soon": "Crear Sucursal Falabella todavía no está disponible.",
@@ -527,7 +530,7 @@ T: dict[str, dict[str, str]] = {
         "update.installing": "Instalando actualización...",
 
         # Spools CL view
-        "spools_cl.title": "Spools / CL Accounts",
+        "spools_cl.title": "Spool CL\n(Consumer lending)",
         "spools_cl.coming_soon": "Flujo de spools — se implementa en la Fase 3.",
         "spools_cl.mode": "Modo",
         "spools_cl.mode.extract": "Extract / Apply",
@@ -610,7 +613,7 @@ T: dict[str, dict[str, str]] = {
         "spools_cl.confirm_apply_existing": "Vas a aplicar {n} archivo(s) de spool en:\n   {db}\n\nArchivos:\n   {files}\n\nEsto modificara datos en destino. Continuar?",
 
         # Spools Savings view
-        "spools_savings.title": "Spools / Savings Accounts",
+        "spools_savings.title": "Spool CASA\n(Current And Saving Account)",
         "spools_savings.mode": "Modo",
         "spools_savings.mode.extract": "Extract / Apply",
         "spools_savings.mode.extract_only": "Solo extraer",
@@ -803,6 +806,9 @@ T: dict[str, dict[str, str]] = {
         "logs.exported": "Logs exportados a:\n{path}",
         "logs.clear_confirm": "Eliminar el log activo y todo el historial de logs rotados?",
         "logs.cleared": "Los logs de la aplicacion fueron limpiados.",
+        "reset_app.button": "Reiniciar app",
+        "reset_app.title": "Reiniciar aplicacion",
+        "reset_app.failed": "No se pudo reiniciar Oracle Tasks. Cierra y vuelve a abrir la aplicacion manualmente.",
 
         # Settings → About
         "settings.about.version": "Versión",

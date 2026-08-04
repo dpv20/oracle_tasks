@@ -126,7 +126,7 @@ with a feature through its service instead of importing another tab's UI.
 
 ## 6. Use it — extract account spools
 
-Home → **Consumer Lending**, **CMR Chile** or **Spools / Savings Accounts**.
+Home → **Spool CL (Consumer lending)**, **CMR Chile** or **Spool CASA (Current And Saving Account)**.
 
 1. Pick **Country**.
 2. Pick **Source DB** — dropdown lists every environment of that country

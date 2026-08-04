@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+import subprocess
 import sys
 import threading
 import webbrowser
@@ -31,6 +32,103 @@ from .spools_savings_view import SpoolsSavingsView
 from .widgets import UpdateBanner
 
 log = logging.getLogger(__name__)
+
+
+class _SidebarNavItem(ctk.CTkFrame):
+    """Clickable sidebar row with independently styled title and subtitle."""
+
+    def __init__(self, master, *, command) -> None:
+        super().__init__(
+            master,
+            height=44,
+            corner_radius=8,
+            fg_color="transparent",
+        )
+        self._command = command
+        self._active = False
+        self.pack_propagate(False)
+
+        self.icon_label = ctk.CTkLabel(
+            self,
+            text="",
+            width=24,
+            font=ctk.CTkFont(size=15),
+            text_color=("#334155", "#94a3b8"),
+        )
+        self.icon_label.pack(side="left", padx=(10, 6))
+
+        self.copy_frame = ctk.CTkFrame(self, fg_color="transparent")
+        self.copy_frame.pack(side="left", fill="both", expand=True, padx=(0, 8))
+
+        self.title_label = ctk.CTkLabel(
+            self.copy_frame,
+            text="",
+            anchor="w",
+            justify="left",
+            font=ctk.CTkFont(size=14, weight="bold"),
+            text_color=("#334155", "#f8fafc"),
+        )
+        self.subtitle_label = ctk.CTkLabel(
+            self.copy_frame,
+            text="",
+            anchor="w",
+            justify="left",
+            font=ctk.CTkFont(size=11, weight="normal"),
+            text_color=("#64748b", "#94a3b8"),
+        )
+
+        for widget in (
+            self,
+            self.icon_label,
+            self.copy_frame,
+            self.title_label,
+            self.subtitle_label,
+        ):
+            widget.bind("<Button-1>", self._on_click)
+            widget.bind("<Enter>", self._on_enter)
+            widget.bind("<Leave>", self._on_leave)
+
+    def set_content(self, icon: str, title: str, subtitle: str = "") -> None:
+        self.icon_label.configure(text=icon)
+        self.title_label.configure(text=title)
+        self.subtitle_label.configure(text=subtitle)
+        self.title_label.pack_forget()
+        self.subtitle_label.pack_forget()
+        if subtitle:
+            self.configure(height=56)
+            self.title_label.pack(fill="x", pady=(7, 0))
+            self.subtitle_label.pack(fill="x", pady=(0, 6))
+        else:
+            self.configure(height=44)
+            self.title_label.pack(fill="both", expand=True)
+
+    def set_active(self, active: bool) -> None:
+        self._active = active
+        self._apply_colors()
+
+    def _on_click(self, _event=None) -> None:
+        self._command()
+
+    def _on_enter(self, _event=None) -> None:
+        if not self._active:
+            self._apply_colors(hover=True)
+
+    def _on_leave(self, _event=None) -> None:
+        self._apply_colors()
+
+    def _apply_colors(self, *, hover: bool = False) -> None:
+        if self._active:
+            self.configure(fg_color=("#4f46e5", "#6366f1"))
+            self.icon_label.configure(text_color="white")
+            self.title_label.configure(text_color="white")
+            self.subtitle_label.configure(text_color=("#e0e7ff", "#e0e7ff"))
+        else:
+            self.configure(
+                fg_color=("#e2e8f0", "#1e293b") if hover else "transparent"
+            )
+            self.icon_label.configure(text_color=("#334155", "#94a3b8"))
+            self.title_label.configure(text_color=("#334155", "#f8fafc"))
+            self.subtitle_label.configure(text_color=("#64748b", "#94a3b8"))
 
 
 class OracleTasksApp:
@@ -76,21 +174,13 @@ class OracleTasksApp:
         self.brand_label.pack(pady=(30, 25), padx=20, anchor="w")
 
         # Sidebar Menu Items
-        self._menu_buttons: dict[str, ctk.CTkButton] = {}
+        self._menu_buttons: dict[str, _SidebarNavItem] = {}
 
         # Quick initialization, actual localized text labels will be loaded dynamically
         for view_name in ["home", "spools_cl", "spools_savings", "fbbatch", "vpn", "settings"]:
-            btn = ctk.CTkButton(
+            btn = _SidebarNavItem(
                 self.sidebar,
-                text="",
-                height=40,
-                corner_radius=8,
-                fg_color="transparent",
-                text_color=("#334155", "#94a3b8"),
-                hover_color=("#e2e8f0", "#1e293b"),
-                anchor="w",
-                font=ctk.CTkFont(size=13, weight="normal"),
-                command=lambda name=view_name: self.show_view(name)
+                command=lambda name=view_name: self.show_view(name),
             )
             btn.pack(fill="x", padx=15, pady=4)
             self._menu_buttons[view_name] = btn
@@ -131,6 +221,20 @@ class OracleTasksApp:
             command=self._open_logs_dialog,
         )
         self.logs_btn.pack(fill="x", pady=(0, 10))
+
+        self.reset_app_btn = ctk.CTkButton(
+            self.sidebar_footer,
+            text="",
+            height=32,
+            corner_radius=6,
+            fg_color=("#ffffff", "#1e293b"),
+            text_color=("#334155", "#f8fafc"),
+            border_color=("#e2e8f0", "#334155"),
+            border_width=1,
+            font=ctk.CTkFont(size=12, weight="normal"),
+            command=self._reset_application,
+        )
+        self.reset_app_btn.pack(fill="x", pady=(0, 10))
 
         # Credits / version info
         self.credits_label = ctk.CTkLabel(
@@ -184,24 +288,30 @@ class OracleTasksApp:
     def _update_sidebar_labels(self) -> None:
         lang = self.config.get("language", "en")
         menu_labels = {
-            "home": "🏠  " + ("Inicio" if lang == "es" else "Dashboard"),
-            "spools_cl": "▣  " + t("home.spools_cl_button"),
-            "spools_savings": "💵  " + t("home.savings_button"),
-            "settings": "⚙️  " + t("settings.title"),
+            "home": ("🏠", "Inicio" if lang == "es" else "Dashboard", ""),
+            "spools_cl": ("▣", *self._split_sidebar_copy(t("home.spools_cl_button"))),
+            "spools_savings": ("💵", *self._split_sidebar_copy(t("home.savings_button"))),
+            "fbbatch": ("☾", t("fbbatch.nav"), ""),
+            "vpn": ("◉", t("vpn.nav"), ""),
+            "settings": ("⚙", t("settings.title"), ""),
         }
-        menu_labels["fbbatch"] = "☾  " + t("fbbatch.nav")
-        menu_labels["vpn"] = "◉  " + t("vpn.nav")
-        for view_name, label in menu_labels.items():
+        for view_name, (icon, title, subtitle) in menu_labels.items():
             if view_name in self._menu_buttons:
-                self._menu_buttons[view_name].configure(text=label)
+                self._menu_buttons[view_name].set_content(icon, title, subtitle)
 
         current_theme = self.config.get("theme", "light")
         theme_text = "☀️  " + t("settings.general.theme.light") if current_theme == "light" else "🌙  " + t("settings.general.theme.dark")
         self.theme_btn.configure(text=theme_text)
         self.logs_btn.configure(text=t("logs.button"))
+        self.reset_app_btn.configure(text=t("reset_app.button"))
 
         credits_text = f"v{__version__}\nDiego Pavez Verdi"
         self.credits_label.configure(text=credits_text)
+
+    @staticmethod
+    def _split_sidebar_copy(value: str) -> tuple[str, str]:
+        title, separator, subtitle = value.partition("\n")
+        return title, subtitle if separator else ""
 
     def _toggle_theme(self) -> None:
         if self._has_running_work():
@@ -219,6 +329,61 @@ class OracleTasksApp:
             dialog.focus_force()
             return
         self._logs_dialog = LogsDialog(self.root)
+
+    def _reset_application(self) -> None:
+        """Restart the complete app while preserving all user data and settings."""
+        if self._has_running_work():
+            self._warn_running_work()
+            return
+        try:
+            log.info("Application restart requested by the user")
+            self._launch_restart_helper()
+        except OSError:
+            log.exception("Could not launch the application restart helper")
+            messagebox.showerror(
+                t("reset_app.title"),
+                t("reset_app.failed"),
+                parent=self.root,
+            )
+            return
+        self._shutdown()
+
+    @staticmethod
+    def _launch_restart_helper() -> None:
+        """Relaunch after this process exits and releases the single-instance mutex."""
+        pythonw = os.path.join(sys.prefix, "pythonw.exe")
+        if not os.path.isfile(pythonw):
+            pythonw = sys.executable
+        script = REPO_ROOT / "src" / "main.py"
+        helper_code = (
+            "import ctypes,subprocess,sys,time\n"
+            "pid=int(sys.argv[1])\n"
+            "if sys.platform == 'win32':\n"
+            "    handle=ctypes.windll.kernel32.OpenProcess(0x00100000,False,pid)\n"
+            "    if handle:\n"
+            "        ctypes.windll.kernel32.WaitForSingleObject(handle,15000)\n"
+            "        ctypes.windll.kernel32.CloseHandle(handle)\n"
+            "else:\n"
+            "    time.sleep(1)\n"
+            "subprocess.Popen(sys.argv[2:],close_fds=True)\n"
+        )
+        kwargs: dict[str, object] = {
+            "cwd": str(REPO_ROOT),
+            "close_fds": True,
+        }
+        if os.name == "nt":
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS
+        subprocess.Popen(
+            [
+                pythonw,
+                "-c",
+                helper_code,
+                str(os.getpid()),
+                pythonw,
+                str(script),
+            ],
+            **kwargs,
+        )
 
     def _has_running_work(self) -> bool:
         return any(bool(getattr(view, "_running", False)) for view in self._views.values())
@@ -247,20 +412,7 @@ class OracleTasksApp:
 
         # Highlight active sidebar button
         for view_name, btn in self._menu_buttons.items():
-            if view_name == name:
-                btn.configure(
-                    fg_color=("#4f46e5", "#6366f1"),
-                    text_color="white",
-                    hover_color=("#4338ca", "#4f46e5"),
-                    font=ctk.CTkFont(size=13, weight="bold")
-                )
-            else:
-                btn.configure(
-                    fg_color="transparent",
-                    text_color=("#334155", "#94a3b8"),
-                    hover_color=("#e2e8f0", "#1e293b"),
-                    font=ctk.CTkFont(size=13, weight="normal")
-                )
+            btn.set_active(view_name == name)
 
     def show_consumer_lending(self) -> None:
         if self._has_running_work():

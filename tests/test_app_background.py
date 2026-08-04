@@ -54,6 +54,32 @@ class AppBackgroundTests(unittest.TestCase):
         app._show_window.assert_called_once_with()
         app.root.after.assert_called_once_with(250, app._poll_background_requests)
 
+    def test_reset_app_launches_replacement_then_shuts_down(self) -> None:
+        app = OracleTasksApp.__new__(OracleTasksApp)
+        app.root = Mock()
+        app._has_running_work = Mock(return_value=False)
+        app._launch_restart_helper = Mock()
+        app._shutdown = Mock()
+
+        app._reset_application()
+
+        app._launch_restart_helper.assert_called_once_with()
+        app._shutdown.assert_called_once_with()
+
+    def test_reset_app_is_blocked_while_work_is_running(self) -> None:
+        app = OracleTasksApp.__new__(OracleTasksApp)
+        app.root = Mock()
+        app._has_running_work = Mock(return_value=True)
+        app._warn_running_work = Mock()
+        app._launch_restart_helper = Mock()
+        app._shutdown = Mock()
+
+        app._reset_application()
+
+        app._warn_running_work.assert_called_once_with()
+        app._launch_restart_helper.assert_not_called()
+        app._shutdown.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
