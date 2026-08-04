@@ -277,7 +277,12 @@ class SpoolsCLView(ctk.CTkFrame):
 
         # ── actions ──
         self.actions_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.actions_frame.pack(fill="x", padx=25, pady=(0, 4))
+        # Reserve the footer before the expandable account/results card. Chile
+        # has an extra "Spool type" row, so packing actions last could push the
+        # run/apply buttons below the visible window on shorter displays.
+        self.actions_frame.pack(
+            side="bottom", fill="x", padx=25, pady=(0, 4), before=self.accounts_card,
+        )
         self.run_btn = IconButton(
             self.actions_frame, text=t("spools_cl.run_extract_only"), width=220,
             command=self._on_run,
@@ -453,7 +458,7 @@ class SpoolsCLView(ctk.CTkFrame):
             if not self.existing_spools_card.winfo_manager():
                 self.existing_spools_card.pack(
                     side="top", fill="both", expand=True, padx=25, pady=(0, 15),
-                    before=self.actions_frame,
+                    after=self.actions_frame,
                 )
             self._render_existing_spools()
             return
@@ -473,7 +478,7 @@ class SpoolsCLView(ctk.CTkFrame):
         self.results_card.pack_forget()
         self._apply_account_list_visibility()
         if not self.accounts_card.winfo_manager():
-            self.accounts_card.pack(side="top", fill="both", expand=True, padx=25, pady=(0, 15), before=self.actions_frame)
+            self.accounts_card.pack(side="top", fill="both", expand=True, padx=25, pady=(0, 15), after=self.actions_frame)
 
     def _apply_account_list_visibility(self) -> None:
         if not hasattr(self, "inject_header"):
@@ -528,16 +533,16 @@ class SpoolsCLView(ctk.CTkFrame):
         self.results_card.pack_forget()
         if self._is_apply_existing_mode():
             self.accounts_card.pack_forget()
-            self.existing_spools_card.pack(side="top", fill="both", expand=True, padx=25, pady=(0, 15), before=self.actions_frame)
+            self.existing_spools_card.pack(side="top", fill="both", expand=True, padx=25, pady=(0, 15), after=self.actions_frame)
             self._render_existing_spools()
             return
         self.existing_spools_card.pack_forget()
-        self.accounts_card.pack(side="top", fill="both", expand=True, padx=25, pady=(0, 15), before=self.actions_frame)
+        self.accounts_card.pack(side="top", fill="both", expand=True, padx=25, pady=(0, 15), after=self.actions_frame)
 
     def _show_results_card(self) -> None:
         self.accounts_card.pack_forget()
         self.existing_spools_card.pack_forget()
-        self.results_card.pack(side="top", fill="both", expand=True, padx=25, pady=(0, 15), before=self.actions_frame)
+        self.results_card.pack(side="top", fill="both", expand=True, padx=25, pady=(0, 15), after=self.actions_frame)
 
     def _on_reset(self) -> None:
         if self._running:
