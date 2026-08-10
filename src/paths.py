@@ -25,6 +25,7 @@ DATA_DIR = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / APP_NAME
 SPOOLS_CL_OUT_DIR = DATA_DIR / "spools_CL_out"
 SPOOLS_CMR_OUT_DIR = DATA_DIR / "spools_CMR"
 SPOOLS_SAVINGS_OUT_DIR = DATA_DIR / "spools_savings_out"
+OUTPUT_FILES_OUT_DIR = DATA_DIR / "output_files"
 SQLCL_DIR = DATA_DIR / "sqlcl"
 LOG_FILE = DATA_DIR / "app.log"
 SHOW_FLAG_PATH = DATA_DIR / "show.flag"
@@ -32,8 +33,16 @@ SHOW_FLAG_PATH = DATA_DIR / "show.flag"
 
 def ensure_dirs() -> None:
     """Create all writable directories the app needs at runtime."""
-    for d in (CONFIG_DIR, DATA_DIR, SPOOLS_CL_OUT_DIR, SPOOLS_CMR_OUT_DIR, SPOOLS_SAVINGS_OUT_DIR):
+    for d in (
+        CONFIG_DIR,
+        DATA_DIR,
+        SPOOLS_CL_OUT_DIR,
+        SPOOLS_CMR_OUT_DIR,
+        SPOOLS_SAVINGS_OUT_DIR,
+        OUTPUT_FILES_OUT_DIR,
+    ):
         d.mkdir(parents=True, exist_ok=True)
     for country in ("Chile", "Peru", "Colombia", "Mexico"):
         (SPOOLS_CL_OUT_DIR / country).mkdir(parents=True, exist_ok=True)
         (SPOOLS_SAVINGS_OUT_DIR / country).mkdir(parents=True, exist_ok=True)
+        (OUTPUT_FILES_OUT_DIR / country).mkdir(parents=True, exist_ok=True)

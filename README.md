@@ -3,6 +3,9 @@
 Desktop app (Windows) to automate Oracle DBA tasks for the team — currently
 account spool extraction (PROD → QA/DEV) for Chile, Peru, Colombia and Mexico.
 
+It also includes Night Shift reporting, VPN controls, and read-only
+reconstruction of missing Generic Interface output files from PROD data.
+
 ---
 
 ## 1. Install
@@ -122,6 +125,11 @@ configuration persistence, startup registration, updates, logs, and the
 system tray stays under `src/settings/` and `src/infra/`. Views communicate
 with a feature through its service instead of importing another tab's UI.
 
+Generic Interface output reconstruction lives under
+`src/features/output_file_generation/`. Each supported input/output pair has
+an explicit format adapter; PROD supplies process data, while package/layout
+research is always performed in QA.
+
 ---
 
 ## 6. Use it — extract account spools
@@ -141,6 +149,11 @@ Home → **Spool CL (Consumer lending)**, **CMR Chile** or **Spool CASA (Current
    error (red) with the last error line.
 7. Click **Open spools folder** to open the destination folder in Explorer.
 
+While CL, CMR or CASA is running, **Cancel** immediately stops the active
+SQLcl/Java process tree and prevents pending accounts from starting. Accounts
+that already completed keep their result; cancellation does not roll back
+statements Oracle may already have committed for the active account.
+
 In **Apply existing**, choose **Consumer Lending** or **CMR** when Chile is
 selected, then browse one or more existing `.SQL` files and apply them to the
 destination DB in one batch.
@@ -156,6 +169,146 @@ CMR Chile files land in:
 `%LOCALAPPDATA%\OracleTasksChile\spools_CMR\CL_Acc_Spool_<account>_<branch>.SQL`
 
 Savings files land in `spools_savings_out\`.
+
+---
+
+## 7. Use it — rebuild a Generic Interface output file
+
+Open **Output files** from the sidebar.
+
+1. Select a configured PROD credential for Chile, Peru, Colombia, or Mexico.
+2. Enter the numeric `process_ref_no`.
+3. The app searches the active/archive upload masters and file logs, then
+   automatically detects the input interface, its outgoing mapping, the
+   reconstructible source, file date, and physical filename. It never treats
+   `ARCHIVAL_DATE` as the client file date: automatic date resolution uses
+   `UPLOAD_DATE` from the matching `GITB_FILE_LOG`/`GITA_FILE_LOG`, with
+   `START_DATE_STAMP` only as a legacy fallback.
+4. Click **Generate file**, review the preview/counts, and open the output
+   folder when complete.
+
+Process discovery and input/output mapping run against whichever configured
+PROD country is selected. Exact generation is enabled for the 39 Chile-QA
+contracts below and for the separate Colombia-QA `IFICOWCG → OFICOWCG`
+contract. Every other Peru, Colombia, or Mexico pair is still detected, but the
+app stops with the required `GIPKS_<OUTPUT>` package from that country's QA
+instead of silently reusing a Chile layout.
+
+Discovery is generic: it can identify any input/output pair currently declared
+in `GITM_INTERFACE_DEFINITION` (49 pairs in the development snapshot). Exact
+file generation remains deliberately adapter-based because each QA package has
+its own client contract. The 39 currently verified Chile adapters are:
+
+| Input | Output | Notes |
+| --- | --- | --- |
+| `ACCBLOCK` | `ACCBLKOU` | active or archived |
+| `CHBOOKIN` | `CHBOOKOU` | active or archived |
+| `CHICLUPD` | `CHICLOU` | active or archived while clearing data is retained |
+| `CHISALCA` | `CHISALOU` | active or archived while teller/file data and one physical upload filename are retained |
+| `CLADCHG` | `CLADCHGO` | active or archived |
+| `CLIIRFAP` | `CLOIRFAP` | active or archived |
+| `CLISLRES` | `CLOSLRES` | active or archived |
+| `CMRADCHG` | `CMRADCHO` | active or archived |
+| `CMRCIFUP` | `CMRCIFOU` | active or archived |
+| `CMRCLUPD` | `CMRCLOU` | active or archived while helper data is retained |
+| `CMRLPMNT` | `CMRLPMTO` | active or archived |
+| `CMRRELVP` | `CMRRELVO` | active or archived |
+| `GIUDFUPD` | `GIUPDSTS` | active only; the detail table has no archived equivalent |
+| `IACMASSC` | `OACMASSC` | active or archived |
+| `IACMCLOS` | `OACMCLOS` | active or archived |
+| `IFCHKPRT` | `OFCHKPRT` | active only; requires current check/file-master rows |
+| `IFCLPMNT` | `IFCLPMTO` | active or archived |
+| `IFCRELVP` | `OFCRELVP` | active or archived |
+| `IFDDISSU` | `OFDDISSU` | active or archived; no footer by QA contract |
+| `IFDOBIEL` | `OFDOBIEL` | active or archived |
+| `IFEARLCG` | `IFOARLCG` | active or archived while clearing rows are retained |
+| `IFGLCRTE` | `OFGLCRTE` | active or archived |
+| `IFGLMDFY` | `OFGLMDFY` | active or archived while lookup rows are retained |
+| `IFICOWCG` | `OFICOWCG` | active only; Chile and Colombia have separate QA contracts; Colombia additionally requires retained IFCC and rejection rows |
+| `IFIWADOC` | `OFIWADOC` | active or archived only while ADOC/file-master rows remain complete |
+| `IFIWDCLG` | `OFIWDCLG` | active only; requires current clearing/file-master rows |
+| `IFLOCREC` | `OFLOCREC` | active or archived |
+| `IFMDCGEN` | `OFMDCGEN` | active or archived |
+| `IFMDSUPD` | `OFMDSUPD` | active or archived |
+| `IFOBTUPD` | `OFOBTUPD` | active or archived while lookup rows are retained |
+| `IFQSIMTP` | `OFQSIMTP` | isolated active process or latest authenticated archive snapshot only |
+| `IFSTDCST` | `DCSTOUT` | active or archived while lookup rows are retained |
+| `INCHBKPR` | `OUCHBKCU` | active or archived |
+| `IXCGRATE` | `OXCGRATE` | active or archived |
+| `LOCAMTIN` | `LOCAMTOU` | active or archived |
+| `STDCIFMO` | `STDCIFOM` | active or archived; body-only QA contract |
+| `STDCIFUP` | `STDCIFOU` | active or archived |
+| `STDCRDUP` | `STDCRDOU` | active or archived |
+| `STDINRTS` | `STDINROU` | active or archived only while custom and standard snapshots still match |
+
+`STDINRTS` preserves the package's two separate clock reads: an early one for
+the header and a later one for the physical filename. PROD uses `SYSDATE`,
+verified as equivalent in QA, because the read-only PROD login cannot resolve
+`FN_SYSDATE`.
+
+The ten remaining declared pairs are still detected, but are not generated:
+`CLMSTCH`, `CMRMSTCH`, `IFDDUPLD`, `IFDMCDRC`, `IFDPAYRC`, `IFDTAPRC`,
+`IFDVSARC`, `IVDRCSTK`, `SWDDEM30`, and `SWDRECON`. Their QA contracts use
+purged/live global data or multi-row cursors without a deterministic order, so
+the app stops instead of inventing a client file that the package cannot be
+shown to have produced byte-for-byte.
+
+`IFLOCREC`, `IFCRELVP`, and `IFICOWCG` have no `ORDER BY` in their QA cursors.
+The app applies a deterministic canonical order, but the physical row order of
+a particular historical package execution cannot be proven.
+
+For another declared pair, the app reports the exact pending adapter and QA
+package (`GIPKS_<OUTPUT_INTERFACE>`) instead of incorrectly returning “no
+interfaces.” If only a file-log row remains, or all process evidence has been
+purged, it explains that the original upload rows are unavailable and does not
+create an empty client file.
+
+If a process has multiple reconstructible interfaces or sources, has ambiguous
+log dates, or a pre-save recheck observes changed rows or mapping, generation
+stops instead of guessing.
+
+Archived tables may have no usable `PROCESS_REF_NO` index. Large historical
+reconstructions can therefore take several minutes because the app performs
+stability rechecks before saving; the UI remains cancellable throughout.
+For archived `CHISALCA`, the app derives the six-column upload index key from
+the matching `GITA_FILE_LOG` rows and then resolves teller XREFs separately.
+This avoids repeated wide scans of the 4.3-billion-row Chile PROD archive after
+initial process discovery. A temporary read-only run for process `2744251`
+completed in about 1m56s with five body rows and `FTR;5;0;`.
+
+`OFICOWCG` ACTIVE additionally proves per-row identity. Chile requires every
+IFICOWCG upload to have a unique `RECORD_REFERENCE`, exactly one clearing-log
+match, exactly one pre-UNION output, and no orphan clearing-upload row. Colombia
+reproduces its four-branch QA cursor, `SUCC/ERRO/REJR` transaction status,
+`IFTB_CLEARING_UPLOAD_C`, and clearing-rejection lookup. Because the Colombia
+DD branches can legitimately emit more than one row per upload, its guard
+instead requires every upload to reach at least one branch, processed clearing
+rows to have one upload owner, and the final UNION count to match the body. All
+mutable inputs are read again before the local save.
+
+`ACTIVE` does not mean that clearing dependencies are guaranteed to remain.
+Colombia cleanup can remove `GITM_CLEARING_LOG` on the same day while upload
+rows are still present. In that case the app stops with an incomplete-clearing
+error rather than inferring `SUCC`, `ERRO`, or `REJR`.
+
+The operation executes only `SELECT` queries in PROD. It never calls
+`fn_handoff`, performs DML/`COMMIT`, or writes to an Oracle server directory.
+Files are validated before an atomic local save, and an existing file is not
+replaced unless the user explicitly enables that option.
+
+Generated files land in:
+`%LOCALAPPDATA%\OracleTasksChile\output_files\<Country>\`
+
+To inspect the complete input/output catalogue directly in Oracle:
+
+```sql
+select distinct
+       upper(trim(interface_code)) as input_interface,
+       upper(trim(outgoing_interface)) as output_interface
+from gitm_interface_definition
+where outgoing_interface is not null
+order by 1, 2;
+```
 
 ---
 

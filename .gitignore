@@ -42,6 +42,7 @@ tmp*/
 shift/
 temp_savings/
 outputs/
+/OUTPUT_FILE_GENERATION/
 
 # Night Shift Java runtime. Runtime credentials, logs and generated files stay local.
 FBBatchSetup/CHILE/config/configuration.properties
@@ -76,6 +77,7 @@ assets/new_icon_backup.png
 
 # Internal project docs (kept local, not for end users)
 agent.md
+new_agent.md
 implementation_plan.md
 progress.md
 handoff.md

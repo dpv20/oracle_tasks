@@ -21,6 +21,7 @@ from infra.updater import check_for_update, launch_update
 from paths import ASSETS_DIR, REPO_ROOT, SHOW_FLAG_PATH
 from version import __version__
 from features.vpn.service import VPNService
+from features.output_file_generation.view import OutputFileGenerationView
 
 from .home_view import HomeView
 from .fbbatch_view import FBBatchSetupView
@@ -153,7 +154,7 @@ class OracleTasksApp:
         self.root.title(t("app.title"))
         # Optimized window sizing for a professional side navigation layout
         self.root.geometry("1100x720")
-        self.root.minsize(850, 600)
+        self.root.minsize(850, 680)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         if not start_hidden:
             self.root.after(0, self._maximize)
@@ -177,7 +178,15 @@ class OracleTasksApp:
         self._menu_buttons: dict[str, _SidebarNavItem] = {}
 
         # Quick initialization, actual localized text labels will be loaded dynamically
-        for view_name in ["home", "spools_cl", "spools_savings", "fbbatch", "vpn", "settings"]:
+        for view_name in [
+            "home",
+            "spools_cl",
+            "spools_savings",
+            "output_files",
+            "fbbatch",
+            "vpn",
+            "settings",
+        ]:
             btn = _SidebarNavItem(
                 self.sidebar,
                 command=lambda name=view_name: self.show_view(name),
@@ -291,6 +300,7 @@ class OracleTasksApp:
             "home": ("🏠", "Inicio" if lang == "es" else "Dashboard", ""),
             "spools_cl": ("▣", *self._split_sidebar_copy(t("home.spools_cl_button"))),
             "spools_savings": ("💵", *self._split_sidebar_copy(t("home.savings_button"))),
+            "output_files": ("⇩", t("output_files.nav"), ""),
             "fbbatch": ("☾", t("fbbatch.nav"), ""),
             "vpn": ("◉", t("vpn.nav"), ""),
             "settings": ("⚙", t("settings.title"), ""),
@@ -389,16 +399,18 @@ class OracleTasksApp:
         return any(bool(getattr(view, "_running", False)) for view in self._views.values())
 
     def _warn_running_work(self) -> None:
-        lang = self.config.get("language", "en")
-        msg = (
-            "Wait for the current extraction/injection to finish, or cancel it, before changing the interface or closing the app."
-            if lang == "en"
-            else "Espera a que termine la extracción/inyección actual, o cancélala, antes de cambiar la interfaz o cerrar la app."
-        )
-        messagebox.showwarning(t("app.title"), msg, parent=self.root)
+        messagebox.showwarning(t("app.title"), t("app.running_work"), parent=self.root)
 
     # ── view router ──
     def show_view(self, name: str) -> None:
+        running_views = {
+            view_name
+            for view_name, view in self._views.items()
+            if bool(getattr(view, "_running", False))
+        }
+        if running_views and name not in running_views:
+            self._warn_running_work()
+            return
         for v in self._views.values():
             if v.winfo_ismapped() and hasattr(v, "on_hide"):
                 v.on_hide()
@@ -441,6 +453,8 @@ class OracleTasksApp:
             return SpoolsCLView(self.container, app=self)
         if name == "spools_savings":
             return SpoolsSavingsView(self.container, app=self)
+        if name == "output_files":
+            return OutputFileGenerationView(self.container, app=self)
         if name == "fbbatch":
             return FBBatchSetupView(self.container, app=self)
         if name == "vpn":
@@ -563,6 +577,9 @@ class OracleTasksApp:
         threading.Thread(target=worker, daemon=True).start()
 
     def show_vpn_settings(self) -> None:
+        if self._has_running_work():
+            self._warn_running_work()
+            return
         self.show_view("vpn")
         view = self._views.get("vpn")
         if view is not None and hasattr(view, "show_settings"):
