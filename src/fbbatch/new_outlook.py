@@ -24,8 +24,12 @@ NEW_OUTLOOK_START_TIMEOUT_SECONDS = 45.0
 NEW_OUTLOOK_INITIAL_WINDOW_TIMEOUT_SECONDS = 15.0
 NEW_OUTLOOK_RECOVERY_WINDOW_TIMEOUT_SECONDS = 35.0
 NEW_OUTLOOK_SAVE_TIMEOUT_SECONDS = 45.0
-NEW_OUTLOOK_IMAGE_PASTE_SETTLE_SECONDS = 2.5
+NEW_OUTLOOK_BODY_CONFIRM_TIMEOUT_SECONDS = 8.0
+NEW_OUTLOOK_BODY_PASTE_ATTEMPTS = 2
+NEW_OUTLOOK_IMAGE_MATERIALIZE_TIMEOUT_SECONDS = 12.0
+NEW_OUTLOOK_IMAGE_PASTE_SETTLE_SECONDS = 6.0
 NEW_OUTLOOK_SAVE_SETTLE_SECONDS = 5.0
+NEW_OUTLOOK_MEDIA_SYNC_SETTLE_SECONDS = 10.0
 OUTLOOK_INLINE_IMAGE_MAX_WIDTH = 960
 OUTLOOK_INLINE_IMAGE_MAX_HEIGHT = 720
 NEW_OUTLOOK_APP_USER_MODEL_ID = (
@@ -196,12 +200,28 @@ def create_new_outlook_draft(
             keyboard.send_keys("^v")
             _wait_for_attachment_chips(compose_window, existing_attachments, timeout=20.0)
 
+        visible_image_count = _image_control_count(compose_window)
         for image_path in existing_images:
             stage = "paste-inline-image"
             _set_clipboard_image(image_path)
             keyboard.send_keys("^v")
+            materialized_image_count = _wait_for_inline_image_materialization(
+                compose_window,
+                previous_count=visible_image_count,
+                timeout=NEW_OUTLOOK_IMAGE_MATERIALIZE_TIMEOUT_SECONDS,
+            )
+            if materialized_image_count <= visible_image_count:
+                log.warning(
+                    "new_outlook_draft: inline image was not exposed through UIA; "
+                    "using extended settle path=%s baseline_images=%s current_images=%s",
+                    image_path,
+                    visible_image_count,
+                    materialized_image_count,
+                )
+            visible_image_count = max(visible_image_count, materialized_image_count)
             # New Outlook consumes bitmap clipboard data asynchronously. Keep
-            # it available until the editor has materialized the image.
+            # it available after the visual control appears so the draft can
+            # persist the image instead of retaining a temporary clipboard URL.
             time.sleep(NEW_OUTLOOK_IMAGE_PASTE_SETTLE_SECONDS)
             keyboard.send_keys("{ENTER}{ENTER}")
             log.info(
@@ -220,6 +240,21 @@ def create_new_outlook_draft(
         )
         draft_saved = True
         log.info("new_outlook_draft: save confirmed status=%r", saved_label)
+        if existing_images:
+            stage = "sync-inline-images"
+            log.info(
+                "new_outlook_draft: keeping saved draft open for inline image sync delay=%.1fs",
+                NEW_OUTLOOK_MEDIA_SYNC_SETTLE_SECONDS,
+            )
+            time.sleep(NEW_OUTLOOK_MEDIA_SYNC_SETTLE_SECONDS)
+            stage = "resave-inline-images"
+            _save_draft(compose_window, keyboard)
+            saved_label = _wait_for_saved_confirmation(
+                compose_window,
+                timeout=NEW_OUTLOOK_SAVE_TIMEOUT_SECONDS,
+                minimum_wait=NEW_OUTLOOK_SAVE_SETTLE_SECONDS,
+            )
+            log.info("new_outlook_draft: inline image resave confirmed status=%r", saved_label)
         stage = "close-compose"
         _close_popout_compose(compose_window, desktop=desktop)
         compose_closed = True
@@ -239,7 +274,7 @@ def create_new_outlook_draft(
         if desktop is not None:
             log_outlook_uia_windows(log, desktop, stage=f"new-unavailable-{stage}")
         if compose_window is not None and not draft_saved:
-            compose_closed = _discard_failed_compose(compose_window)
+            compose_closed = _discard_failed_compose(compose_window, desktop=desktop)
         elif compose_window is not None and not compose_closed:
             log.warning(
                 "new_outlook_draft: saved compose remains open for manual recovery; "
@@ -255,7 +290,7 @@ def create_new_outlook_draft(
         if desktop is not None:
             log_outlook_uia_windows(log, desktop, stage=f"new-failed-{stage}")
         if compose_window is not None and not draft_saved:
-            compose_closed = _discard_failed_compose(compose_window)
+            compose_closed = _discard_failed_compose(compose_window, desktop=desktop)
         elif compose_window is not None and not compose_closed:
             log.warning(
                 "new_outlook_draft: saved compose remains open for manual recovery; "
@@ -1010,7 +1045,7 @@ def _fill_subject(window, subject: str, keyboard) -> None:
 
 
 def _control_contains_text(control, expected: str) -> bool:
-    wanted = expected.strip().casefold()
+    wanted = _normalize_uia_text(expected)
     values: list[str] = []
 
     for getter_name in ("get_value", "window_text"):
@@ -1031,7 +1066,30 @@ def _control_contains_text(control, expected: str) -> bool:
     except Exception:
         pass
 
-    return any(wanted in value.strip().casefold() for value in values)
+    try:
+        values.append(str(control.iface_text.DocumentRange.GetText(-1)))
+    except Exception:
+        pass
+
+    try:
+        descendants = list(control.descendants())
+    except (Exception, TypeError):
+        descendants = []
+    for descendant in descendants:
+        try:
+            values.append(str(descendant.window_text()))
+        except Exception:
+            pass
+        try:
+            values.append(str(descendant.element_info.name))
+        except Exception:
+            pass
+
+    return any(wanted in _normalize_uia_text(value) for value in values)
+
+
+def _normalize_uia_text(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value)).strip().casefold()
 
 
 def _find_body_editor(window):
@@ -1048,25 +1106,81 @@ def _find_body_editor(window):
 
 
 def _fill_body(body, message_text: str, keyboard) -> None:
-    body.click_input()
-    keyboard.send_keys("^{HOME}")
-    _set_clipboard_text(message_text)
-    keyboard.send_keys("^v")
-    log.info("new_outlook_draft: body paste sent chars=%s", len(message_text))
-    marker = next(
-        (line.strip() for line in message_text.splitlines() if line.strip()),
-        "",
-    )[:80]
+    lines = [line.strip() for line in message_text.splitlines() if line.strip()]
+    marker = max(lines, key=len, default="")[:120]
     if not marker:
         log.info("new_outlook_draft: empty body paste completed")
         return
-    deadline = time.monotonic() + 4.0
-    while time.monotonic() < deadline:
-        if marker.casefold() in body.window_text().casefold():
-            log.info("new_outlook_draft: body text completed")
-            return
-        time.sleep(0.2)
+
+    for attempt in range(1, NEW_OUTLOOK_BODY_PASTE_ATTEMPTS + 1):
+        try:
+            body.set_focus()
+        except Exception:
+            log.debug("new_outlook_draft: body set_focus failed", exc_info=True)
+        body.click_input()
+        time.sleep(0.25)
+        keyboard.send_keys("^{HOME}")
+        time.sleep(0.15)
+        _set_clipboard_text(message_text)
+        keyboard.send_keys("^v")
+        log.info(
+            "new_outlook_draft: body paste sent attempt=%s/%s chars=%s",
+            attempt,
+            NEW_OUTLOOK_BODY_PASTE_ATTEMPTS,
+            len(message_text),
+        )
+        deadline = time.monotonic() + NEW_OUTLOOK_BODY_CONFIRM_TIMEOUT_SECONDS
+        while time.monotonic() < deadline:
+            if _control_contains_text(body, marker):
+                log.info(
+                    "new_outlook_draft: body text completed attempt=%s marker=%r",
+                    attempt,
+                    marker,
+                )
+                return
+            time.sleep(0.25)
+        if attempt < NEW_OUTLOOK_BODY_PASTE_ATTEMPTS:
+            log.warning(
+                "new_outlook_draft: body was not confirmed after paste; refocusing and retrying"
+            )
+            time.sleep(0.75)
     raise NewOutlookAutomationError("New Outlook did not confirm the message body.")
+
+
+def _image_control_count(window) -> int:
+    try:
+        controls = list(window.descendants())
+    except (Exception, TypeError):
+        return 0
+    count = 0
+    for control in controls:
+        try:
+            if str(control.element_info.control_type) == "Image":
+                count += 1
+        except Exception:
+            continue
+    return count
+
+
+def _wait_for_inline_image_materialization(
+    window,
+    *,
+    previous_count: int,
+    timeout: float,
+) -> int:
+    deadline = time.monotonic() + max(0.0, timeout)
+    current_count = _image_control_count(window)
+    while time.monotonic() < deadline:
+        current_count = _image_control_count(window)
+        if current_count > previous_count:
+            log.info(
+                "new_outlook_draft: inline image materialized previous_images=%s current_images=%s",
+                previous_count,
+                current_count,
+            )
+            return current_count
+        time.sleep(0.25)
+    return current_count
 
 
 def _wait_for_attachment_chips(window, attachments: list[Path], *, timeout: float) -> None:
@@ -1221,9 +1335,25 @@ def _native_window_exists(handle: int, window) -> bool:
         return False
 
 
-def _discard_failed_compose(window, *, timeout: float = 5.0) -> bool:
+def _discard_failed_compose(window, *, desktop=None, timeout: float = 10.0) -> bool:
     try:
-        window.close()
+        handle = int(getattr(window, "handle", 0) or 0)
+    except (TypeError, ValueError):
+        handle = 0
+    try:
+        close_buttons = [
+            control
+            for control in window.descendants()
+            if control.element_info.control_type == "Button"
+            and str(control.element_info.automation_id) == "windowIconClose"
+        ]
+        if close_buttons:
+            try:
+                close_buttons[0].invoke()
+            except Exception:
+                close_buttons[0].click_input()
+        else:
+            window.close()
     except Exception:
         log.warning("new_outlook_draft: could not request closing failed compose", exc_info=True)
         return False
@@ -1231,15 +1361,31 @@ def _discard_failed_compose(window, *, timeout: float = 5.0) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
-            discard_buttons = [
-                control
-                for control in window.descendants()
-                if control.element_info.control_type == "Button"
-                and control.window_text().strip().casefold() in ("no", "discard", "descartar")
-            ]
-            if discard_buttons:
-                discard_buttons[0].invoke()
-                log.info("new_outlook_draft: incomplete compose discarded")
+            candidates = [window]
+            if desktop is not None:
+                candidates.extend(
+                    candidate
+                    for candidate in desktop.windows()
+                    if getattr(candidate, "handle", None) != handle
+                )
+            for candidate in candidates:
+                controls = candidate.descendants()
+                discard_buttons = [
+                    control
+                    for control in controls
+                    if control.element_info.control_type == "Button"
+                    and control.window_text().replace("&", "").strip().casefold()
+                    in ("no", "discard", "descartar", "don't save", "no guardar")
+                ]
+                if discard_buttons:
+                    try:
+                        discard_buttons[0].invoke()
+                    except Exception:
+                        discard_buttons[0].click_input()
+                    log.info("new_outlook_draft: incomplete compose discarded")
+                    return True
+            if not _native_window_exists(handle, window):
+                log.info("new_outlook_draft: incomplete compose closed without a save prompt")
                 return True
         except Exception:
             log.debug("new_outlook_draft: waiting for close-draft confirmation", exc_info=True)

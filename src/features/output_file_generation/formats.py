@@ -12,6 +12,20 @@ _INTERFACE_RE = re.compile(r"^[A-Z][A-Z0-9_$#]{0,29}$")
 _TIME_RE = re.compile(r"^[0-9]{6}$")
 
 
+# These three country packages share the extended OFICOWCG wire contract:
+# eleven data values, the upload status, optional error fields, and the final
+# clearing transaction status.  Their SELECT cursors are still dispatched by
+# country in queries.py because Peru has a material join difference.
+OFICOWCG_TRANSACTION_CONTRACTS = frozenset(
+    {
+        "oficowcg_colombia",
+        "oficowcg_mexico",
+        "oficowcg_peru",
+    }
+)
+CHISALOU_CONTRACTS = frozenset({"chisalou", "chisalou_peru"})
+
+
 @dataclass(frozen=True)
 class InterfaceSpec:
     input_code: str
@@ -699,7 +713,7 @@ def build_header(
         return f"LH^{spec.header_name}^{client_date}^"
     if spec.contract == "cmrclou":
         return f"LH^{spec.header_name}^{date}^"
-    if spec.contract == "chisalou":
+    if spec.contract in CHISALOU_CONTRACTS:
         header_date = validate_file_date(database_date)
         name = str(input_physical_filename or "").strip()
         if not name or ";" in name or "\r" in name or "\n" in name:
@@ -909,7 +923,7 @@ def build_footer(
         return f"FTR;{processed};{unprocessed};"
     if spec.contract in {
         "chbookou",
-        "chisalou",
+        *CHISALOU_CONTRACTS,
         "locamtou",
         "oacmassc",
         "stdcrdou",
@@ -1096,7 +1110,7 @@ def validate_output_lines(spec: InterfaceSpec, lines: Sequence[str]) -> None:
     if spec.contract == "stdinrou":
         _validate_stdinrou_lines(lines)
         return
-    if spec.contract not in {"standard", "oficowcg_colombia"}:
+    if spec.contract not in {"standard", *OFICOWCG_TRANSACTION_CONTRACTS}:
         _validate_declarative_lines(spec, lines)
         return
     if spec.input_code == "CLADCHG":
@@ -1195,7 +1209,7 @@ def validate_output_lines(spec: InterfaceSpec, lines: Sequence[str]) -> None:
             status = fields[12]
             if status not in spec.allowed_statuses:
                 raise ValueError("OFICOWCG body status must be P, E, or U")
-            if spec.contract == "oficowcg_colombia":
+            if spec.contract in OFICOWCG_TRANSACTION_CONTRACTS:
                 has_error_fields = len(fields) == spec.error_body_field_count
                 txn_status = fields[15] if has_error_fields else fields[13]
                 allowed_pairs = {
@@ -1204,18 +1218,18 @@ def validate_output_lines(spec: InterfaceSpec, lines: Sequence[str]) -> None:
                     "U": {"NOPR"},
                 }
                 if txn_status not in allowed_pairs[status]:
-                    raise ValueError("Invalid Colombia OFICOWCG status pair")
+                    raise ValueError("Invalid regional OFICOWCG status pair")
                 if status == "P" and txn_status == "SUCC" and has_error_fields:
                     raise ValueError(
-                        "Successful Colombia OFICOWCG body must not contain error fields"
+                        "Successful OFICOWCG body must not contain error fields"
                     )
                 if status == "P" and txn_status == "REJR" and not has_error_fields:
                     raise ValueError(
-                        "Rejected Colombia OFICOWCG body must contain error fields"
+                        "Rejected OFICOWCG body must contain error fields"
                     )
                 if status in {"E", "U"} and not has_error_fields:
                     raise ValueError(
-                        "Colombia OFICOWCG error body must contain code and description"
+                        "OFICOWCG error body must contain code and description"
                     )
             else:
                 if status == "P" and len(fields) != spec.body_field_count:
@@ -1539,7 +1553,7 @@ def _validate_declarative_lines(
         expected_header_fields = 2 if contract == "dcstout" else 3
         if len(header) != expected_header_fields:
             raise ValueError(f"Invalid {spec.output_code} header")
-        if contract == "chisalou":
+        if contract in CHISALOU_CONTRACTS:
             if header[0] != "HDR" or not header[1]:
                 raise ValueError("Invalid CHISALOU header")
             if not re.fullmatch(r"[0-9]{14}", header[2]):
@@ -1641,26 +1655,27 @@ def _validate_declarative_lines(
             if len(fields) == 7 and fields[3] == "E" and fields[6] == "":
                 continue
             raise ValueError(f"Invalid {spec.output_code} body")
-        if contract == "chisalou":
+        if contract in CHISALOU_CONTRACTS:
             # ERROR/FLD199 is a raw semicolon list, so validate only the stable
             # package prefix and leave the package-owned tail structurally open.
-            prefix = line.split(";", 9)
+            status_index = 9 if contract == "chisalou_peru" else 8
+            prefix = line.split(";", status_index + 1)
             if (
-                len(prefix) != 10
+                len(prefix) != status_index + 2
                 or prefix[0] != "BDY"
                 or not line.endswith(";")
             ):
                 raise ValueError("Invalid CHISALOU body record")
             if prefix[6]:
                 validate_file_date(prefix[6])
-            if prefix[8] == "Y":
+            if prefix[status_index] == "Y":
                 positive += 1
-            elif prefix[8] == "N":
+            elif prefix[status_index] == "N":
                 negative += 1
             elif (
                 prefix[1] == ""
-                and prefix[8] == "NGI-INT214*Failed to process data*"
-                and prefix[9] == ""
+                and prefix[status_index] == "NGI-INT214*Failed to process data*"
+                and prefix[status_index + 1] == ""
             ):
                 # Preserve the missing delimiter in the QA package's U branch.
                 negative += 1
@@ -1892,7 +1907,7 @@ def _validate_declarative_lines(
         if counts != [positive, negative]:
             raise ValueError(f"{spec.output_code} footer does not match its body")
     elif contract in {
-        "chisalou",
+        *CHISALOU_CONTRACTS,
         "cmrcifou",
         "ouchbkcu",
         "stdcifou",

@@ -7,6 +7,7 @@ import os
 import re
 import tempfile
 import threading
+import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -15,11 +16,15 @@ from pathlib import Path
 from paths import OUTPUT_FILES_OUT_DIR
 from settings.config import ConfigManager, decrypt_password
 from settings.credentials import to_sqlcl_arg
+from settings.database_failover import alternative_alias
+from spools_cl_accounts.database_failover import connection_failure_reason
 from spools_cl_accounts.databases import configured_databases, find_db
 from spools_cl_accounts.sqlcl import RunResult, SqlclRunner
 
 from .formats import (
+    CHISALOU_CONTRACTS,
     InterfaceSpec,
+    OFICOWCG_TRANSACTION_CONTRACTS,
     build_footer,
     build_header,
     format_error_code,
@@ -32,6 +37,7 @@ from .formats import (
     serialize_lines,
     split_error_codes,
     split_oacmclos_error_codes,
+    spec_for_code,
     supported_specs,
     validate_file_date,
     validate_output_lines,
@@ -76,11 +82,18 @@ _COUNTRY_FOLDERS = {
     "colombia": "Colombia",
     "mexico": "Mexico",
 }
+
+
+def _uses_transactional_oficowcg_contract(spec: InterfaceSpec) -> bool:
+    return spec.contract in OFICOWCG_TRANSACTION_CONTRACTS
 _SQL_ERROR_RE = re.compile(
     r"\b(?:ORA|SP2|PLS)-\d{4,5}\b|\bSQL\s+Error\b|\bClosed\s+Connection\b",
     re.IGNORECASE,
 )
 _CONNECTION_RE = re.compile(r"\b[^\s/]+(?:\[[^\]]+\])?/[^\s@]+@[^\s]+", re.IGNORECASE)
+_SQLCL_LOGIN_USER_RE = re.compile(r"^\s*USER\s*=", re.IGNORECASE)
+_SQLCL_LOGIN_URL_RE = re.compile(r"^\s*URL\s*=", re.IGNORECASE)
+_SQLCL_LOGIN_ERROR_RE = re.compile(r"^\s*Error Message\s*=\s*(.*)$", re.IGNORECASE)
 _ORACLE_IDENTIFIER_RE = re.compile(r"^[A-Z][A-Z0-9_$#]{0,127}$")
 _CHISALCA_TELLER_BATCH_SIZE = 500
 
@@ -105,6 +118,7 @@ class _ChisalcaUploadRow:
     fallback_amount: str
     fallback_date: str
     fallback_currency: str
+    ccicode: str
     error_code: str
     error_param: str
 
@@ -184,7 +198,7 @@ class _OficowcgCoverageMetadata:
 
 
 @dataclass(frozen=True)
-class _OficowcgColombiaCoverageMetadata:
+class _OficowcgRegionalCoverageMetadata:
     upload_rows: int
     nonnull_record_references: int
     distinct_record_references: int
@@ -201,6 +215,74 @@ class OutputFileGenerationError(RuntimeError):
 
 class GenerationCancelled(OutputFileGenerationError):
     """The user cancelled the SQLcl operation."""
+
+
+class _RetryableDatabaseConnectionError(OutputFileGenerationError):
+    """A structured connection failure that may restart the whole generation."""
+
+    def __init__(self, message: str, *, reason: str, stage: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.stage = stage
+
+
+def _sqlcl_login_diagnostic(stdout: str) -> str:
+    """Extract only the error portion of SQLcl's structured login banner."""
+    lines = (stdout or "").replace("\r\n", "\n").replace("\r", "\n").splitlines()
+    if not any(_SQLCL_LOGIN_USER_RE.match(line) for line in lines):
+        return ""
+    if not any(_SQLCL_LOGIN_URL_RE.match(line) for line in lines):
+        return ""
+    error_indexes = [
+        index
+        for index, line in enumerate(lines)
+        if _SQLCL_LOGIN_ERROR_RE.match(line)
+    ]
+    if len(error_indexes) != 1:
+        return ""
+    index = error_indexes[0]
+    match = _SQLCL_LOGIN_ERROR_RE.match(lines[index])
+    assert match is not None
+    diagnostic = [match.group(1).strip()]
+    for line in lines[index + 1 : index + 5]:
+        stripped = line.strip()
+        if re.match(r"^(?:ORA|TNS)-\d+\b", stripped, re.IGNORECASE):
+            diagnostic.append(stripped)
+    return "\n".join(part for part in diagnostic if part)
+
+
+def _connection_failure_reason_for_query(
+    result: RunResult,
+    query: FramedQuery,
+) -> str | None:
+    """Classify connectivity without inspecting client rows inside the frame."""
+    if result.exit_code in {124, 130}:
+        return None
+    stdout = (result.stdout or "").replace("\r\n", "\n").replace("\r", "\n")
+    begin = stdout.find(query.begin_marker)
+    end = stdout.find(query.end_marker)
+    outside = ""
+    # Without a complete frame arbitrary stdout cannot be separated safely from
+    # rows already fetched for the client. The sole exception is SQLcl's exact
+    # structured login banner, from which only the Error Message is extracted.
+    if begin >= 0 and end >= begin:
+        outside = output_outside_markers(stdout, query)
+    elif begin < 0:
+        outside = _sqlcl_login_diagnostic(stdout)
+    diagnostic = "\n".join(
+        part for part in (result.stderr or "", outside) if part
+    )
+    if not diagnostic.strip():
+        return None
+    # A few SQLcl versions have returned a zero exit code with an Oracle error
+    # outside the markers. Use a synthetic failing result solely for the shared
+    # connection-error classifier; framed client data is never included.
+    classified = RunResult(
+        result.exit_code if not result.ok else 1,
+        "",
+        diagnostic,
+    )
+    return connection_failure_reason(classified)
 
 
 class OutputFileGenerationService:
@@ -243,6 +325,12 @@ class OutputFileGenerationService:
     ) -> GenerationResult:
         _folder_for_country(request.target.country)
         process_ref = _as_generation_error(validate_process_ref, request.process_ref_no)
+        selected_spec = _resolve_requested_interface(request.interface_code)
+        requested_file_date = (
+            _as_generation_error(validate_file_date, request.input_file_date)
+            if request.input_file_date is not None
+            else None
+        )
 
         sqlcl_path = str(self.config.get("sqlcl_path", "") or "").strip()
         if not sqlcl_path or not Path(sqlcl_path).is_file():
@@ -263,11 +351,16 @@ class OutputFileGenerationService:
                 "The selected credential is no longer configured for PROD"
             )
 
-        trusted_request = replace(request, target=target)
+        trusted_request = replace(
+            request,
+            target=target,
+            input_file_date=requested_file_date,
+        )
 
         _raise_if_cancelled(cancel_event)
         password = ""
         connection = ""
+        fallback_connection = ""
         try:
             password = self._decryptor(str(credential.get("password_enc") or ""))
             if not password:
@@ -281,14 +374,51 @@ class OutputFileGenerationService:
                 target.tns,
             )
             runner = self._runner_factory(sqlcl_path)
-            return self._generate_connected(
-                request=trusted_request,
-                process_ref=process_ref,
-                runner=runner,
-                connection=connection,
-                cancel_event=cancel_event,
-            )
+            try:
+                return self._generate_connected(
+                    request=trusted_request,
+                    process_ref=process_ref,
+                    runner=runner,
+                    connection=connection,
+                    cancel_event=cancel_event,
+                    selected_spec=selected_spec,
+                )
+            except _RetryableDatabaseConnectionError as primary_failure:
+                _raise_if_cancelled(cancel_event)
+                fallback = self._alternative_prod_attempt(target)
+                if fallback is None:
+                    raise
+                fallback_target, fallback_connection = fallback
+                log.warning(
+                    "Output database connection failed alias=%s stage=%s "
+                    "reason=%s; restarting complete generation on equivalent alias=%s",
+                    target.tns,
+                    primary_failure.stage,
+                    primary_failure.reason,
+                    fallback_target.tns,
+                )
+                _raise_if_cancelled(cancel_event)
+                fallback_request = replace(trusted_request, target=fallback_target)
+                try:
+                    return self._generate_connected(
+                        request=fallback_request,
+                        process_ref=process_ref,
+                        runner=runner,
+                        connection=fallback_connection,
+                        cancel_event=cancel_event,
+                        selected_spec=selected_spec,
+                    )
+                except _RetryableDatabaseConnectionError as fallback_failure:
+                    log.warning(
+                        "Equivalent output database connection also failed "
+                        "alias=%s stage=%s reason=%s; no further retry",
+                        fallback_target.tns,
+                        fallback_failure.stage,
+                        fallback_failure.reason,
+                    )
+                    raise
         finally:
+            fallback_connection = ""
             connection = ""
             password = ""
 
@@ -321,6 +451,93 @@ class OutputFileGenerationService:
             tns=str(selected["id"]),
             label=str(selected.get("label") or selected["id"]),
         )
+
+    def _alternative_prod_attempt(
+        self,
+        target: OracleTarget,
+    ) -> tuple[OracleTarget, str] | None:
+        """Resolve one unambiguous, usable equivalent PROD connection lazily."""
+        fallback_alias = alternative_alias(
+            target.country,
+            target.tns,
+            self.config.get("database_failover", {}),
+        )
+        if not fallback_alias:
+            return None
+
+        rows = [
+            row
+            for row in self.targets(target.country)
+            if str(row.get("id") or "").strip().upper()
+            == fallback_alias.upper()
+        ]
+        same_login = [
+            row
+            for row in rows
+            if str(row.get("credential_key") or "").strip().upper()
+            == target.credential_key.strip().upper()
+        ]
+        if len(same_login) == 1:
+            selected = same_login[0]
+        elif len(same_login) > 1 or len(rows) != 1:
+            log.warning(
+                "Output database failover unavailable primary=%s alternative=%s "
+                "reason=ambiguous-or-missing-PROD-credential",
+                target.tns,
+                fallback_alias,
+            )
+            return None
+        else:
+            selected = rows[0]
+
+        fallback_target = OracleTarget(
+            country=target.country,
+            database_key=str(selected.get("database_key") or fallback_alias),
+            credential_key=str(selected.get("credential_key") or ""),
+            tns=str(selected.get("id") or fallback_alias),
+            label=str(selected.get("label") or fallback_alias),
+        )
+        credential = self.config.get_credential(
+            fallback_target.country,
+            fallback_target.database_key,
+            fallback_target.credential_key,
+        )
+        if not credential or not self._credential_still_matches_prod(
+            fallback_target,
+            credential,
+        ):
+            log.warning(
+                "Output database failover unavailable primary=%s alternative=%s "
+                "reason=credential-no-longer-valid-for-PROD",
+                target.tns,
+                fallback_alias,
+            )
+            return None
+
+        fallback_password = ""
+        try:
+            fallback_password = self._decryptor(
+                str(credential.get("password_enc") or "")
+            )
+            if not fallback_password:
+                raise ValueError("empty decrypted password")
+            connection = to_sqlcl_arg(
+                str(credential.get("user") or ""),
+                str(credential.get("schema") or "") or None,
+                fallback_password,
+                fallback_target.tns,
+            )
+        except Exception:
+            log.warning(
+                "Output database failover unavailable primary=%s alternative=%s "
+                "reason=password-could-not-be-decrypted",
+                target.tns,
+                fallback_alias,
+            )
+            return None
+        finally:
+            fallback_password = ""
+        return fallback_target, connection
 
     @staticmethod
     def _credential_still_matches_prod(
@@ -362,34 +579,67 @@ class OutputFileGenerationService:
         runner: SqlclRunner,
         connection: str,
         cancel_event: threading.Event | None,
+        selected_spec: InterfaceSpec | None,
     ) -> GenerationResult:
+        detection = "automatic" if selected_spec is None else "manual"
         log.info(
-            "Output reconstruction started country=%s tns=%s process_ref=%s detection=automatic",
+            "Output reconstruction started country=%s tns=%s process_ref=%s "
+            "detection=%s interface=%s",
             request.target.country,
             request.target.tns,
             process_ref,
+            detection,
+            selected_spec.input_code if selected_spec is not None else "<automatic>",
         )
 
+        # A manual selection already identifies the event.  Restrict discovery
+        # to that interface so old processes do not force a scan of every GI
+        # archive.  DCSTOUT/STDINROU retain the full view because their verified
+        # QA footers are process-global and must reject shared process numbers.
+        discovery_input_code = (
+            selected_spec.input_code
+            if selected_spec is not None
+            and selected_spec.contract not in {"dcstout", "stdinrou"}
+            else None
+        )
         discovery_rows = self._execute(
             runner,
             connection,
-            build_discovery_query(process_ref),
+            build_discovery_query(process_ref, discovery_input_code),
             timeout=120,
             cancel_event=cancel_event,
         )
         candidates = _parse_candidates(discovery_rows)
 
-        mapping_rows: list[str] = []
-        if candidates:
+        if selected_spec is not None:
+            spec, candidate = _select_candidate(
+                candidates,
+                {},
+                selected_spec=selected_spec,
+            )
+            _validate_manual_process_scope(spec, candidate, candidates)
             mapping_rows = self._execute(
                 runner,
                 connection,
-                build_mappings_query(candidate.input_code for candidate in candidates),
+                build_mappings_query((selected_spec.input_code,)),
                 timeout=90,
                 cancel_event=cancel_event,
             )
-        mappings = _parse_mappings(mapping_rows)
-        spec, candidate = _select_candidate(candidates, mappings)
+            mappings = _parse_mappings(mapping_rows)
+        else:
+            mapping_rows: list[str] = []
+            if candidates:
+                mapping_rows = self._execute(
+                    runner,
+                    connection,
+                    build_mappings_query(
+                        candidate.input_code for candidate in candidates
+                    ),
+                    timeout=90,
+                    cancel_event=cancel_event,
+                )
+            mappings = _parse_mappings(mapping_rows)
+            spec, candidate = _select_candidate(candidates, mappings)
         _validate_mapping(spec, mappings)
         if (
             spec.input_code in {"IFCHKPRT", "IFIWDCLG"}
@@ -408,7 +658,7 @@ class OutputFileGenerationService:
                 "retained GITM_CLEARING_LOG, IFTB_CLEARING_UPLOAD, "
                 "IFTB_CLEARING_UPLOAD_C, CSTB_CLEARING_REJECTION, and active "
                 "GITB_FILE_MASTER data"
-                if request.target.country == "colombia"
+                if request.target.country in {"colombia", "mexico", "peru"}
                 else (
                     "retained GITM_CLEARING_LOG, IFTB_CLEARING_UPLOAD, and "
                     "active GITB_FILE_MASTER data"
@@ -419,6 +669,20 @@ class OutputFileGenerationService:
                 "be reconstructed from them alone: the QA contract also requires "
                 f"{dependencies}. Generation was stopped "
                 "instead of creating an empty output file"
+            )
+        if (
+            request.target.country != "chile"
+            and candidate.source is DataSourceChoice.ARCHIVE
+            and spec.input_code in {"CHISALCA", "IFDOBIEL"}
+        ):
+            country_label = _COUNTRY_FOLDERS.get(
+                request.target.country,
+                request.target.country.title(),
+            )
+            raise OutputFileGenerationError(
+                f"{spec.output_code} archive reconstruction for {country_label} "
+                "is not verified against a retained regional upload. Use a "
+                "current ACTIVE process or add a country-specific archive fixture"
             )
         if (
             spec.input_code == "GIUDFUPD"
@@ -463,6 +727,24 @@ class OutputFileGenerationService:
                 "The file date could not be detected automatically from this process"
             )
         file_date = _as_generation_error(validate_file_date, file_date)
+        if (
+            request.input_file_date is not None
+            and file_date != request.input_file_date
+        ):
+            selected_display = (
+                f"{request.input_file_date[6:8]}-"
+                f"{request.input_file_date[4:6]}-"
+                f"{request.input_file_date[:4]}"
+            )
+            detected_display = (
+                f"{file_date[6:8]}-{file_date[4:6]}-{file_date[:4]}"
+            )
+            raise OutputFileGenerationError(
+                "The selected input date does not match the PROD file log: "
+                f"selected {selected_display}, detected {detected_display}. "
+                "The selected date is a safety check and never overrides "
+                "Oracle's persisted process date"
+            )
 
         qsimtp_snapshot_rows: list[str] = []
         qsimtp_snapshot: _QsimtpSnapshotMetadata | None = None
@@ -596,9 +878,13 @@ class OutputFileGenerationService:
                 "the archived file-log index keys may be incomplete"
             )
         if spec.input_code == "IFICOWCG" and not body_records:
-            if spec.contract == "oficowcg_colombia":
+            if _uses_transactional_oficowcg_contract(spec):
+                country_label = _COUNTRY_FOLDERS.get(
+                    request.target.country,
+                    request.target.country.title(),
+                )
                 raise OutputFileGenerationError(
-                    "IFICOWCG upload rows were found, but Colombia OFICOWCG has "
+                    f"IFICOWCG upload rows were found, but {country_label} OFICOWCG has "
                     "no clearing output rows for this process. GITM_CLEARING_LOG, "
                     "IFTB_CLEARING_UPLOAD, or IFTB_CLEARING_UPLOAD_C may already "
                     "have been cleaned up; generation was stopped instead of "
@@ -630,7 +916,7 @@ class OutputFileGenerationService:
             )
         if (
             spec.input_code == "IFICOWCG"
-            and spec.contract != "oficowcg_colombia"
+            and not _uses_transactional_oficowcg_contract(spec)
             and len(body_records) != candidate.upload_record_count
         ):
             raise OutputFileGenerationError(
@@ -1249,7 +1535,11 @@ class OutputFileGenerationService:
         if spec.input_code != "CHISALCA":
             return upload_rows
 
-        parsed_uploads = _parse_chisalca_upload_rows(upload_rows)
+        peru_contract = spec.contract == "chisalou_peru"
+        parsed_uploads = _parse_chisalca_upload_rows(
+            upload_rows,
+            include_ccicode=peru_contract,
+        )
         processed_xrefs = sorted(
             {
                 row.xref
@@ -1272,7 +1562,11 @@ class OutputFileGenerationService:
                     cancel_event=cancel_event,
                 )
             )
-        return _compose_chisalca_body_rows(parsed_uploads, teller_rows)
+        return _compose_chisalca_body_rows(
+            parsed_uploads,
+            teller_rows,
+            include_ccicode=peru_contract,
+        )
 
     def _execute(
         self,
@@ -1284,6 +1578,13 @@ class OutputFileGenerationService:
         cancel_event: threading.Event | None,
     ) -> list[str]:
         _raise_if_cancelled(cancel_event)
+        stage = str(query.purpose or "QUERY").strip().upper()
+        started_at = time.monotonic()
+        log.info(
+            "Output SQL started stage=%s timeout=%ss",
+            stage,
+            f"{timeout:g}",
+        )
         with tempfile.TemporaryDirectory(prefix="oracle_tasks_output_") as temp_dir:
             script_path = Path(temp_dir) / "query.sql"
             script_path.write_text(query.script, encoding="utf-8", newline="\n")
@@ -1296,12 +1597,35 @@ class OutputFileGenerationService:
                 )
             except Exception as exc:
                 safe_error = _safe_text_error(str(exc))
-                log.warning("SQLcl execution failed before returning a result: %s", safe_error)
+                log.warning(
+                    "SQLcl execution failed before returning a result "
+                    "stage=%s elapsed=%.1fs reason=%s",
+                    stage,
+                    time.monotonic() - started_at,
+                    safe_error,
+                )
                 raise OutputFileGenerationError(safe_error) from None
+        elapsed = time.monotonic() - started_at
+        log.info(
+            "Output SQL finished stage=%s elapsed=%.1fs exit_code=%s",
+            stage,
+            elapsed,
+            result.exit_code,
+        )
         if result.exit_code == 130 or _is_cancelled(cancel_event):
             raise GenerationCancelled("Output generation was cancelled")
+        connection_reason = _connection_failure_reason_for_query(result, query)
+        if connection_reason:
+            raise _RetryableDatabaseConnectionError(
+                f"Oracle connection failed ({connection_reason}) while running {stage}",
+                reason=connection_reason,
+                stage=stage,
+            )
         if not result.ok:
-            raise OutputFileGenerationError(_safe_sqlcl_error(result))
+            message = _safe_sqlcl_error(result)
+            if result.exit_code == 124:
+                message = f"{message} while running {stage}"
+            raise OutputFileGenerationError(message)
         outside = output_outside_markers(result.stdout, query)
         diagnostic = "\n".join(part for part in (outside, result.stderr) if part)
         if _SQL_ERROR_RE.search(diagnostic):
@@ -1374,21 +1698,60 @@ def _validate_country_contract(country: str, spec: InterfaceSpec) -> InterfaceSp
     country_key = str(country or "").strip().lower()
     if country_key == "chile":
         return spec
-    if country_key == "colombia" and spec.input_code == "IFICOWCG":
+    if spec.input_code == "CHISALCA" and country_key in {"colombia", "mexico"}:
+        # These QA packages format every FLD199 code. Unlike Chile, they do
+        # not discard ERTB_MSGS rows whose TYPE is O.
+        return replace(spec, error_message_mode="list_tilde_all")
+    if spec.input_code == "CHISALCA" and country_key == "peru":
+        # Peru additionally emits FLD43/CCICODE between currency and the Y/N
+        # flag, giving its normal P/E records one extra field.
+        return replace(
+            spec,
+            body_field_count=12,
+            contract="chisalou_peru",
+            error_message_mode="list_tilde_all",
+        )
+    if country_key == "peru" and spec.input_code == "IFDOBIEL":
+        # GIPKS_OFDOBIEL in Peru QA implements the same output contract as
+        # Chile. PROD's mapping guard remains authoritative and fail-closed.
+        return spec
+    if (
+        country_key in {"colombia", "mexico", "peru"}
+        and spec.input_code == "IFICOWCG"
+    ):
         return replace(
             spec,
             body_field_count=14,
             error_body_field_count=16,
-            contract="oficowcg_colombia",
+            contract=f"oficowcg_{country_key}",
             revalidate_external_inputs=True,
         )
     country_label = _COUNTRY_FOLDERS.get(country_key, country_key.title())
+    if spec.input_code == "IFDOBIEL" and country_key in {"colombia", "mexico"}:
+        raise OutputFileGenerationError(
+            f"OFDOBIEL generation for {country_label} is not available: "
+            f"GIPKS_OFDOBIEL and IFDOBIEL->OFDOBIEL are absent from "
+            f"{country_label} QA. Generation was stopped instead of reusing "
+            "another country's package contract"
+        )
     raise OutputFileGenerationError(
         f"{spec.output_code} generation for {country_label} is not enabled yet: "
         f"verify GIPKS_{spec.output_code} in {country_label} QA and add or "
         "approve its country-specific adapter. PROD discovery and mapping "
         "completed, but the Chile QA contract will not be reused automatically"
     )
+
+
+def _resolve_requested_interface(value: str | None) -> InterfaceSpec | None:
+    """Resolve a manual input/output code against the implemented allowlist."""
+    if value is None:
+        return None
+    try:
+        return spec_for_code(str(value))
+    except (TypeError, ValueError) as exc:
+        raise OutputFileGenerationError(
+            "The selected interface/output is not supported"
+        ) from exc
 
 
 def _parse_candidates(rows: list[str]) -> list[ProcessCandidate]:
@@ -1528,7 +1891,7 @@ def _parse_oficowcg_coverage_metadata(
     candidate_upload_rows: int,
     country: str = "chile",
     body_record_count: int | None = None,
-) -> _OficowcgCoverageMetadata | _OficowcgColombiaCoverageMetadata:
+) -> _OficowcgCoverageMetadata | _OficowcgRegionalCoverageMetadata:
     values = [row.strip() for row in rows if row.strip()]
     if len(values) != 1:
         raise OutputFileGenerationError(
@@ -1551,27 +1914,30 @@ def _parse_oficowcg_coverage_metadata(
         )
 
     country_key = str(country or "").strip().lower()
-    if country_key == "colombia":
-        metadata = _OficowcgColombiaCoverageMetadata(*counts)
+    if country_key in {"colombia", "mexico", "peru"}:
+        country_label = _COUNTRY_FOLDERS[country_key]
+        metadata = _OficowcgRegionalCoverageMetadata(*counts)
         if metadata.upload_rows <= 0 or metadata.upload_rows != candidate_upload_rows:
             raise OutputFileGenerationError(
-                "IFICOWCG upload rows changed while Colombia clearing coverage was validated"
+                f"IFICOWCG upload rows changed while {country_label} clearing "
+                "coverage was validated"
             )
         if (
             metadata.nonnull_record_references != metadata.upload_rows
             or metadata.distinct_record_references != metadata.upload_rows
         ):
             raise OutputFileGenerationError(
-                "Colombia IFICOWCG RECORD_REFERENCE values must be non-null and unique"
+                f"{country_label} IFICOWCG RECORD_REFERENCE values must be "
+                "non-null and unique"
             )
         if metadata.uploads_with_output != metadata.upload_rows:
             raise OutputFileGenerationError(
-                "Each Colombia IFICOWCG upload must resolve at least one of the four "
+                f"Each {country_label} IFICOWCG upload must resolve at least one of the four "
                 "QA OFICOWCG cursor branches"
             )
         if metadata.processed_gic_rows_without_one_owner != 0:
             raise OutputFileGenerationError(
-                "A Colombia OFICOWCG clearing row is not owned by exactly one "
+                f"A {country_label} OFICOWCG clearing row is not owned by exactly one "
                 "IFICOWCG upload from this process"
             )
         if (
@@ -1581,16 +1947,17 @@ def _parse_oficowcg_coverage_metadata(
             or metadata.cursor_rows != body_record_count
         ):
             raise OutputFileGenerationError(
-                "Colombia OFICOWCG cursor coverage does not match the reconstructed body"
+                f"{country_label} OFICOWCG cursor coverage does not match the "
+                "reconstructed body"
             )
         if metadata.cursor_rows_with_multiple_rejections != 0:
             raise OutputFileGenerationError(
-                "A Colombia OFICOWCG transaction has more than one clearing rejection; "
+                f"A {country_label} OFICOWCG transaction has more than one clearing rejection; "
                 "the QA package would not produce an unambiguous output"
             )
         if metadata.rejected_rows_with_multiple_error_lookups != 0:
             raise OutputFileGenerationError(
-                "A Colombia OFICOWCG rejected transaction resolves more than one "
+                f"A {country_label} OFICOWCG rejected transaction resolves more than one "
                 "error-code row"
             )
         return metadata
@@ -1932,8 +2299,43 @@ def _parse_input_physical_filename(rows: list[str]) -> str:
 def _select_candidate(
     candidates: list[ProcessCandidate],
     mappings: dict[str, set[str]],
+    *,
+    selected_spec: InterfaceSpec | None = None,
 ) -> tuple[InterfaceSpec, ProcessCandidate]:
     supported_by_input = {spec.input_code: spec for spec in supported_specs()}
+    if selected_spec is not None:
+        selected = [
+            candidate
+            for candidate in candidates
+            if candidate.input_code == selected_spec.input_code
+        ]
+        if not selected:
+            raise OutputFileGenerationError(
+                f"The selected interface {selected_spec.input_code} "
+                f"({selected_spec.output_code}) was not found for this process"
+            )
+        reconstructible = [
+            candidate
+            for candidate in selected
+            if (
+                not selected_spec.requires_upload_master
+                or "UPLOAD_MASTER" in candidate.evidence_kinds
+            )
+        ]
+        if not reconstructible:
+            raise OutputFileGenerationError(
+                f"The selected interface {selected_spec.input_code} was found only "
+                "in the file log, but its upload rows are no longer available; "
+                "refusing to generate an empty client file"
+            )
+        sources = {candidate.source for candidate in reconstructible}
+        if len(sources) != 1:
+            raise OutputFileGenerationError(
+                f"The selected interface {selected_spec.input_code} exists in active "
+                "and archived data; automatic source detection is ambiguous"
+            )
+        return selected_spec, reconstructible[0]
+
     if not candidates:
         raise OutputFileGenerationError(
             "No current evidence for this process was found in the GI repositories "
@@ -2026,6 +2428,32 @@ def _select_candidate(
     return spec, candidate
 
 
+def _validate_manual_process_scope(
+    spec: InterfaceSpec,
+    candidate: ProcessCandidate,
+    candidates: list[ProcessCandidate],
+) -> None:
+    """Block QA contracts whose footer cannot isolate a shared process."""
+    if spec.contract not in {"dcstout", "stdinrou"}:
+        return
+    other_upload_interfaces = sorted(
+        {
+            observed.input_code
+            for observed in candidates
+            if observed.source is candidate.source
+            and observed.input_code != spec.input_code
+            and "UPLOAD_MASTER" in observed.evidence_kinds
+        }
+    )
+    if not other_upload_interfaces:
+        return
+    raise OutputFileGenerationError(
+        f"{spec.output_code} cannot safely isolate this shared process: its QA "
+        "footer counts all upload rows for the process, including "
+        + ", ".join(other_upload_interfaces)
+    )
+
+
 def _parse_mappings(rows: list[str]) -> dict[str, set[str]]:
     mappings: dict[str, set[str]] = {}
     for row in rows:
@@ -2064,8 +2492,11 @@ def _validate_mapping(spec: InterfaceSpec, mappings: dict[str, set[str]]) -> Non
     )
 
 
-def _validate_oficowcg_colombia_status_pair(status: str, txn_status: str) -> None:
-    """Validate the status pairs emitted by Colombia QA's four cursor branches."""
+def _validate_oficowcg_transaction_status_pair(
+    status: str,
+    txn_status: str,
+) -> None:
+    """Validate the status pairs emitted by the regional four-branch cursor."""
     allowed = {
         "P": {"SUCC", "REJR"},
         # The DD non-processed branch uses DECODE(E, 'U', 'NOPR'), so an E
@@ -2076,7 +2507,7 @@ def _validate_oficowcg_colombia_status_pair(status: str, txn_status: str) -> Non
     if txn_status not in allowed.get(status, set()):
         shown = txn_status or "<NULL>"
         raise OutputFileGenerationError(
-            f"Oracle returned an invalid Colombia OFICOWCG status pair: "
+            f"Oracle returned an invalid OFICOWCG status pair: "
             f"{status or '<NULL>'}/{shown}"
         )
 
@@ -2102,17 +2533,24 @@ def _parse_body_records(
             )
         elif spec.input_code == "IFICOWCG":
             parts = row.split("|")
-            expected_parts = 15 if spec.contract == "oficowcg_colombia" else 14
+            transactional = _uses_transactional_oficowcg_contract(spec)
+            expected_parts = 15 if transactional else 14
             if len(parts) != expected_parts:
                 raise OutputFileGenerationError("Oracle returned a malformed body record")
             decoded = [_decode_utf8_hex(value) for value in parts]
-            status = decoded[0].strip().upper()
+            raw_status = decoded[0]
+            status = raw_status.strip().upper()
+            if raw_status != status:
+                raise OutputFileGenerationError(
+                    "IFICOWCG contains a non-canonical status that the QA "
+                    "package emits verbatim; generation was stopped"
+                )
             error_code = decoded[1]
             error_param = decoded[2]
-            if spec.contract == "oficowcg_colombia":
+            if transactional:
                 body_fields = decoded[3:-1]
                 txn_status = decoded[-1].strip().upper()
-                _validate_oficowcg_colombia_status_pair(status, txn_status)
+                _validate_oficowcg_transaction_status_pair(status, txn_status)
             else:
                 body_fields = decoded[3:]
                 txn_status = ""
@@ -2535,6 +2973,8 @@ def _parse_body_records(
         elif adapter is not None:
             parts = row.split("|")
             expected = len(adapter.fields) + 2
+            if spec.contract == "chisalou_peru":
+                expected += 1
             if len(parts) != expected:
                 raise OutputFileGenerationError(
                     "Oracle returned a malformed declarative body record"
@@ -2780,11 +3220,16 @@ def _parse_body_records(
     return records, counts
 
 
-def _parse_chisalca_upload_rows(rows: list[str]) -> list[_ChisalcaUploadRow]:
+def _parse_chisalca_upload_rows(
+    rows: list[str],
+    *,
+    include_ccicode: bool = False,
+) -> list[_ChisalcaUploadRow]:
     parsed: list[_ChisalcaUploadRow] = []
     for raw_row in rows:
         parts = raw_row.split("|")
-        if len(parts) != 10:
+        expected_parts = 11 if include_ccicode else 10
+        if len(parts) != expected_parts:
             raise OutputFileGenerationError(
                 "Oracle returned a malformed CHISALCA upload record"
             )
@@ -2801,8 +3246,9 @@ def _parse_chisalca_upload_rows(rows: list[str]) -> list[_ChisalcaUploadRow]:
                 fallback_amount=decoded[5],
                 fallback_date=decoded[6],
                 fallback_currency=decoded[7],
-                error_code=decoded[8],
-                error_param=decoded[9],
+                ccicode=decoded[8] if include_ccicode else "",
+                error_code=decoded[9] if include_ccicode else decoded[8],
+                error_param=decoded[10] if include_ccicode else decoded[9],
             )
         )
     return parsed
@@ -2852,6 +3298,8 @@ def _parse_chisalca_teller_rows(
 def _compose_chisalca_body_rows(
     upload_rows: list[_ChisalcaUploadRow],
     teller_rows: list[str],
+    *,
+    include_ccicode: bool = False,
 ) -> list[str]:
     requested_xrefs = {
         row.xref
@@ -2873,9 +3321,20 @@ def _compose_chisalca_body_rows(
                     teller.amount,
                     teller.transaction_date,
                     teller.currency,
+                    *((upload.ccicode,) if include_ccicode else ()),
                 )
                 if teller is not None
-                else ("0", "", "", "", "", "", "", "")
+                else (
+                    "0",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    *((upload.ccicode,) if include_ccicode else ()),
+                )
             )
         else:
             contract_fields = (
@@ -2887,6 +3346,7 @@ def _compose_chisalca_body_rows(
                 upload.fallback_amount,
                 upload.fallback_date,
                 upload.fallback_currency,
+                *((upload.ccicode,) if include_ccicode else ()),
             )
         composed.append(
             "|".join(
@@ -2984,7 +3444,7 @@ def _collect_error_codes(
             if (
                 record.status in {"E", "U"}
                 or (
-                    spec.contract == "oficowcg_colombia"
+                    _uses_transactional_oficowcg_contract(spec)
                     and record.output_status == "REJR"
                 )
             )
@@ -3039,7 +3499,12 @@ def _collect_error_codes(
             continue
         if spec.contract == "cmrrelvo" and record.status == "P":
             continue
-        if mode in {"list_tilde", "list_tilde_nonp", "list_prefixed"}:
+        if mode in {
+            "list_tilde",
+            "list_tilde_all",
+            "list_tilde_nonp",
+            "list_prefixed",
+        }:
             codes.update(split_oacmclos_error_codes(error_code))
         elif mode == "list_plain_trailing":
             codes.update(split_oacmclos_error_codes(error_code))
@@ -3154,7 +3619,14 @@ def _render_upload_body_record(
     direct_message: str | None = None,
 ) -> str:
     adapter = upload_body_adapter(spec.input_code)
-    if adapter is None or adapter.style != spec.contract:
+    compatible_style = adapter is not None and (
+        adapter.style == spec.contract
+        or (
+            adapter.style == "chisalou"
+            and spec.contract in CHISALOU_CONTRACTS
+        )
+    )
+    if not compatible_style:
         raise OutputFileGenerationError(
             f"Missing declarative body renderer for {spec.input_code}"
         )
@@ -3164,7 +3636,7 @@ def _render_upload_body_record(
     message_types = error_types or {}
 
     if style == "chisalou":
-        data = fields[1:8]
+        data = fields[1:9] if spec.contract == "chisalou_peru" else fields[1:8]
         _validate_delimited_values(data, "CHISALOU body field")
         _validate_output_text(error_code, "CHISALOU error-code list")
         _validate_output_text(error_param, "CHISALOU error-parameter list")
@@ -3180,7 +3652,10 @@ def _render_upload_body_record(
         param_groups = str(error_param or "").split(";")
         kept: list[tuple[str, str]] = []
         for index, code in enumerate(codes):
-            if message_types.get(code, "") == "O":
+            if (
+                spec.error_message_mode != "list_tilde_all"
+                and message_types.get(code, "") == "O"
+            ):
                 continue
             param = param_groups[index] if index < len(param_groups) else ""
             kept.append((code, param))
@@ -3879,7 +4354,7 @@ def _render_body_records(
         lines: list[str] = []
         for record in records:
             include_error = record.status in {"E", "U"} or (
-                spec.contract == "oficowcg_colombia"
+                _uses_transactional_oficowcg_contract(spec)
                 and record.output_status == "REJR"
             )
             line = record.body_prefix
@@ -3892,7 +4367,7 @@ def _render_body_records(
                 _validate_output_field(record.error_code, "OFICOWCG error code")
                 _validate_output_field(description, "OFICOWCG error description")
                 line += record.error_code + ";" + description + ";"
-            if spec.contract == "oficowcg_colombia":
+            if _uses_transactional_oficowcg_contract(spec):
                 line += record.output_status + ";"
             lines.append(line)
         return lines
@@ -3999,7 +4474,7 @@ def _write_atomic(path: Path, payload: bytes, *, overwrite: bool) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists() and not overwrite:
         raise OutputFileGenerationError(
-            f"{path.name} already exists; enable Replace existing file to overwrite it"
+            f"{path.name} already exists and this request did not allow replacement"
         )
     temp_path = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
     try:
@@ -4013,7 +4488,7 @@ def _write_atomic(path: Path, payload: bytes, *, overwrite: bool) -> None:
             os.rename(temp_path, path)
     except FileExistsError as exc:
         raise OutputFileGenerationError(
-            f"{path.name} already exists; enable Replace existing file to overwrite it"
+            f"{path.name} already exists and this request did not allow replacement"
         ) from exc
     except OSError as exc:
         raise OutputFileGenerationError(f"Could not save {path.name}: {exc}") from exc

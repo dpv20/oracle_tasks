@@ -31,6 +31,7 @@ class FramedQuery:
     script: str
     begin_marker: str
     end_marker: str
+    purpose: str = "QUERY"
 
 
 def _hex_utf8(expression: str) -> str:
@@ -71,6 +72,7 @@ def _build_chisalca_sql(
     table: str,
     process_ref_no: str,
     archive: bool,
+    country: str,
 ) -> str:
     """Read only the CHISALCA upload fields needed by its QA contract.
 
@@ -78,20 +80,32 @@ def _build_chisalca_sql(
     Joining ``GITA_UPLOAD_MASTER`` to ``DETB_RTL_TELLER`` made Oracle scan the
     large historical population even for a five-row process.
     """
-    columns = (
+    regional_contract = country in {"colombia", "mexico", "peru"}
+    fallback_date = (
+        "case when trim(u.status) = 'P' then null else trim(u.fld16) end"
+        if regional_contract
+        else (
+            "case when trim(u.status) = 'P' then null else "
+            "to_char(to_date(trim(u.fld16), 'YYYYMMDD'), 'YYYYMMDD') end"
+        )
+    )
+    columns = [
         _hex_utf8("nvl(upper(trim(u.status)), '<NULL>')"),
         _hex_utf8("u.status"),
         _hex_utf8("trim(u.fld22)"),
         _hex_utf8("trim(u.fld6)"),
         _hex_utf8("trim(u.fld4)"),
         _hex_utf8("trim(u.fld8)"),
-        _hex_utf8(
-            "case when trim(u.status) = 'P' then null else "
-            "to_char(to_date(trim(u.fld16), 'YYYYMMDD'), 'YYYYMMDD') end"
-        ),
+        _hex_utf8(fallback_date),
         _hex_utf8("trim(u.fld7)"),
-        _hex_utf8("trim(u.fld199)"),
-        _hex_utf8("trim(u.fld200)"),
+    ]
+    if country == "peru":
+        columns.append(_hex_utf8("trim(u.fld43)"))
+    columns.extend(
+        (
+            _hex_utf8("trim(u.fld199)"),
+            _hex_utf8("trim(u.fld200)"),
+        )
     )
     projection = " || '|' ||\n       ".join(columns)
     if archive:
@@ -128,7 +142,7 @@ select /*+ leading(k) use_nl(u) index(u INX01_GITA_UPLOAD_MASTER) */
         + projection
         + f"\n  from {table} u"
         + f"\n where u.process_ref_no = '{process_ref_no}'"
-        + "\n   and upper(trim(u.interface_code)) = 'CHISALCA'"
+        + "\n   and u.interface_code = 'CHISALCA'"
         + "\n   and u.target_table = 'DETB_UPLOAD_RTL_TELLER'"
         + "\n order by u.record_reference"
     )
@@ -431,6 +445,7 @@ def _build_ofchkprt_sql(*, process_ref_no: str, file_date: str) -> str:
         "        from GITU_UPLOAD_MASTER gim,\n"
         "             GITM_PROTEST_LOG gp\n"
         "       where gim.interface_code = 'IFCHKPRT'\n"
+        "         and gp.interface_code = 'IFCHKPRT'\n"
         "         and gim.process_ref_no = gp.process_ref_no\n"
         "         and gim.record_reference = gp.record_reference\n"
         "         and trim(gim.fld30) = gp.xref\n"
@@ -625,6 +640,7 @@ def _build_ofiwdclg_sql(*, process_ref_no: str) -> str:
         "         and giu.process_ref_no = gic.process_ref_no\n"
         "         and giu.record_reference = gic.record_reference\n"
         "         and giu.interface_code = 'IFIWDCLG'\n"
+        "         and gic.interface_code = 'IFIWDCLG'\n"
         f"         and gic.process_ref_no = '{process_ref_no}'\n"
         "         and giu.status <> 'P'\n"
         "         and not exists (\n"
@@ -876,7 +892,12 @@ prompt {begin}
 prompt {end}
 exit success
 """
-    return FramedQuery(script=script, begin_marker=begin, end_marker=end)
+    return FramedQuery(
+        script=script,
+        begin_marker=begin,
+        end_marker=end,
+        purpose=label,
+    )
 
 
 def parse_framed_output(stdout: str, query: FramedQuery) -> list[str]:
@@ -905,19 +926,134 @@ def output_outside_markers(stdout: str, query: FramedQuery) -> str:
     return text[:start] + text[end + len(query.end_marker) :]
 
 
-def build_discovery_query(process_ref_no: str) -> FramedQuery:
+def build_discovery_query(
+    process_ref_no: str,
+    input_code: str | None = None,
+) -> FramedQuery:
     ref = validate_process_ref(process_ref_no)
+    selected = normalize_interface_code(input_code) if input_code is not None else None
+    if selected == "CHISALCA":
+        # GITA_UPLOAD_MASTER has no PROCESS_REF_NO index and contains billions
+        # of rows in PROD.  Use the same retained file-log tuple and index path
+        # as the byte-exact CHISALCA archive adapter instead of scanning it.
+        return _frame(
+            f"""
+with archive_log_keys as (
+       select /*+ materialize */ distinct
+              trim(l.external_system) external_system,
+              l.archival_date,
+              replace(trim(l.file_name), '.', '_') upload_file_name
+         from GITA_FILE_LOG l
+        where l.process_ref_no = '{ref}'
+          and l.interface_code = 'CHISALCA'
+     ),
+     archive_upload as (
+       select /*+ leading(k) use_nl(u) index(u INX01_GITA_UPLOAD_MASTER) */
+              count(*) row_count
+         from archive_log_keys k
+         join GITA_UPLOAD_MASTER u
+           on u.branch_code is null
+          and u.external_system = k.external_system
+          and u.interface_code = 'CHISALCA'
+          and u.archival_date = k.archival_date
+          and u.file_name = k.upload_file_name
+          and u.target_table = 'DETB_UPLOAD_RTL_TELLER'
+        where u.process_ref_no = '{ref}'
+     )
+select 'UPLOAD_MASTER|ACTIVE|CHISALCA|' || count(*)
+  from GITU_UPLOAD_MASTER
+ where process_ref_no = '{ref}'
+   and interface_code = 'CHISALCA'
+   and target_table = 'DETB_UPLOAD_RTL_TELLER'
+union all
+select 'UPLOAD_MASTER|ARCHIVE|CHISALCA|' || row_count
+  from archive_upload
+union all
+select 'FILE_LOG|ACTIVE|CHISALCA|' || count(*)
+  from GITB_FILE_LOG
+ where process_ref_no = '{ref}'
+   and interface_code = 'CHISALCA'
+union all
+select 'FILE_LOG|ARCHIVE|CHISALCA|' || count(*)
+  from GITA_FILE_LOG
+ where process_ref_no = '{ref}'
+   and interface_code = 'CHISALCA'
+order by 1
+""",
+            "DISCOVERY_CHISALCA",
+        )
+
+    if selected is not None:
+        return _frame(
+            f"""
+select 'UPLOAD_MASTER|ACTIVE|{selected}|' || count(*)
+  from GITU_UPLOAD_MASTER
+ where process_ref_no = '{ref}'
+   and upper(trim(interface_code)) = '{selected}'
+union all
+select 'UPLOAD_MASTER|ARCHIVE|{selected}|' || count(*)
+  from GITA_UPLOAD_MASTER
+ where process_ref_no = '{ref}'
+   and upper(trim(interface_code)) = '{selected}'
+union all
+select 'FILE_LOG|ACTIVE|{selected}|' || count(*)
+  from GITB_FILE_LOG
+ where process_ref_no = '{ref}'
+   and upper(trim(interface_code)) = '{selected}'
+union all
+select 'FILE_LOG|ARCHIVE|{selected}|' || count(*)
+  from GITA_FILE_LOG
+ where process_ref_no = '{ref}'
+   and upper(trim(interface_code)) = '{selected}'
+order by 1
+""",
+            "DISCOVERY_SELECTED",
+        )
+
     return _frame(
         f"""
+with archive_log_keys as (
+       select /*+ materialize */ distinct
+              trim(l.external_system) external_system,
+              l.archival_date,
+              replace(trim(l.file_name), '.', '_') upload_file_name
+         from GITA_FILE_LOG l
+        where l.process_ref_no = '{ref}'
+          and l.interface_code = 'CHISALCA'
+     ),
+     archive_chisalca as (
+       select /*+ leading(k) use_nl(u) index(u INX01_GITA_UPLOAD_MASTER) */
+              count(*) row_count
+         from archive_log_keys k
+         join GITA_UPLOAD_MASTER u
+           on u.branch_code is null
+          and u.external_system = k.external_system
+          and u.interface_code = 'CHISALCA'
+          and u.archival_date = k.archival_date
+          and u.file_name = k.upload_file_name
+          and u.target_table = 'DETB_UPLOAD_RTL_TELLER'
+        where u.process_ref_no = '{ref}'
+     )
 select 'UPLOAD_MASTER|ACTIVE|' || upper(trim(interface_code)) || '|' || count(*)
   from GITU_UPLOAD_MASTER
  where process_ref_no = '{ref}'
+   and upper(trim(interface_code)) <> 'CHISALCA'
  group by upper(trim(interface_code))
+union all
+select 'UPLOAD_MASTER|ACTIVE|CHISALCA|' || count(*)
+  from GITU_UPLOAD_MASTER
+ where process_ref_no = '{ref}'
+   and interface_code = 'CHISALCA'
+   and target_table = 'DETB_UPLOAD_RTL_TELLER'
 union all
 select 'UPLOAD_MASTER|ARCHIVE|' || upper(trim(interface_code)) || '|' || count(*)
   from GITA_UPLOAD_MASTER
  where process_ref_no = '{ref}'
+   and upper(trim(interface_code)) <> 'CHISALCA'
  group by upper(trim(interface_code))
+union all
+select 'UPLOAD_MASTER|ARCHIVE|CHISALCA|' || row_count
+  from archive_chisalca
 union all
 select 'FILE_LOG|ACTIVE|' || upper(trim(interface_code)) || '|' || count(*)
   from GITB_FILE_LOG
@@ -992,10 +1128,11 @@ with log_keys as (
          join GITA_UPLOAD_MASTER u
            on u.branch_code is null
           and u.external_system = k.external_system
-          and u.interface_code = 'CHISALCA'
-          and u.archival_date = k.archival_date
-          and u.file_name = k.upload_file_name
-        where u.process_ref_no = '{ref}'
+           and u.interface_code = 'CHISALCA'
+           and u.archival_date = k.archival_date
+           and u.file_name = k.upload_file_name
+           and u.target_table = 'DETB_UPLOAD_RTL_TELLER'
+         where u.process_ref_no = '{ref}'
      )
 select (select count(*) from upload_rows) || '|' ||
        (
@@ -1021,14 +1158,24 @@ select (select count(*) from upload_rows) || '|' ||
 """,
             "PROCESS_CONTRACT",
         )
+    target_table_filter = (
+        "\n             and target_table = 'DETB_UPLOAD_RTL_TELLER'"
+        if input_value == "CHISALCA"
+        else ""
+    )
+    interface_filter = (
+        "interface_code = 'CHISALCA'"
+        if input_value == "CHISALCA"
+        else f"upper(trim(interface_code)) = '{input_value}'"
+    )
     return _frame(
         f"""
 select (
          select count(*)
-           from {table}
+          from {table}
           where process_ref_no = '{ref}'
-            and upper(trim(interface_code)) = '{input_value}'
-       ) || '|' ||
+            and {interface_filter}{target_table_filter}
+        ) || '|' ||
        (
          select count(*)
            from (
@@ -1103,6 +1250,22 @@ def build_interface_last_run_date_query(input_code: str) -> FramedQuery:
     code = normalize_interface_code(input_code)
     if code not in {"CHISALCA", "GIUDFUPD", "IFEARLCG"}:
         raise ValueError(f"Interface {code} does not use LAST_RUN_DATE in its header")
+    if code == "CHISALCA":
+        # GIPKS_CHISALOU opens this exact definition/file-name join. A second
+        # row would make the package emit another header, even when both rows
+        # carry the same date, so preserve row cardinality rather than merely
+        # counting distinct dates.
+        return _frame(
+            """
+select nvl(to_char(max(a.last_run_date), 'YYYYMMDD'), '') || '|' ||
+       count(*)
+  from GITM_INTERFACE_DEFINITION a,
+       GITM_FILE_NAMES b
+ where a.interface_code = b.interface_code
+   and a.interface_code = 'CHISALCA'
+""",
+            "INTERFACE_LAST_RUN_DATE",
+        )
     return _frame(
         f"""
 select nvl(to_char(max(last_run_date), 'YYYYMMDD'), '') || '|' ||
@@ -1180,6 +1343,36 @@ def build_input_physical_filename_query(
             else "archived detail-table/body source"
         )
         raise ValueError(f"{code} has no verified {reason}")
+    if (
+        code in {"CHISALCA", "IFICOWCG"}
+        and selected_source is DataSourceChoice.ACTIVE
+    ):
+        # The trigger supplies p_fn from the logical file-name row and accepts
+        # only the successful FP file-master row. Its PHY_FILE_NAME becomes the
+        # package global printed by CHISALOU/OFICOWCG.
+        return _frame(
+            f"""
+with header_ctx as (
+       select b.file_name
+         from GITM_INTERFACE_DEFINITION a,
+              GITM_FILE_NAMES b
+        where a.interface_code = b.interface_code
+          and a.interface_code = '{code}'
+     )
+select count(*) || '|' ||
+       nvl(max(rawtohex(utl_i18n.string_to_raw(
+         trim(m.phy_file_name), 'AL32UTF8'
+       ))), '')
+  from GITB_FILE_MASTER m,
+       header_ctx h
+ where m.file_name = h.file_name
+   and m.process_ref_no = '{ref}'
+   and m.interface_code = '{code}'
+   and m.upload_status = 'P'
+   and m.process_code = 'FP'
+""",
+            "INPUT_PHYSICAL_FILENAME",
+        )
     if code == "CHISALCA" and selected_source is DataSourceChoice.ARCHIVE:
         return _frame(
             f"""
@@ -1215,13 +1408,24 @@ with log_keys as (
           and upper(trim(interface_code)) = 'CHISALCA'
           and trim(phy_file_name) is not null
      ),
+     header_ctx as (
+       select b.file_name
+         from GITM_INTERFACE_DEFINITION a,
+              GITM_FILE_NAMES b
+        where a.interface_code = b.interface_code
+          and a.interface_code = 'CHISALCA'
+     ),
      file_master_source as (
-       select count(distinct trim(phy_file_name)) distinct_name_count,
-              max(trim(phy_file_name)) phy_file_name
-         from GITB_FILE_MASTER
-        where process_ref_no = '{ref}'
-          and upper(trim(interface_code)) = 'CHISALCA'
-          and trim(phy_file_name) is not null
+       select count(distinct trim(m.phy_file_name)) distinct_name_count,
+              max(trim(m.phy_file_name)) phy_file_name
+         from GITB_FILE_MASTER m,
+              header_ctx h
+        where m.file_name = h.file_name
+          and m.process_ref_no = '{ref}'
+          and m.interface_code = 'CHISALCA'
+          and m.upload_status = 'P'
+          and m.process_code = 'FP'
+          and trim(m.phy_file_name) is not null
      )
 select case
          when u.upload_row_count > 0
@@ -1265,14 +1469,31 @@ select count(*) || '|' ||
     )
 
 
-def _build_oficowcg_colombia_coverage_query(
+def _oficowcg_regional_instrno_predicate(country: str) -> str:
+    if country == "peru":
+        return (
+            "(nvl(ifc.instrno2, '##') = nvl(gic.instrno2, '##') "
+            "or ifcc.record_type = 'T')"
+        )
+    if country in {"colombia", "mexico"}:
+        return "(ifc.instrno2 = gic.instrno2 or ifcc.record_type = 'T')"
+    raise ValueError("Regional OFICOWCG cursor is not verified for this country")
+
+
+def _build_oficowcg_regional_coverage_query(
     *,
     process_ref_no: str,
     file_date: str,
+    country: str = "colombia",
 ) -> FramedQuery:
-    cursor_sql = _oficowcg_colombia_cursor_sql(
+    instrno_predicate = _oficowcg_regional_instrno_predicate(country)
+    nonprocessed_interface_filter = (
+        "" if country == "peru" else "and gic.interface_code = 'IFICOWCG'"
+    )
+    cursor_sql = _oficowcg_regional_cursor_sql(
         process_ref_no=process_ref_no,
         file_date=file_date,
+        country=country,
     )
     return _frame(
         f"""
@@ -1292,9 +1513,10 @@ with uploads as (
               (select count(*)
                  from GITM_CLEARING_LOG gic
                 where trim(u.fld27) = gic.xref
-                  and ltrim(u.fld28, 0) = gic.entry_no
-                  and trim(u.fld2) = gic.instrno2
-                  and gic.process_ref_no = '{process_ref_no}'
+                   and ltrim(u.fld28, 0) = gic.entry_no
+                   and trim(u.fld2) = gic.instrno2
+                   and gic.process_ref_no = '{process_ref_no}'
+                   {nonprocessed_interface_filter}
                   and gic.record_reference = u.record_reference
                   and u.status <> 'P'
                   and not exists (
@@ -1309,20 +1531,21 @@ with uploads as (
                       IFTB_CLEARING_UPLOAD ifc,
                       IFTB_CLEARING_UPLOAD_C ifcc
                 where trim(u.fld27) = gic.xref
-                  and ltrim(u.fld28, 0) = gic.entry_no
-                  and gic.record_reference = u.record_reference
-                  and gic.process_ref_no = '{process_ref_no}'
-                  and gic.interface_code = 'IFICOWCG'
+                   and ltrim(u.fld28, 0) = gic.entry_no
+                   and gic.record_reference = u.record_reference
+                   and gic.process_ref_no = '{process_ref_no}'
+                   and gic.interface_code = 'IFICOWCG'
                   and ifc.xref = gic.xref
                   and ifc.xref = ifcc.xref
                   and ifc.entry_no = gic.entry_no
-                  and (ifc.instrno2 = gic.instrno2 or ifcc.record_type = 'T')) branch_b_count,
+                   and {instrno_predicate}) branch_b_count,
               (select count(*)
                  from GITM_CLEARING_LOG gic
                 where trim(u.fld27) = gic.xref
                   and ltrim(u.fld28, 0) = gic.entry_no
                   and trim(u.fld6) = '02'
                   and gic.process_ref_no = '{process_ref_no}'
+                   {nonprocessed_interface_filter}
                   and gic.record_reference = u.record_reference
                   and u.status <> 'P'
                   and not exists (
@@ -1364,7 +1587,7 @@ with uploads as (
                  where ifc.xref = gic.xref
                    and ifc.xref = ifcc.xref
                    and ifc.entry_no = gic.entry_no
-                   and (ifc.instrno2 = gic.instrno2 or ifcc.record_type = 'T')
+                    and {instrno_predicate}
               )
               or exists (
                 select 1
@@ -1414,7 +1637,7 @@ select (select count(*) from uploads) || '|' ||
            and error_lookup_count > 1)
   from dual
 """,
-        "OFICOWCG_CO_COVERAGE",
+        f"OFICOWCG_{country[:2].upper()}_COVERAGE",
     )
 
 
@@ -1436,10 +1659,11 @@ def build_oficowcg_coverage_query(
     """
     ref = validate_process_ref(process_ref_no)
     country_key = str(country or "").strip().lower()
-    if country_key == "colombia":
-        return _build_oficowcg_colombia_coverage_query(
+    if country_key in {"colombia", "mexico", "peru"}:
+        return _build_oficowcg_regional_coverage_query(
             process_ref_no=ref,
             file_date=validate_file_date(file_date),
+            country=country_key,
         )
     if country_key != "chile":
         raise ValueError("OFICOWCG coverage is not verified for this country")
@@ -1460,6 +1684,7 @@ with uploads as (
               (select count(*)
                  from GITM_CLEARING_LOG gic
                 where gic.process_ref_no = '{ref}'
+                  and upper(trim(gic.interface_code)) = 'IFICOWCG'
                   and gic.record_reference = u.record_reference
                   and trim(u.fld27) = gic.xref
                   and ltrim(u.fld28, 0) = gic.entry_no
@@ -1467,6 +1692,7 @@ with uploads as (
               (select count(*)
                  from GITM_CLEARING_LOG gic
                 where gic.process_ref_no = '{ref}'
+                  and upper(trim(gic.interface_code)) = 'IFICOWCG'
                   and gic.record_reference = u.record_reference
                   and trim(u.fld27) = gic.xref
                   and ltrim(u.fld28, 0) = gic.entry_no
@@ -1777,6 +2003,7 @@ select {_hex_utf8("nvl(status, '<NULL>')")} || '|' ||
            and giu.process_ref_no = gic.process_ref_no
            and giu.record_reference = gic.record_reference
            and upper(trim(giu.interface_code)) = 'IFICOWCG'
+           and upper(trim(gic.interface_code)) = 'IFICOWCG'
            and gic.process_ref_no = '{process_ref_no}'
            and giu.status <> 'P'
            and not exists (
@@ -1816,8 +2043,13 @@ select {_hex_utf8("nvl(status, '<NULL>')")} || '|' ||
 """
 
 
-def _oficowcg_colombia_cursor_sql(*, process_ref_no: str, file_date: str) -> str:
-    """Return Colombia QA's four UNION branches before rejection rendering.
+def _oficowcg_regional_cursor_sql(
+    *,
+    process_ref_no: str,
+    file_date: str,
+    country: str = "colombia",
+) -> str:
+    """Return the regional four UNION branches before rejection rendering.
 
     Colombia QA spells the upload source ``GITM_UPLOAD_MASTER``; its private
     synonym resolves exactly to ``GITU_UPLOAD_MASTER``. PROD exposes that target
@@ -1828,6 +2060,10 @@ def _oficowcg_colombia_cursor_sql(*, process_ref_no: str, file_date: str) -> str
     comparison of ``IFC.INSTRNO2`` with ``GIC.ENTRY_NO`` is also contractual
     package behavior.
     """
+    instrno_predicate = _oficowcg_regional_instrno_predicate(country)
+    nonprocessed_interface_filter = (
+        "" if country == "peru" else "and gic.interface_code = 'IFICOWCG'"
+    )
     return f"""
         select gic.xref xref,
                to_char(gic.entry_no) entry_no,
@@ -1853,6 +2089,7 @@ def _oficowcg_colombia_cursor_sql(*, process_ref_no: str, file_date: str) -> str
            and giu.process_ref_no = gic.process_ref_no
            and giu.record_reference = gic.record_reference
            and giu.interface_code = 'IFICOWCG'
+            {nonprocessed_interface_filter}
            and gic.process_ref_no = '{process_ref_no}'
            and giu.status <> 'P'
            and not exists (
@@ -1885,9 +2122,9 @@ def _oficowcg_colombia_cursor_sql(*, process_ref_no: str, file_date: str) -> str
          where ifc.xref = gic.xref
            and ifc.xref = ifcc.xref
            and gic.process_ref_no = '{process_ref_no}'
-           and gic.interface_code = 'IFICOWCG'
+            and gic.interface_code = 'IFICOWCG'
            and ifc.entry_no = gic.entry_no
-           and (ifc.instrno2 = gic.instrno2 or ifcc.record_type = 'T')
+            and {instrno_predicate}
         union
         select gic.xref xref,
                to_char(gic.entry_no) entry_no,
@@ -1913,6 +2150,7 @@ def _oficowcg_colombia_cursor_sql(*, process_ref_no: str, file_date: str) -> str
            and giu.process_ref_no = gic.process_ref_no
            and giu.record_reference = gic.record_reference
            and giu.interface_code = 'IFICOWCG'
+            {nonprocessed_interface_filter}
            and gic.process_ref_no = '{process_ref_no}'
            and giu.status <> 'P'
            and not exists (
@@ -1951,10 +2189,16 @@ def _oficowcg_colombia_cursor_sql(*, process_ref_no: str, file_date: str) -> str
 """
 
 
-def _build_oficowcg_colombia_sql(*, process_ref_no: str, file_date: str) -> str:
-    cursor_sql = _oficowcg_colombia_cursor_sql(
+def _build_oficowcg_regional_sql(
+    *,
+    process_ref_no: str,
+    file_date: str,
+    country: str = "colombia",
+) -> str:
+    cursor_sql = _oficowcg_regional_cursor_sql(
         process_ref_no=process_ref_no,
         file_date=file_date,
+        country=country,
     )
     return f"""
 with cursor_rows as (
@@ -2063,10 +2307,18 @@ def build_body_query(
             process_ref_no=ref,
         )
     elif code == "CHISALCA":
+        if (
+            country_key != "chile"
+            and DataSourceChoice(source) is DataSourceChoice.ARCHIVE
+        ):
+            raise ValueError(
+                "Regional CHISALCA archive reconstruction is not verified"
+            )
         sql = _build_chisalca_sql(
             table=table,
             process_ref_no=ref,
             archive=DataSourceChoice(source) is DataSourceChoice.ARCHIVE,
+            country=country_key,
         )
     elif code == "GIUDFUPD":
         if DataSourceChoice(source) is not DataSourceChoice.ACTIVE:
@@ -2080,6 +2332,13 @@ def build_body_query(
             adapter=adapter,
         )
     elif code == "IFDOBIEL":
+        if country_key not in {"chile", "peru"}:
+            raise ValueError("OFDOBIEL body is not verified for this country")
+        if (
+            country_key == "peru"
+            and DataSourceChoice(source) is DataSourceChoice.ARCHIVE
+        ):
+            raise ValueError("Peru OFDOBIEL archive reconstruction is not verified")
         sql = f"""
 select nvl(upper(trim(status)), '<NULL>') || '|' ||
        nvl(rawtohex(utl_i18n.string_to_raw(error, 'AL32UTF8')), '') || '|' ||
@@ -2203,10 +2462,11 @@ select nvl(rawtohex(utl_i18n.string_to_raw(
                 "its file-master and clearing sources have not been verified"
             )
         date = validate_file_date(file_date)
-        if country_key == "colombia":
-            sql = _build_oficowcg_colombia_sql(
+        if country_key in {"colombia", "mexico", "peru"}:
+            sql = _build_oficowcg_regional_sql(
                 process_ref_no=ref,
                 file_date=date,
+                country=country_key,
             )
         elif country_key == "chile":
             sql = _build_oficowcg_chile_sql(
@@ -2374,7 +2634,7 @@ select nvl(trim(status), '<NULL>') || '|' || count(*)
 select nvl(trim(status), '<NULL>') || '|' || count(*)
   from {table}
  where process_ref_no = '{ref}'
-   and upper(trim(interface_code)) = 'CHISALCA'
+   and interface_code = 'CHISALCA'
  group by nvl(trim(status), '<NULL>')
  order by 1
 """,

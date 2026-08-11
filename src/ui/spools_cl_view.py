@@ -37,6 +37,11 @@ from i18n import t
 from settings.config import decrypt_password
 from settings.credentials import to_sqlcl_arg
 from spools_cl_accounts import databases as dbs
+from spools_cl_accounts.database_failover import (
+    ConnectionCandidate,
+    FailoverSqlclRunner,
+    fallback_candidates_for_source,
+)
 from spools_cl_accounts.spool_cl_engine import (
     MAX_PARALLEL_ACCOUNTS, CLAccountResult, SpoolCLEngine, SpoolCLStatus,
     SPOOL_KIND_CMR, SPOOL_KIND_CONSUMER_LENDING,
@@ -1288,6 +1293,12 @@ class SpoolsCLView(ctk.CTkFrame):
                 return
 
         source_connection = self._connection_for_credential(source_cred, db["id"])
+        source_fallbacks = fallback_candidates_for_source(
+            self.app.config,
+            country,
+            db,
+            self._connection_for_credential,
+        )
         self._show_results_card()
         self._prepare_results(accounts)
 
@@ -1307,7 +1318,7 @@ class SpoolsCLView(ctk.CTkFrame):
             args=(
                 run_id, country, accounts, inject_accounts, source_connection,
                 dest_connection, sqlcl_path, cancel_event, dict(self._account_branches), spool_kind,
-                extract_archive_dir,
+                extract_archive_dir, str(db["id"]), source_fallbacks,
             ),
             daemon=True,
         ).start()
@@ -1446,8 +1457,22 @@ class SpoolsCLView(ctk.CTkFrame):
         branches: dict[str, str],
         spool_kind: str,
         extract_archive_dir: Path | None,
+        source_alias: str = "",
+        source_fallbacks: tuple[ConnectionCandidate, ...] = (),
     ) -> None:
-        engine = SpoolCLEngine(SqlclRunner(sqlcl_path))
+        sqlcl_runner = SqlclRunner(sqlcl_path)
+        if source_alias and source_fallbacks:
+            sqlcl_runner = FailoverSqlclRunner(
+                sqlcl_runner,
+                ConnectionCandidate(source_alias, source_connection),
+                source_fallbacks,
+            )
+            log.info(
+                "CL/CMR source failover enabled: source=%s alternatives=%s",
+                source_alias,
+                [candidate.alias for candidate in source_fallbacks],
+            )
+        engine = SpoolCLEngine(sqlcl_runner)
         total = len(accounts)
         workers = worker_count_for(total, MAX_PARALLEL_ACCOUNTS)
         log.info("Starting spool extraction batch: accounts=%s workers=%s", total, workers)

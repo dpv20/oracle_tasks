@@ -29,6 +29,7 @@ from features.output_file_generation.queries import (  # noqa: E402
 class OutputFileQueryTests(unittest.TestCase):
     def test_discovery_is_framed_and_checks_both_stores(self) -> None:
         query = build_discovery_query("1234567")
+        compact = " ".join(query.script.lower().split())
         self.assertIn("whenever sqlerror exit sql.sqlcode", query.script.lower())
         self.assertIn("set heading off", query.script.lower())
         self.assertIn("GITU_UPLOAD_MASTER", query.script)
@@ -38,8 +39,52 @@ class OutputFileQueryTests(unittest.TestCase):
         self.assertIn("'UPLOAD_MASTER|ACTIVE|'", query.script)
         self.assertIn("'FILE_LOG|ARCHIVE|'", query.script)
         self.assertIn("process_ref_no = '1234567'", query.script)
+        self.assertEqual(
+            compact.count("upper(trim(interface_code)) <> 'chisalca'"),
+            2,
+        )
+        self.assertIn("'upload_master|active|chisalca|' || count(*)", compact)
+        self.assertIn("'upload_master|archive|chisalca|' || row_count", compact)
+        self.assertIn("with archive_log_keys as", compact)
+        self.assertIn("join gita_upload_master u", compact)
+        self.assertIn("u.branch_code is null", compact)
+        self.assertIn("index(u inx01_gita_upload_master)", compact)
+        self.assertIn("u.target_table = 'detb_upload_rtl_teller'", compact)
+        self.assertNotIn("or target_table = 'detb_upload_rtl_teller'", compact)
         self.assertNotIn("count(*) || '|'", query.script)
-        self.assertNotIn("archival_date", query.script.lower())
+
+    def test_manual_discovery_is_restricted_to_the_selected_interface(self) -> None:
+        query = build_discovery_query("1234567", "ifdobiel")
+        compact = " ".join(query.script.lower().split())
+
+        self.assertEqual(query.purpose, "DISCOVERY_SELECTED")
+        self.assertIn("from gitu_upload_master", compact)
+        self.assertIn("from gita_upload_master", compact)
+        self.assertIn("from gitb_file_log", compact)
+        self.assertIn("from gita_file_log", compact)
+        self.assertEqual(
+            compact.count("upper(trim(interface_code)) = 'ifdobiel'"),
+            4,
+        )
+        self.assertNotIn("group by upper(trim(interface_code))", compact)
+
+    def test_manual_chisalca_discovery_uses_indexed_archive_log_keys(self) -> None:
+        query = build_discovery_query("2744251", "CHISALCA")
+        compact = " ".join(query.script.lower().split())
+
+        self.assertEqual(query.purpose, "DISCOVERY_CHISALCA")
+        self.assertIn("with archive_log_keys as", compact)
+        self.assertIn("from gita_file_log l", compact)
+        self.assertIn("leading(k) use_nl(u)", compact)
+        self.assertIn("index(u inx01_gita_upload_master)", compact)
+        self.assertIn("u.external_system = k.external_system", compact)
+        self.assertIn("u.archival_date = k.archival_date", compact)
+        self.assertIn("u.file_name = k.upload_file_name", compact)
+        self.assertIn("u.target_table = 'detb_upload_rtl_teller'", compact)
+        self.assertNotIn(
+            "from gita_upload_master where process_ref_no = '2744251'",
+            compact,
+        )
 
     def test_mapping_query_accepts_only_a_validated_observed_set(self) -> None:
         query = build_mappings_query(["ifdobiel", "ACCBLOCK", "IFDOBIEL"])
@@ -259,9 +304,13 @@ class OutputFileQueryTests(unittest.TestCase):
 
         self.assertIn("from gitb_file_master", compact)
         self.assertIn("process_ref_no = '2806536'", compact)
-        self.assertIn("interface_code)) = 'ificowcg'", compact)
-        self.assertIn("select distinct trim(phy_file_name)", compact)
-        self.assertIn("rawtohex(utl_i18n.string_to_raw(phy_file_name", compact)
+        self.assertIn("gitm_interface_definition", compact)
+        self.assertIn("gitm_file_names", compact)
+        self.assertIn("m.file_name = h.file_name", compact)
+        self.assertIn("m.interface_code = 'ificowcg'", compact)
+        self.assertIn("m.upload_status = 'p'", compact)
+        self.assertIn("m.process_code = 'fp'", compact)
+        self.assertIn("rawtohex(utl_i18n.string_to_raw(", compact)
         self.assertNotIn("gita_file", compact)
         with self.assertRaisesRegex(ValueError, "archived file master"):
             build_input_physical_filename_query(
@@ -292,6 +341,10 @@ class OutputFileQueryTests(unittest.TestCase):
         self.assertIn("to_date('20260806', 'yyyymmdd') txn_dt", compact)
         self.assertIn("rawtohex(utl_i18n.string_to_raw(err_code", compact)
         self.assertIn("order by xref, entry_no, fccref", compact)
+        self.assertEqual(
+            compact.count("upper(trim(gic.interface_code)) = 'ificowcg'"),
+            2,
+        )
         self.assertNotIn("gipks_", compact)
         self.assertNotIn("fn_handoff", compact)
         self.assertNotRegex(compact, r"\b(?:insert|update|delete|merge|commit)\b")
@@ -320,6 +373,10 @@ class OutputFileQueryTests(unittest.TestCase):
         self.assertIn("branch_b_ownership", compact)
         self.assertIn("upload_owner_count <> 1", compact)
         self.assertIn("count(distinct record_reference)", compact)
+        self.assertGreaterEqual(
+            compact.count("upper(trim(gic.interface_code)) = 'ificowcg'"),
+            4,
+        )
         self.assertNotIn("fn_handoff", compact)
         self.assertNotIn("gipks_", compact)
         self.assertNotRegex(

@@ -195,9 +195,8 @@ class ChisalouOutputMappingTests(unittest.TestCase):
                     self.assertIn("u.interface_code = 'CHISALCA'", script)
                 else:
                     self.assertIn(f"from {table} u", script)
-                    self.assertIn(
-                        "upper(trim(u.interface_code)) = 'CHISALCA'", script
-                    )
+                    self.assertIn("u.interface_code = 'CHISALCA'", script)
+                    self.assertNotIn("upper(trim(u.interface_code))", script)
                 self.assertIn("u.process_ref_no = '2808006'", script)
                 self.assertIn("u.target_table = 'DETB_UPLOAD_RTL_TELLER'", script)
                 self.assertNotIn("detb_rtl_teller", compact)
@@ -234,7 +233,10 @@ class ChisalouOutputMappingTests(unittest.TestCase):
     def test_header_and_footer_queries_preserve_required_source_semantics(self) -> None:
         last_run = build_interface_last_run_date_query("CHISALCA").script
         self.assertIn("GITM_INTERFACE_DEFINITION", last_run)
-        self.assertIn("max(last_run_date)", last_run)
+        self.assertIn("GITM_FILE_NAMES", last_run)
+        self.assertIn("a.interface_code = b.interface_code", last_run)
+        self.assertIn("max(a.last_run_date)", last_run)
+        self.assertIn("count(*)", last_run)
 
         active_filename = build_input_physical_filename_query(
             "2808006",
@@ -242,10 +244,10 @@ class ChisalouOutputMappingTests(unittest.TestCase):
             DataSourceChoice.ACTIVE,
         ).script
         self.assertIn("from GITB_FILE_MASTER", active_filename)
-        self.assertIn(
-            "select distinct trim(phy_file_name)",
-            active_filename.lower(),
-        )
+        self.assertIn("GITM_FILE_NAMES", active_filename)
+        self.assertIn("m.file_name = h.file_name", active_filename)
+        self.assertIn("m.upload_status = 'P'", active_filename)
+        self.assertIn("m.process_code = 'FP'", active_filename)
         self.assertNotIn("GITA_UPLOAD_MASTER", active_filename)
 
         archive_filename = build_input_physical_filename_query(
@@ -311,6 +313,21 @@ class ChisalouOutputMappingTests(unittest.TestCase):
         self.assertIn("from gita_file_log l", compact_contract)
         self.assertIn("join gita_upload_master u", compact_contract)
         self.assertIn("index(u inx01_gita_upload_master)", compact_contract)
+        self.assertIn(
+            "u.target_table = 'detb_upload_rtl_teller'",
+            compact_contract,
+        )
+
+        active_contract = build_process_contract_query(
+            "2808006",
+            "CHISALCA",
+            "CHISALOU",
+            DataSourceChoice.ACTIVE,
+        ).script
+        self.assertIn(
+            "target_table = 'detb_upload_rtl_teller'",
+            " ".join(active_contract.lower().split()),
+        )
 
     def test_2744251_eml_golden_accepts_retained_archive_filename(self) -> None:
         spec = spec_for_code("CHISALCA")
@@ -689,7 +706,8 @@ class ChisalouOutputMappingTests(unittest.TestCase):
             body_scripts = [
                 script
                 for script in runner.scripts
-                if "join GITA_UPLOAD_MASTER u" in script
+                if "_CHISALCA_BODY_" in script
+                and "join GITA_UPLOAD_MASTER u" in script
                 and "u.target_table = 'DETB_UPLOAD_RTL_TELLER'" in script
             ]
             self.assertEqual(len(body_scripts), 2)
@@ -700,7 +718,7 @@ class ChisalouOutputMappingTests(unittest.TestCase):
             ]
             self.assertEqual(len(teller_scripts), 2)
             self.assertEqual(
-                sum("max(last_run_date)" in script.lower() for script in runner.scripts),
+                sum("max(a.last_run_date)" in script.lower() for script in runner.scripts),
                 2,
             )
             self.assertEqual(

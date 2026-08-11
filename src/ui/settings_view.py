@@ -1,4 +1,4 @@
-"""Settings view — Credentials, General, About tabs."""
+"""Settings view — credentials, database failover, general and about tabs."""
 from __future__ import annotations
 
 import logging
@@ -8,6 +8,7 @@ from tkinter import filedialog, messagebox
 import customtkinter as ctk
 
 from settings.config import decrypt_password, encrypt_password
+from settings.database_failover import DATABASE_FAILOVER_PAIRS
 from settings.credentials import (
     credential_dict,
     parse,
@@ -59,10 +60,12 @@ class SettingsView(ctk.CTkFrame):
         self.tabs.pack(fill="both", expand=True, padx=20, pady=(5, 20))
 
         self.tabs.add(t("settings.tab.credentials"))
+        self.tabs.add(t("settings.tab.database_failover"))
         self.tabs.add(t("settings.tab.general"))
         self.tabs.add(t("settings.tab.about"))
 
         self._build_credentials_tab(self.tabs.tab(t("settings.tab.credentials")))
+        self._build_database_failover_tab(self.tabs.tab(t("settings.tab.database_failover")))
         self._build_general_tab(self.tabs.tab(t("settings.tab.general")))
         self._build_about_tab(self.tabs.tab(t("settings.tab.about")))
 
@@ -162,6 +165,9 @@ class SettingsView(ctk.CTkFrame):
                 command=lambda cid=country, lbl=country_label: self._open_country_dialog(cid, lbl),
             ).grid(row=r, column=c, padx=6, pady=6, sticky="nsew")
 
+        if hasattr(self, "database_failover_status_labels"):
+            self._refresh_database_failover_status()
+
     def _open_country_dialog(self, country: str, country_label: str):
         CountryCredentialsDialog(
             self, self.app,
@@ -218,6 +224,108 @@ class SettingsView(ctk.CTkFrame):
             w.delete(0, "end")
         self._render_credentials_list()
         messagebox.showinfo(t("common.info"), t("settings.cred.saved"))
+
+    # ── Database failover tab ──
+    def _build_database_failover_tab(self, parent):
+        wrap = ctk.CTkScrollableFrame(parent, fg_color="transparent")
+        wrap.pack(fill="both", expand=True, padx=16, pady=16)
+
+        SectionLabel(wrap, text=t("settings.failover.title")).pack(
+            fill="x", pady=(0, 6)
+        )
+        ctk.CTkLabel(
+            wrap,
+            text=t("settings.failover.help"),
+            anchor="w",
+            justify="left",
+            wraplength=820,
+            text_color=("gray35", "gray70"),
+        ).pack(fill="x", pady=(0, 4))
+        ctk.CTkLabel(
+            wrap,
+            text=t("settings.failover.source_only"),
+            anchor="w",
+            justify="left",
+            wraplength=820,
+            text_color=("gray35", "gray70"),
+        ).pack(fill="x", pady=(0, 16))
+
+        country_labels = dict(COUNTRIES)
+        self.database_failover_vars: dict[str, ctk.BooleanVar] = {}
+        self.database_failover_status_labels: dict[str, ctk.CTkLabel] = {}
+        for pair in DATABASE_FAILOVER_PAIRS:
+            row = ctk.CTkFrame(wrap)
+            row.pack(fill="x", pady=6)
+            row.grid_columnconfigure(1, weight=1)
+
+            enabled_var = ctk.BooleanVar(
+                value=self.app.config.database_failover_enabled(pair.key)
+            )
+            self.database_failover_vars[pair.key] = enabled_var
+            ctk.CTkCheckBox(
+                row,
+                text="",
+                width=28,
+                variable=enabled_var,
+                command=lambda key=pair.key: self._on_database_failover_toggle(key),
+            ).grid(row=0, column=0, rowspan=3, padx=(14, 6), pady=14, sticky="n")
+            ctk.CTkLabel(
+                row,
+                text=country_labels.get(pair.country, pair.country.title()),
+                anchor="w",
+                font=ctk.CTkFont(size=14, weight="bold"),
+            ).grid(row=0, column=1, sticky="ew", padx=(4, 14), pady=(12, 2))
+            ctk.CTkLabel(
+                row,
+                text=f"{pair.first_alias}  <->  {pair.second_alias}",
+                anchor="w",
+                font=ctk.CTkFont(family="Consolas", size=12),
+            ).grid(row=1, column=1, sticky="ew", padx=(4, 14), pady=2)
+            status = ctk.CTkLabel(row, text="", anchor="w", justify="left")
+            status.grid(row=2, column=1, sticky="ew", padx=(4, 14), pady=(2, 12))
+            self.database_failover_status_labels[pair.key] = status
+
+        self._refresh_database_failover_status()
+
+    def _on_database_failover_toggle(self, pair_key: str) -> None:
+        enabled = bool(self.database_failover_vars[pair_key].get())
+        self.app.config.set_database_failover_enabled(pair_key, enabled)
+        log.info("Database failover setting changed: pair=%s enabled=%s", pair_key, enabled)
+        self._refresh_database_failover_status()
+
+    def _refresh_database_failover_status(self) -> None:
+        credentials = self.app.config.all_credentials()
+        for pair in DATABASE_FAILOVER_PAIRS:
+            label = self.database_failover_status_labels.get(pair.key)
+            if label is None:
+                continue
+            if not self.app.config.database_failover_enabled(pair.key):
+                label.configure(
+                    text=t("settings.failover.disabled"),
+                    text_color=("gray40", "gray65"),
+                )
+                continue
+
+            available_aliases = {
+                str(credential.get("tns") or database_key).strip().upper()
+                for database_key, by_login in credentials.get(pair.country, {}).items()
+                for credential in by_login.values()
+                if isinstance(credential, dict)
+                and credential.get("bucket") == "shared_prod"
+            }
+            missing = [
+                alias for alias in pair.aliases if alias.upper() not in available_aliases
+            ]
+            if missing:
+                label.configure(
+                    text=t("settings.failover.missing", aliases=", ".join(missing)),
+                    text_color=("#9A6700", "#E3B341"),
+                )
+            else:
+                label.configure(
+                    text=t("settings.failover.ready"),
+                    text_color=("#1A7F37", "#3FB950"),
+                )
 
     # ── General tab ──
     def _build_general_tab(self, parent):

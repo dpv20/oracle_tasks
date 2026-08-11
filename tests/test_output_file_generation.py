@@ -7,6 +7,7 @@ import tempfile
 import threading
 import unittest
 from collections import deque
+from dataclasses import replace
 from pathlib import Path
 from typing import Sequence
 
@@ -32,6 +33,10 @@ class _FakeConfig:
     def __init__(self, sqlcl_path: Path) -> None:
         self.sqlcl_path = sqlcl_path
         self.credential_calls: list[tuple[str, str, str]] = []
+        self.database_failover = {
+            "chile_prod_oci": True,
+            "colombia_prod_oci": True,
+        }
         self.credential = {
             "user": "fake_user",
             "schema": "",
@@ -50,6 +55,8 @@ class _FakeConfig:
     def get(self, key: str, default=None):
         if key == "sqlcl_path":
             return str(self.sqlcl_path)
+        if key == "database_failover":
+            return self.database_failover
         return default
 
     def get_credential(
@@ -268,12 +275,22 @@ class OutputFileGenerationTests(unittest.TestCase):
         *,
         process_ref_no: str = "1234567",
         overwrite: bool = False,
+        interface_code: str | None = None,
     ) -> GenerationRequest:
         return GenerationRequest(
             target=self.target,
             process_ref_no=process_ref_no,
             overwrite=overwrite,
+            interface_code=interface_code,
         )
+
+    def test_non_ui_request_keeps_fail_safe_overwrite_default(self) -> None:
+        request = GenerationRequest(
+            target=self.target,
+            process_ref_no="1234567",
+        )
+
+        self.assertFalse(request.overwrite)
 
     def test_ofdobiel_auto_archive_writes_exact_lf_utf8_payload_and_sha(self) -> None:
         body_lines = [
@@ -302,7 +319,13 @@ class OutputFileGenerationTests(unittest.TestCase):
         request = self._request()
         self.assertEqual(
             set(request.__dataclass_fields__),
-            {"target", "process_ref_no", "overwrite"},
+            {
+                "target",
+                "process_ref_no",
+                "overwrite",
+                "interface_code",
+                "input_file_date",
+            },
         )
         result = service.generate(request)
 
@@ -332,6 +355,360 @@ class OutputFileGenerationTests(unittest.TestCase):
             )
         )
         self.assertEqual(runner.pending, 0)
+
+    def test_chile_connection_error_restarts_the_whole_generation_on_dr(self) -> None:
+        self.config.credentials["chile"]["PROD-DB-DR"] = {
+            "SHARED-PROD": {
+                **self.config.credential,
+                "tns": "FXBFCL_19C_PROD_OCI_DR",
+            }
+        }
+        service, runner = self._service(
+            RunResult(
+                1,
+                "\n  USER          = fake_user\n"
+                "  URL           = jdbc:oracle:thin:@FXBFCL_19C_PROD_OCI\n"
+                "  Error Message = Listener refused the connection with the "
+                "following error:\n"
+                "ORA-12514, TNS:listener does not currently know of service "
+                "requested in connect descriptor\n",
+                "",
+            ),
+            ["UPLOAD_MASTER|ARCHIVE|IFDOBIEL|1"],
+            ["IFDOBIEL|OFDOBIEL"],
+            ["20260731|1|1"],
+            ["P|||BDY;C;000000001;E;P;"],
+            ["1|1|1"],
+        )
+
+        with self.assertLogs(
+            "features.output_file_generation.service",
+            level="INFO",
+        ) as captured:
+            result = service.generate(self._request(interface_code="OFDOBIEL"))
+
+        primary = "fake_user/fake-password@FXBFCL_19C_PROD_OCI"
+        fallback = "fake_user/fake-password@FXBFCL_19C_PROD_OCI_DR"
+        self.assertEqual(runner.connections, [primary, *([fallback] * 5)])
+        self.assertEqual(result.output_code, "OFDOBIEL")
+        self.assertEqual(runner.pending, 0)
+        logs = "\n".join(captured.output)
+        self.assertIn("FXBFCL_19C_PROD_OCI_DR", logs)
+        self.assertIn("Output reconstruction completed", logs)
+        self.assertIn("tns=FXBFCL_19C_PROD_OCI_DR", logs)
+
+    def test_mid_generation_connection_loss_restarts_discovery_on_dr(self) -> None:
+        self.config.credentials["chile"]["PROD-DB-DR"] = {
+            "SHARED-PROD": {
+                **self.config.credential,
+                "tns": "FXBFCL_19C_PROD_OCI_DR",
+            }
+        }
+        service, runner = self._service(
+            ["UPLOAD_MASTER|ARCHIVE|IFDOBIEL|1"],
+            RunResult(1, "", "ORA-03113: end-of-file on communication channel"),
+            ["UPLOAD_MASTER|ARCHIVE|IFDOBIEL|1"],
+            ["IFDOBIEL|OFDOBIEL"],
+            ["20260731|1|1"],
+            ["P|||BDY;C;000000001;E;P;"],
+            ["1|1|1"],
+        )
+
+        result = service.generate(self._request(interface_code="OFDOBIEL"))
+
+        primary = "fake_user/fake-password@FXBFCL_19C_PROD_OCI"
+        fallback = "fake_user/fake-password@FXBFCL_19C_PROD_OCI_DR"
+        self.assertEqual(
+            runner.connections,
+            [primary, primary, *([fallback] * 5)],
+        )
+        self.assertEqual(
+            sum("GITU_UPLOAD_MASTER" in script for script in runner.scripts),
+            2,
+        )
+        self.assertEqual(result.output_code, "OFDOBIEL")
+        self.assertEqual(runner.pending, 0)
+
+    def test_chile_dr_connection_error_can_fall_back_to_primary_oci(self) -> None:
+        primary_credential = dict(self.config.credential)
+        dr_credential = {
+            **self.config.credential,
+            "tns": "FXBFCL_19C_PROD_OCI_DR",
+        }
+        self.config.credentials["chile"] = {
+            "PROD-DB": {"SHARED-PROD": primary_credential},
+            "PROD-DB-DR": {"SHARED-PROD": dr_credential},
+        }
+        dr_target = OracleTarget(
+            country="chile",
+            database_key="prod-db-dr",
+            credential_key="shared-prod",
+            tns="FXBFCL_19C_PROD_OCI_DR",
+            label="Chile PROD DR",
+        )
+        service, runner = self._service(
+            RunResult(1, "", "ORA-12541: TNS:no listener"),
+            ["UPLOAD_MASTER|ARCHIVE|IFDOBIEL|1"],
+            ["IFDOBIEL|OFDOBIEL"],
+            ["20260731|1|1"],
+            ["P|||BDY;C;000000001;E;P;"],
+            ["1|1|1"],
+        )
+
+        with self.assertLogs(
+            "features.output_file_generation.service",
+            level="INFO",
+        ) as captured:
+            result = service.generate(
+                GenerationRequest(
+                    target=dr_target,
+                    process_ref_no="1234567",
+                    interface_code="OFDOBIEL",
+                )
+            )
+
+        dr = "fake_user/fake-password@FXBFCL_19C_PROD_OCI_DR"
+        primary = "fake_user/fake-password@FXBFCL_19C_PROD_OCI"
+        self.assertEqual(runner.connections, [dr, *([primary] * 5)])
+        self.assertEqual(result.output_code, "OFDOBIEL")
+        logs = "\n".join(captured.output)
+        self.assertIn("tns=FXBFCL_19C_PROD_OCI", logs)
+        self.assertEqual(runner.pending, 0)
+
+    def test_working_primary_does_not_decrypt_unused_fallback_credential(self) -> None:
+        self.config.credentials["chile"]["PROD-DB-DR"] = {
+            "SHARED-PROD": {
+                **self.config.credential,
+                "password_enc": "fallback-encrypted",
+                "tns": "FXBFCL_19C_PROD_OCI_DR",
+            }
+        }
+        runner = _QueuedSqlclRunner(
+            (
+                ["UPLOAD_MASTER|ARCHIVE|IFDOBIEL|1"],
+                ["IFDOBIEL|OFDOBIEL"],
+                ["20260731|1|1"],
+                ["P|||BDY;C;000000001;E;P;"],
+                ["1|1|1"],
+            )
+        )
+        decrypted: list[str] = []
+
+        def decryptor(encrypted: str) -> str:
+            decrypted.append(encrypted)
+            if encrypted == "fallback-encrypted":
+                raise AssertionError("Fallback password was decrypted eagerly")
+            return "fake-password"
+
+        service = OutputFileGenerationService(
+            self.config,
+            runner_factory=lambda _path: runner,
+            decryptor=decryptor,
+            output_root=self.root / "output",
+        )
+
+        result = service.generate(self._request(interface_code="OFDOBIEL"))
+
+        self.assertEqual(result.output_code, "OFDOBIEL")
+        self.assertEqual(decrypted, ["encrypted-for-test"])
+        self.assertEqual(
+            runner.connections,
+            ["fake_user/fake-password@FXBFCL_19C_PROD_OCI"] * 5,
+        )
+
+    def test_output_generation_does_not_fail_over_for_functional_sql_error(self) -> None:
+        self.config.credentials["chile"]["PROD-DB-DR"] = {
+            "SHARED-PROD": {
+                **self.config.credential,
+                "tns": "FXBFCL_19C_PROD_OCI_DR",
+            }
+        }
+        service, runner = self._service(
+            RunResult(1, "", "ORA-00942: table or view does not exist"),
+            ["UPLOAD_MASTER|ARCHIVE|IFDOBIEL|1"],
+        )
+
+        with self.assertRaisesRegex(OutputFileGenerationError, "ORA-00942"):
+            service.generate(self._request(interface_code="OFDOBIEL"))
+
+        self.assertEqual(
+            runner.connections,
+            ["fake_user/fake-password@FXBFCL_19C_PROD_OCI"],
+        )
+        self.assertEqual(runner.pending, 1)
+
+    def test_output_generation_does_not_fail_over_for_authentication_error(self) -> None:
+        self.config.credentials["chile"]["PROD-DB-DR"] = {
+            "SHARED-PROD": {
+                **self.config.credential,
+                "tns": "FXBFCL_19C_PROD_OCI_DR",
+            }
+        }
+        service, runner = self._service(
+            RunResult(
+                1,
+                "",
+                "ORA-01017: invalid username/password; logon denied for "
+                "fake_user/fake-password@FXBFCL_19C_PROD_OCI",
+            ),
+            ["UPLOAD_MASTER|ARCHIVE|IFDOBIEL|1"],
+        )
+
+        with self.assertRaises(OutputFileGenerationError) as raised:
+            service.generate(self._request(interface_code="OFDOBIEL"))
+
+        self.assertIn("ORA-01017", str(raised.exception))
+        self.assertIn("[connection redacted]", str(raised.exception))
+        self.assertNotIn("fake-password", str(raised.exception))
+        self.assertEqual(
+            runner.connections,
+            ["fake_user/fake-password@FXBFCL_19C_PROD_OCI"],
+        )
+        self.assertEqual(runner.pending, 1)
+
+    def test_output_generation_does_not_fail_over_after_timeout(self) -> None:
+        self.config.credentials["chile"]["PROD-DB-DR"] = {
+            "SHARED-PROD": {
+                **self.config.credential,
+                "tns": "FXBFCL_19C_PROD_OCI_DR",
+            }
+        }
+        service, runner = self._service(
+            RunResult(124, "ORA-12514", "Timed out after 120s"),
+            ["UPLOAD_MASTER|ARCHIVE|IFDOBIEL|1"],
+        )
+
+        with self.assertRaisesRegex(OutputFileGenerationError, "Timed out after 120s"):
+            service.generate(self._request(interface_code="OFDOBIEL"))
+
+        self.assertEqual(
+            runner.connections,
+            ["fake_user/fake-password@FXBFCL_19C_PROD_OCI"],
+        )
+        self.assertEqual(runner.pending, 1)
+
+    def test_output_generation_does_not_fail_over_after_cancel(self) -> None:
+        self.config.credentials["chile"]["PROD-DB-DR"] = {
+            "SHARED-PROD": {
+                **self.config.credential,
+                "tns": "FXBFCL_19C_PROD_OCI_DR",
+            }
+        }
+        service, runner = self._service(
+            RunResult(130, "ORA-12514", "Cancelled by user"),
+            ["UPLOAD_MASTER|ARCHIVE|IFDOBIEL|1"],
+        )
+
+        with self.assertRaisesRegex(GenerationCancelled, "cancelled"):
+            service.generate(self._request(interface_code="OFDOBIEL"))
+
+        self.assertEqual(
+            runner.connections,
+            ["fake_user/fake-password@FXBFCL_19C_PROD_OCI"],
+        )
+        self.assertEqual(runner.pending, 1)
+
+    def test_disabled_output_failover_never_uses_the_equivalent_database(self) -> None:
+        self.config.database_failover["chile_prod_oci"] = False
+        self.config.credentials["chile"]["PROD-DB-DR"] = {
+            "SHARED-PROD": {
+                **self.config.credential,
+                "tns": "FXBFCL_19C_PROD_OCI_DR",
+            }
+        }
+        service, runner = self._service(
+            RunResult(1, "", "ORA-12514: listener does not know this service"),
+            ["UPLOAD_MASTER|ARCHIVE|IFDOBIEL|1"],
+        )
+
+        with self.assertRaisesRegex(OutputFileGenerationError, "ORA-12514"):
+            service.generate(self._request(interface_code="OFDOBIEL"))
+
+        self.assertEqual(
+            runner.connections,
+            ["fake_user/fake-password@FXBFCL_19C_PROD_OCI"],
+        )
+        self.assertEqual(runner.pending, 1)
+
+    def test_missing_alternative_credential_does_not_retry_elsewhere(self) -> None:
+        service, runner = self._service(
+            RunResult(1, "", "ORA-12514: listener does not know this service"),
+            ["UPLOAD_MASTER|ARCHIVE|IFDOBIEL|1"],
+        )
+
+        with self.assertRaisesRegex(OutputFileGenerationError, "ORA-12514"):
+            service.generate(self._request(interface_code="OFDOBIEL"))
+
+        self.assertEqual(
+            runner.connections,
+            ["fake_user/fake-password@FXBFCL_19C_PROD_OCI"],
+        )
+        self.assertEqual(runner.pending, 1)
+
+    def test_ambiguous_alternative_credentials_disable_output_failover(self) -> None:
+        fallback = {
+            **self.config.credential,
+            "tns": "FXBFCL_19C_PROD_OCI_DR",
+        }
+        self.config.credentials["chile"].update(
+            {
+                "DR-STORE-A": {
+                    "DR-LOGIN-A": {**fallback, "user": "dr_user_a"},
+                },
+                "DR-STORE-B": {
+                    "DR-LOGIN-B": {**fallback, "user": "dr_user_b"},
+                },
+            }
+        )
+        service, runner = self._service(
+            RunResult(1, "", "ORA-12514: listener does not know this service"),
+            ["UPLOAD_MASTER|ARCHIVE|IFDOBIEL|1"],
+        )
+
+        with self.assertLogs(
+            "features.output_file_generation.service",
+            level="WARNING",
+        ) as captured:
+            with self.assertRaisesRegex(OutputFileGenerationError, "ORA-12514"):
+                service.generate(self._request(interface_code="OFDOBIEL"))
+
+        self.assertEqual(
+            runner.connections,
+            ["fake_user/fake-password@FXBFCL_19C_PROD_OCI"],
+        )
+        self.assertEqual(runner.pending, 1)
+        self.assertIn("ambiguous-or-missing-PROD-credential", "\n".join(captured.output))
+
+    def test_output_failover_stops_after_both_equivalent_databases_fail(self) -> None:
+        self.config.credentials["chile"]["PROD-DB-DR"] = {
+            "SHARED-PROD": {
+                **self.config.credential,
+                "tns": "FXBFCL_19C_PROD_OCI_DR",
+            }
+        }
+        service, runner = self._service(
+            RunResult(1, "", "ORA-12514: primary listener unavailable"),
+            RunResult(1, "", "ORA-12541: fallback listener unavailable"),
+            ["UPLOAD_MASTER|ARCHIVE|IFDOBIEL|1"],
+        )
+
+        with self.assertLogs(
+            "features.output_file_generation.service",
+            level="WARNING",
+        ) as captured:
+            with self.assertRaisesRegex(OutputFileGenerationError, "ORA-12541") as raised:
+                service.generate(self._request(interface_code="OFDOBIEL"))
+
+        self.assertEqual(
+            runner.connections,
+            [
+                "fake_user/fake-password@FXBFCL_19C_PROD_OCI",
+                "fake_user/fake-password@FXBFCL_19C_PROD_OCI_DR",
+            ],
+        )
+        self.assertEqual(runner.pending, 1)
+        diagnostics = str(raised.exception) + "\n" + "\n".join(captured.output)
+        self.assertNotIn("fake-password", diagnostics)
 
     def test_archive_rejects_error_message_catalog_change_before_save(self) -> None:
         service, runner = self._service(
@@ -1014,6 +1391,71 @@ class OutputFileGenerationTests(unittest.TestCase):
         self.assertNotIn("FN_HANDOFF", body_script.upper())
         self.assertEqual(runner.pending, 0)
 
+    def test_colombia_connection_error_restarts_generation_on_sao_paulo(self) -> None:
+        success_fields = (
+            "XREF-1", "10", "001", "20260604", "BANK", "ACCOUNT-1",
+            "INSTR-1", "INSTR-2", "SEC", "100.25", "C",
+        )
+        body_rows = [_oficowcg_colombia_row("P", success_fields, "SUCC")]
+        coverage = ["1|1|1|1|0|1|0|0"]
+        service, runner = self._service(
+            RunResult(1, "", "ORA-12541: TNS:no listener"),
+            ["UPLOAD_MASTER|ACTIVE|IFICOWCG|1"],
+            ["IFICOWCG|OFICOWCG"],
+            ["20260604|1|1"],
+            ["1|" + _hex("IFICOWCG_20260604.TXT")],
+            body_rows,
+            coverage,
+            coverage,
+            body_rows,
+            ["20260604|1|1"],
+            ["1|" + _hex("IFICOWCG_20260604.TXT")],
+            ["1|1|1"],
+        )
+        primary_credential = {
+            **self.config.credential,
+            "tns": "BFCO_POCISANTIAGO",
+        }
+        fallback_credential = {
+            **self.config.credential,
+            "user": "sao_user",
+            "tns": "BFCO_POCISAOPALO",
+        }
+        self.config.credentials["colombia"] = {
+            "CO-SANTIAGO": {"CO-SHARED-PROD": primary_credential},
+            "CO-SAO-PAULO": {"CO-SHARED-PROD": fallback_credential},
+        }
+        target = OracleTarget(
+            country="colombia",
+            database_key="co-santiago",
+            credential_key="co-shared-prod",
+            tns="BFCO_POCISANTIAGO",
+            label="Colombia PROD Santiago",
+        )
+
+        with self.assertLogs(
+            "features.output_file_generation.service",
+            level="INFO",
+        ) as captured:
+            result = service.generate(
+                GenerationRequest(
+                    target=target,
+                    process_ref_no="5328716",
+                    interface_code="OFICOWCG",
+                )
+            )
+
+        primary = "fake_user/fake-password@BFCO_POCISANTIAGO"
+        fallback = "sao_user/fake-password@BFCO_POCISAOPALO"
+        self.assertEqual(runner.connections, [primary, *([fallback] * 11)])
+        self.assertEqual(result.output_code, "OFICOWCG")
+        self.assertEqual(result.output_path.parent.name, "Colombia")
+        self.assertEqual(runner.pending, 0)
+        logs = "\n".join(captured.output)
+        self.assertIn("BFCO_POCISAOPALO", logs)
+        self.assertIn("Output reconstruction completed", logs)
+        self.assertIn("tns=BFCO_POCISAOPALO", logs)
+
     def test_oficowcg_colombia_empty_clearing_cursor_reports_cleanup(self) -> None:
         service, runner = self._service(
             ["UPLOAD_MASTER|ACTIVE|IFICOWCG|30"],
@@ -1465,6 +1907,167 @@ class OutputFileGenerationTests(unittest.TestCase):
         self.assertEqual(len(runner.scripts), 2)
         self.assertEqual(runner.pending, 0)
 
+    def test_manual_interface_selects_one_supported_event_from_shared_process(self) -> None:
+        service, runner = self._service(
+            [
+                "UPLOAD_MASTER|ARCHIVE|IFDOBIEL|1",
+                "UPLOAD_MASTER|ARCHIVE|ACCBLOCK|1",
+            ],
+            ["IFDOBIEL|OFDOBIEL"],
+            ["20260731|1|1"],
+            ["P|||BDY;C;000000001;E;P;"],
+            ["1|1|1"],
+        )
+
+        result = service.generate(self._request(interface_code="OFDOBIEL"))
+
+        self.assertEqual((result.input_code, result.output_code), ("IFDOBIEL", "OFDOBIEL"))
+        discovery_script = runner.scripts[0]
+        self.assertEqual(
+            discovery_script.count(
+                "upper(trim(interface_code)) = 'IFDOBIEL'"
+            ),
+            4,
+        )
+        self.assertNotIn("group by upper(trim(interface_code))", discovery_script.lower())
+        mapping_script = runner.scripts[1]
+        self.assertIn("in ('IFDOBIEL')", mapping_script)
+        self.assertNotIn("'ACCBLOCK'", mapping_script)
+        self.assertEqual(runner.pending, 0)
+
+    def test_manual_interface_ignores_unselected_unsupported_event(self) -> None:
+        service, runner = self._service(
+            [
+                "UPLOAD_MASTER|ARCHIVE|IFDOBIEL|1",
+                "UPLOAD_MASTER|ARCHIVE|NOTREADY|9",
+            ],
+            ["IFDOBIEL|OFDOBIEL"],
+            ["20260731|1|1"],
+            ["P|||BDY;C;000000001;E;P;"],
+            ["1|1|1"],
+        )
+
+        result = service.generate(self._request(interface_code="IFDOBIEL"))
+
+        self.assertEqual(result.output_code, "OFDOBIEL")
+        self.assertEqual(runner.pending, 0)
+
+    def test_manual_interface_must_exist_for_the_selected_process(self) -> None:
+        service, runner = self._service(
+            ["UPLOAD_MASTER|ARCHIVE|ACCBLOCK|1"],
+        )
+
+        with self.assertRaisesRegex(
+            OutputFileGenerationError,
+            r"selected interface IFDOBIEL.*was not found",
+        ):
+            service.generate(self._request(interface_code="OFDOBIEL"))
+
+        self.assertEqual(len(runner.scripts), 1)
+        self.assertEqual(runner.pending, 0)
+
+    def test_manual_interface_keeps_active_archive_ambiguity_fail_closed(self) -> None:
+        service, runner = self._service(
+            [
+                "UPLOAD_MASTER|ACTIVE|IFDOBIEL|1",
+                "UPLOAD_MASTER|ARCHIVE|IFDOBIEL|1",
+            ],
+        )
+
+        with self.assertRaisesRegex(
+            OutputFileGenerationError,
+            r"selected interface IFDOBIEL exists in active and archived data",
+        ):
+            service.generate(self._request(interface_code="IFDOBIEL"))
+
+        self.assertEqual(len(runner.scripts), 1)
+        self.assertEqual(runner.pending, 0)
+
+    def test_invalid_manual_interface_fails_before_sql(self) -> None:
+        service, runner = self._service()
+
+        with self.assertRaisesRegex(
+            OutputFileGenerationError,
+            "selected interface/output is not supported",
+        ):
+            service.generate(self._request(interface_code="NOT_IMPLEMENTED"))
+
+        self.assertEqual(runner.scripts, [])
+
+    def test_invalid_expected_input_date_fails_before_sql(self) -> None:
+        service, runner = self._service()
+        request = replace(
+            self._request(interface_code="OFDOBIEL"),
+            input_file_date="20260230",
+        )
+
+        with self.assertRaisesRegex(
+            OutputFileGenerationError,
+            "valid calendar date",
+        ):
+            service.generate(request)
+
+        self.assertEqual(runner.scripts, [])
+
+    def test_expected_input_date_must_match_prod_file_log(self) -> None:
+        service, runner = self._service(
+            ["UPLOAD_MASTER|ARCHIVE|IFDOBIEL|1"],
+            ["IFDOBIEL|OFDOBIEL"],
+            ["20260731|1|1"],
+        )
+        request = replace(
+            self._request(interface_code="OFDOBIEL"),
+            input_file_date="20260801",
+        )
+
+        with self.assertRaisesRegex(
+            OutputFileGenerationError,
+            r"selected input date does not match.*selected 01-08-2026.*detected 31-07-2026",
+        ):
+            service.generate(request)
+
+        self.assertEqual(len(runner.scripts), 3)
+        self.assertFalse((self.root / "output").exists())
+
+    def test_expected_input_date_is_validated_but_never_overrides_oracle(self) -> None:
+        service, runner = self._service(
+            ["UPLOAD_MASTER|ARCHIVE|IFDOBIEL|1"],
+            ["IFDOBIEL|OFDOBIEL"],
+            ["20260731|1|1"],
+            ["P|||BDY;C;000000001;E;P;"],
+            ["1|1|1"],
+        )
+        request = replace(
+            self._request(interface_code="OFDOBIEL"),
+            input_file_date="20260731",
+        )
+
+        result = service.generate(request)
+
+        self.assertEqual(result.file_date, "20260731")
+        self.assertEqual(result.output_path.name, "OFDOBIEL_20260731.TXT")
+        self.assertTrue(
+            any("from GITA_FILE_LOG" in script for script in runner.scripts)
+        )
+        self.assertEqual(runner.pending, 0)
+
+    def test_manual_shared_process_blocks_process_global_footer_contract(self) -> None:
+        service, runner = self._service(
+            [
+                "UPLOAD_MASTER|ACTIVE|STDINRTS|1",
+                "UPLOAD_MASTER|ACTIVE|IFDOBIEL|1",
+            ],
+        )
+
+        with self.assertRaisesRegex(
+            OutputFileGenerationError,
+            r"STDINROU cannot safely isolate this shared process.*IFDOBIEL",
+        ):
+            service.generate(self._request(interface_code="STDINROU"))
+
+        self.assertEqual(len(runner.scripts), 1)
+        self.assertEqual(runner.pending, 0)
+
     def test_stale_archive_log_does_not_hide_current_upload_source(self) -> None:
         body = ["P|||BDY;C;000000001;E;P;"]
         service, runner = self._service(
@@ -1794,11 +2397,18 @@ class OutputFileGenerationTests(unittest.TestCase):
 
         message = str(raised.exception)
         self.assertIn("Timed out after 120s", message)
+        self.assertIn("DISCOVERY", message)
         self.assertNotIn(secret_row, message)
         self.assertNotIn("PRIVATE-CUSTOMER-DATA", message)
         self.assertEqual(runner.pending, 0)
 
     def test_nonzero_stdout_is_never_used_as_an_error_message(self) -> None:
+        self.config.credentials["chile"]["PROD-DB-DR"] = {
+            "SHARED-PROD": {
+                **self.config.credential,
+                "tns": "FXBFCL_19C_PROD_OCI_DR",
+            }
+        }
         leaked_rows = (
             "BDY;ACCOUNT123;SQL Error;SECRET;",
             "BDY;ACCOUNT123;ORA-20000: error for SECRET;",
@@ -1806,7 +2416,10 @@ class OutputFileGenerationTests(unittest.TestCase):
         )
         for leaked_row in leaked_rows:
             with self.subTest(leaked_row=leaked_row):
-                service, runner = self._service(RunResult(1, leaked_row, ""))
+                service, runner = self._service(
+                    RunResult(1, leaked_row, ""),
+                    ["UPLOAD_MASTER|ARCHIVE|IFDOBIEL|1"],
+                )
 
                 with self.assertRaises(OutputFileGenerationError) as raised:
                     service.generate(self._request())
@@ -1814,7 +2427,11 @@ class OutputFileGenerationTests(unittest.TestCase):
                 self.assertEqual(str(raised.exception), "SQLcl failed with exit code 1")
                 self.assertNotIn("ACCOUNT123", str(raised.exception))
                 self.assertNotIn("SECRET", str(raised.exception))
-                self.assertEqual(runner.pending, 0)
+                self.assertEqual(
+                    runner.connections,
+                    ["fake_user/fake-password@FXBFCL_19C_PROD_OCI"],
+                )
+                self.assertEqual(runner.pending, 1)
 
     def test_programmatic_target_must_still_be_a_configured_prod_login(self) -> None:
         service, runner = self._service()

@@ -318,6 +318,7 @@ class OfchkprtCentralAdapterContractTests(unittest.TestCase):
         self.assertIn("status <> 'p'", compact)
         self.assertIn("pru.status <> 's'", compact)
         self.assertIn("pru.status = 's'", compact)
+        self.assertEqual(compact.count("gp.interface_code = 'ifchkprt'"), 3)
         self.assertIn("fld29", compact)
         self.assertIn("fm999999999999999v999", compact)
         self.assertIn("order by rec_ref", compact)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import tempfile
+import threading
 import unittest
 from datetime import date, timedelta
 from pathlib import Path
@@ -26,11 +27,16 @@ from fbbatch.runner import (  # noqa: E402
     _accept_outlook_profile_dialog,
     _click_outlook_profile_ok_native,
     _confirm_outlook_profile_dialog,
+    _credential_property_values,
     _ensure_outlook_window,
+    _initial_fbbatch_alias_overrides,
     _get_outlook_mapi_namespace,
+    _java_connection_failed,
+    _java_failed_connection_key,
     _java_idle_timeout_seconds,
     _java_process_label,
     _java_reported_failure,
+    _next_fbbatch_failover_overrides,
     _newest_after,
     _parse_historical_event_dates,
     _prepare_historical_event_runtime,
@@ -38,8 +44,10 @@ from fbbatch.runner import (  # noqa: E402
     _run_java,
     _snapshot_html_outputs,
     _start_outlook_application,
+    _terminate_java_process_tree,
     issue_routing_flags,
     run_batch_report,
+    run_eod_batch_event,
 )
 from ui.fbbatch_view import (  # noqa: E402
     _DraftRetryContext,
@@ -74,6 +82,351 @@ class EventProgressTests(unittest.TestCase):
         message = _java_reported_failure(output)
 
         self.assertIn("could not connect", message)
+
+    def test_java_connection_failure_identifies_the_last_logical_database(self) -> None:
+        output = (
+            "FBConnection getFBConnection connecting to the-->CL_PROD\n"
+            "FBConnection Successfully connected to the 'CL_PROD' database.\n"
+            "FBConnection getFBConnection connecting to the-->COL_PROD\n"
+            "ORA-12514: TNS:listener does not currently know of service requested\n"
+        )
+
+        self.assertTrue(_java_connection_failed(output))
+        self.assertEqual(_java_failed_connection_key(output), "COL_PROD")
+
+    def test_functional_java_error_is_not_classified_as_connection_failure(self) -> None:
+        self.assertFalse(_java_connection_failed("ORA-00942: table or view does not exist"))
+        self.assertFalse(_java_connection_failed("ORA-01017: invalid username/password"))
+
+    def test_night_shift_jdbc_urls_follow_the_selected_equivalent_alias(self) -> None:
+        primary = _credential_property_values(
+            "CL_PROD",
+            {"user": "user", "password": "secret", "tns": "FXBFCL_19C_PROD_OCI"},
+        )
+        alternate = _credential_property_values(
+            "CL_PROD",
+            {
+                "user": "user",
+                "password": "secret",
+                "tns": "FXBFCL_19C_PROD_OCI_DR",
+            },
+        )
+
+        self.assertIn("sascl1", primary["CL_PROD_DB_URL"])
+        self.assertIn("savap1", alternate["CL_PROD_DB_URL"])
+        self.assertNotEqual(primary["CL_PROD_DB_URL"], alternate["CL_PROD_DB_URL"])
+
+        colombia_primary = _credential_property_values(
+            "COL_PROD",
+            {"user": "user", "password": "secret", "tns": "BFCO_POCISANTIAGO"},
+        )
+        colombia_alternate = _credential_property_values(
+            "COL_PROD",
+            {"user": "user", "password": "secret", "tns": "BFCO_POCISAOPALO"},
+        )
+        self.assertIn("db-priv.fif.tech", colombia_primary["COL_PROD_DB_URL"])
+        self.assertIn("sasao1", colombia_alternate["COL_PROD_DB_URL"])
+        self.assertNotEqual(
+            colombia_primary["COL_PROD_DB_URL"],
+            colombia_alternate["COL_PROD_DB_URL"],
+        )
+
+    def test_report_failover_switches_only_the_database_that_failed(self) -> None:
+        credentials = {
+            "chile": {
+                "PRIMARY": {
+                    "TEAM": {
+                        "tns": "FXBFCL_19C_PROD_OCI",
+                        "bucket": "shared_prod",
+                    }
+                },
+                "SECONDARY": {
+                    "TEAM": {
+                        "tns": "FXBFCL_19C_PROD_OCI_DR",
+                        "bucket": "shared_prod",
+                    }
+                },
+            },
+            "colombia": {
+                "PRIMARY": {
+                    "TEAM": {
+                        "tns": "BFCO_POCISANTIAGO",
+                        "bucket": "shared_prod",
+                    }
+                },
+                "SECONDARY": {
+                    "TEAM": {
+                        "tns": "BFCO_POCISAOPALO",
+                        "bucket": "shared_prod",
+                    }
+                },
+            },
+        }
+        result = BatchResult(
+            False,
+            "connection failed",
+            connection_failure=True,
+            failed_connection_key="COL_PROD",
+        )
+
+        overrides = _next_fbbatch_failover_overrides(
+            result,
+            "PROD",
+            credentials,
+            {"chile_prod_oci": True, "colombia_prod_oci": True},
+            {
+                "chile": "FXBFCL_19C_PROD_OCI",
+                "colombia": "BFCO_POCISANTIAGO",
+            },
+            {},
+            {
+                "chile": {"FXBFCL_19C_PROD_OCI"},
+                "colombia": {"BFCO_POCISANTIAGO"},
+            },
+            event_only=False,
+        )
+
+        self.assertEqual(overrides, {"colombia": "BFCO_POCISAOPALO"})
+
+    def test_night_shift_failover_respects_disabled_pair(self) -> None:
+        result = BatchResult(
+            False,
+            "connection failed",
+            connection_failure=True,
+            failed_connection_key="CL_PROD",
+        )
+        credentials = {
+            "chile": {
+                "PRIMARY": {
+                    "TEAM": {
+                        "tns": "FXBFCL_19C_PROD_OCI",
+                        "bucket": "shared_prod",
+                    }
+                },
+                "SECONDARY": {
+                    "TEAM": {
+                        "tns": "FXBFCL_19C_PROD_OCI_DR",
+                        "bucket": "shared_prod",
+                    }
+                },
+            }
+        }
+
+        overrides = _next_fbbatch_failover_overrides(
+            result,
+            "PROD",
+            credentials,
+            {"chile_prod_oci": False},
+            {"chile": "FXBFCL_19C_PROD_OCI"},
+            {},
+            {"chile": {"FXBFCL_19C_PROD_OCI"}},
+            event_only=True,
+        )
+
+        self.assertIsNone(overrides)
+
+    def test_report_does_not_switch_an_unrelated_pair_for_mexico_failure(self) -> None:
+        result = BatchResult(
+            False,
+            "connection failed",
+            connection_failure=True,
+            failed_connection_key="MX_PROD",
+        )
+        credentials = {
+            "chile": {
+                "PRIMARY": {
+                    "TEAM": {
+                        "tns": "FXBFCL_19C_PROD_OCI",
+                        "bucket": "shared_prod",
+                    }
+                },
+                "SECONDARY": {
+                    "TEAM": {
+                        "tns": "FXBFCL_19C_PROD_OCI_DR",
+                        "bucket": "shared_prod",
+                    }
+                },
+            }
+        }
+
+        overrides = _next_fbbatch_failover_overrides(
+            result,
+            "PROD",
+            credentials,
+            {"chile_prod_oci": True},
+            {"chile": "FXBFCL_19C_PROD_OCI"},
+            {},
+            {"chile": {"FXBFCL_19C_PROD_OCI"}},
+            event_only=False,
+        )
+
+        self.assertIsNone(overrides)
+
+    def test_initial_alias_preferences_apply_only_to_prod_and_event_uses_chile(self) -> None:
+        preferred = {
+            "chile": "FXBFCL_19C_PROD_OCI_DR",
+            "colombia": "BFCO_POCISAOPALO",
+        }
+
+        self.assertEqual(
+            _initial_fbbatch_alias_overrides(
+                "PROD",
+                preferred,
+                event_only=False,
+            ),
+            preferred,
+        )
+        self.assertEqual(
+            _initial_fbbatch_alias_overrides(
+                "PROD",
+                preferred,
+                event_only=True,
+            ),
+            {"chile": "FXBFCL_19C_PROD_OCI_DR"},
+        )
+        self.assertEqual(
+            _initial_fbbatch_alias_overrides("QA", preferred, event_only=False),
+            {},
+        )
+
+    def test_batch_report_retries_with_the_equivalent_failed_database(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "CommonBatches" / "output" / "EODBATCH").mkdir(parents=True)
+            credentials = {
+                "colombia": {
+                    "PRIMARY": {
+                        "TEAM": {
+                            "tns": "BFCO_POCISANTIAGO",
+                            "bucket": "shared_prod",
+                        }
+                    },
+                    "SECONDARY": {
+                        "TEAM": {
+                            "tns": "BFCO_POCISAOPALO",
+                            "bucket": "shared_prod",
+                        }
+                    },
+                }
+            }
+            primary_configuration = SimpleNamespace(
+                paths=[],
+                aliases={"colombia": "BFCO_POCISAOPALO"},
+            )
+            alternate_configuration = SimpleNamespace(
+                paths=[],
+                aliases={"colombia": "BFCO_POCISANTIAGO"},
+            )
+            failed = BatchResult(
+                False,
+                "connection failed",
+                connection_failure=True,
+                failed_connection_key="COL_PROD",
+            )
+            completed = BatchResult(True, "Completed.", exit_code=0)
+            with (
+                patch(
+                    "fbbatch.runner.validate_fbbatch_root",
+                    return_value=(True, "", root),
+                ),
+                patch(
+                    "fbbatch.runner._materialize_fbbatch_configuration",
+                    side_effect=(primary_configuration, alternate_configuration),
+                ) as materialize,
+                patch("fbbatch.runner._run_java", side_effect=(failed, completed)) as run_java,
+                patch("fbbatch.runner._with_report_images", return_value=completed),
+            ):
+                result = run_batch_report(
+                    "PROD",
+                    True,
+                    "23072026",
+                    False,
+                    root,
+                    credentials=credentials,
+                    database_failover={"colombia_prod_oci": True},
+                    preferred_aliases={"colombia": "BFCO_POCISAOPALO"},
+                )
+
+            self.assertTrue(result.ok)
+            self.assertEqual(run_java.call_count, 2)
+            self.assertEqual(materialize.call_count, 2)
+            self.assertEqual(
+                materialize.call_args_list[0].kwargs["alias_overrides"],
+                {
+                    "chile": "FXBFCL_19C_PROD_OCI_DR",
+                    "colombia": "BFCO_POCISAOPALO",
+                },
+            )
+            self.assertEqual(
+                materialize.call_args_list[1].kwargs["alias_overrides"],
+                {
+                    "chile": "FXBFCL_19C_PROD_OCI_DR",
+                    "colombia": "BFCO_POCISANTIAGO",
+                },
+            )
+
+    def test_eod_batch_event_retries_with_the_equivalent_chile_database(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            credentials = {
+                "chile": {
+                    "PRIMARY": {
+                        "TEAM": {
+                            "tns": "FXBFCL_19C_PROD_OCI",
+                            "bucket": "shared_prod",
+                        }
+                    },
+                    "SECONDARY": {
+                        "TEAM": {
+                            "tns": "FXBFCL_19C_PROD_OCI_DR",
+                            "bucket": "shared_prod",
+                        }
+                    },
+                }
+            }
+            primary_configuration = SimpleNamespace(
+                paths=[],
+                aliases={"chile": "FXBFCL_19C_PROD_OCI_DR"},
+            )
+            alternate_configuration = SimpleNamespace(
+                paths=[],
+                aliases={"chile": "FXBFCL_19C_PROD_OCI"},
+            )
+            failed = BatchResult(
+                False,
+                "connection failed",
+                connection_failure=True,
+                failed_connection_key="CL_PROD",
+            )
+            completed = BatchResult(True, "Completed.", exit_code=0)
+            with (
+                patch(
+                    "fbbatch.runner.validate_fbbatch_root",
+                    return_value=(True, "", root),
+                ),
+                patch(
+                    "fbbatch.runner._materialize_fbbatch_configuration",
+                    side_effect=(primary_configuration, alternate_configuration),
+                ) as materialize,
+                patch(
+                    "fbbatch.runner._execute_eod_batch_event",
+                    side_effect=(failed, completed),
+                ) as run_event,
+            ):
+                result = run_eod_batch_event(
+                    "PROD",
+                    root,
+                    credentials=credentials,
+                    database_failover={"chile_prod_oci": True},
+                )
+
+            self.assertTrue(result.ok)
+            self.assertEqual(run_event.call_count, 2)
+            self.assertEqual(materialize.call_count, 2)
+            self.assertEqual(
+                materialize.call_args_list[1].kwargs["alias_overrides"],
+                {"chile": "FXBFCL_19C_PROD_OCI"},
+            )
 
     def test_batch_report_does_not_reuse_stale_html_when_java_writes_nothing(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -261,7 +614,10 @@ class EventProgressTests(unittest.TestCase):
             updates: list[tuple[int, str]] = []
 
             with (
-                patch("ui.fbbatch_view.run_batch_report", return_value=report_result),
+                patch(
+                    "ui.fbbatch_view.run_batch_report",
+                    return_value=report_result,
+                ) as run_report,
                 patch("ui.fbbatch_view.find_event_pdf_for_report_date", return_value=None),
                 patch("ui.fbbatch_view.run_eod_batch_event", return_value=event_result) as run_event,
                 patch("ui.fbbatch_view.create_outlook_draft") as create_draft,
@@ -281,15 +637,89 @@ class EventProgressTests(unittest.TestCase):
                     body_template="Body {DAY}",
                     mail_method="classic",
                     credentials={},
+                    database_failover={},
+                    preferred_aliases={
+                        "chile": "FXBFCL_19C_PROD_OCI_DR",
+                        "colombia": "BFCO_POCISAOPALO",
+                    },
                     progress=lambda percent, message: updates.append((percent, message)),
                 )
 
             self.assertTrue(result.ok)
+            self.assertEqual(
+                run_report.call_args.kwargs["preferred_aliases"],
+                {
+                    "chile": "FXBFCL_19C_PROD_OCI_DR",
+                    "colombia": "BFCO_POCISAOPALO",
+                },
+            )
             self.assertEqual(run_event.call_args.kwargs["latest"], False)
             self.assertEqual(run_event.call_args.kwargs["event_date"], "17072026")
             self.assertEqual(run_event.call_args.kwargs["next_date"], "20072026")
+            self.assertEqual(run_event.call_args.kwargs["database_failover"], {})
+            self.assertEqual(
+                run_event.call_args.kwargs["preferred_aliases"],
+                {
+                    "chile": "FXBFCL_19C_PROD_OCI_DR",
+                    "colombia": "BFCO_POCISAOPALO",
+                },
+            )
             self.assertEqual(create_draft.call_args.kwargs["attachments"], [event_pdf])
             self.assertEqual(create_draft.call_args.kwargs["inline_images"], [report_image])
+
+    def test_full_report_cancellation_after_report_skips_event_and_draft(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            report_html = output_dir / "BatchReport_17-07-2026.html"
+            report_html.write_text("<html>regular batch</html>", encoding="utf-8")
+            report_image = output_dir / "summary.png"
+            report_image.write_bytes(b"image")
+            report_result = BatchResult(
+                True,
+                "ready",
+                html_path=report_html,
+                image_paths=[report_image],
+                images_dir=output_dir,
+                output_dir=output_dir,
+            )
+            cancel_event = threading.Event()
+            view = SimpleNamespace(_draft_retry_context=None)
+
+            def finish_report(*_args, **_kwargs):
+                cancel_event.set()
+                return report_result
+
+            with (
+                patch("ui.fbbatch_view.run_batch_report", side_effect=finish_report),
+                patch("ui.fbbatch_view.run_eod_batch_event") as run_event,
+                patch("ui.fbbatch_view.create_outlook_draft") as create_draft,
+            ):
+                result = FBBatchSetupView._run_full_report(
+                    view,
+                    env="PROD",
+                    latest=False,
+                    report_date="17072026",
+                    has_batch_issue=False,
+                    has_other_issue=False,
+                    root="FBBatchSetup",
+                    subject_template="NSSR: {DAY}",
+                    from_account="sender@example.com",
+                    to="to@example.com",
+                    cc="cc@example.com",
+                    body_template="Body {DAY}",
+                    mail_method="classic",
+                    credentials={},
+                    database_failover={},
+                    preferred_aliases={},
+                    progress=Mock(),
+                    cancel_event=cancel_event,
+                )
+
+            self.assertTrue(result.cancelled)
+            self.assertEqual(result.exit_code, 130)
+            self.assertEqual(result.html_path, report_html)
+            run_event.assert_not_called()
+            create_draft.assert_not_called()
 
     def test_background_worker_queues_progress_and_completion(self) -> None:
         events: Queue[tuple[str, object]] = Queue()
@@ -302,6 +732,28 @@ class EventProgressTests(unittest.TestCase):
 
         self.assertEqual(events.get_nowait(), ("progress", (40, "Report: 4/10")))
         self.assertEqual(events.get_nowait(), ("finish", result))
+
+    def test_cancel_button_signals_active_night_shift(self) -> None:
+        cancel_event = threading.Event()
+        progress_label = Mock()
+        view = SimpleNamespace(
+            _running=True,
+            _cancel_event=cancel_event,
+            _active_progress="report",
+            _set_cancel_controls=Mock(),
+            _progress_widgets=Mock(return_value=(Mock(), progress_label)),
+            status_label=Mock(),
+        )
+
+        FBBatchSetupView._on_cancel(view)
+
+        self.assertTrue(cancel_event.is_set())
+        view._set_cancel_controls.assert_called_once_with(
+            state="disabled",
+            text_key="fbbatch.cancelling",
+        )
+        progress_label.configure.assert_called_once()
+        view.status_label.configure.assert_called_once()
 
     def test_simple_report_page_is_shown_without_building_a_second_workflow(self) -> None:
         view = SimpleNamespace(
@@ -525,6 +977,49 @@ class EventProgressTests(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertTrue(any("TRANSFERENCIAS DE LINEA DE CREDITO" in message for _, message in updates))
         self.assertEqual(updates[-1], (90, "Java process completed"))
+        process.kill.assert_not_called()
+
+    def test_java_runner_honors_cancellation_before_process_start(self) -> None:
+        cancel_event = threading.Event()
+        cancel_event.set()
+
+        with patch("fbbatch.runner.subprocess.Popen") as popen:
+            result = _run_java(
+                ROOT_DIR,
+                "example.EventApplication",
+                "PROD\n",
+                progress_kind="event",
+                cancel_event=cancel_event,
+            )
+
+        self.assertTrue(result.cancelled)
+        self.assertEqual(result.exit_code, 130)
+        popen.assert_not_called()
+
+    def test_java_cancellation_terminates_the_complete_windows_process_tree(self) -> None:
+        process = SimpleNamespace(
+            pid=4321,
+            poll=Mock(return_value=None),
+            wait=Mock(return_value=0),
+            kill=Mock(),
+            terminate=Mock(),
+        )
+
+        with (
+            patch("fbbatch.runner.os.name", "nt"),
+            patch(
+                "fbbatch.runner.subprocess.run",
+                return_value=SimpleNamespace(returncode=0),
+            ) as run,
+        ):
+            _terminate_java_process_tree(process, "EOD Batch Event")
+
+        self.assertEqual(
+            run.call_args.args[0],
+            ["taskkill", "/PID", "4321", "/T", "/F"],
+        )
+        process.wait.assert_called_once_with(timeout=5)
+        process.terminate.assert_not_called()
         process.kill.assert_not_called()
 
     def test_event_transcript_advances_through_events_and_summary(self) -> None:

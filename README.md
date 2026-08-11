@@ -66,6 +66,27 @@ Mexico). Click a tile to see the credentials grouped by environment
 Passwords are encrypted with Windows DPAPI on disk — readable only by your
 Windows user on this machine.
 
+### Optional PROD database failover
+
+Settings → **Database failover** controls the two explicitly approved pairs of
+equivalent PROD databases:
+
+- Chile: `FXBFCL_19C_PROD_OCI` ↔ `FXBFCL_19C_PROD_OCI_DR`
+- Colombia: `BFCO_POCISANTIAGO` ↔ `BFCO_POCISAOPALO`
+
+Both pairs are enabled by default after updating. Save a **PROD (shared)**
+credential for both aliases in a pair; when the selected source returns an
+Oracle listener/network connection error, the operation retries the other
+alias. This applies to source extraction in Spool CL, CMR and Spool CASA, to
+Output File Generation, and to the PROD Batch Report/Batch Event queries in
+Night Shift. Output File Generation restarts the complete read-only build on
+one equivalent alias, so a single file never mixes rows from both databases.
+Apply/injection, generic timeouts, authentication failures and functional SQL
+errors are never redirected.
+Night Shift also exposes a preferred PROD alias for Chile and Colombia: the
+selected alias is tried first, while the paired alias remains the automatic
+fallback when failover is enabled.
+
 ---
 
 ## 4. Night Shift credentials
@@ -77,6 +98,11 @@ configuration files for that run, and removes them when the process finishes.
 
 PROD reports require one **PROD (shared)** credential for Chile, Peru, Colombia
 and Mexico. QA and DEV runs use the corresponding Chile credential.
+
+For PROD, Night Shift writes the JDBC URL that corresponds to the selected TNS
+alias into its temporary Java configuration. If Java reports a listener or
+network connection failure, it retries only the enabled equivalent Chile or
+Colombia alias for which a saved PROD credential exists.
 
 ### Microsoft Graph drafts (optional)
 
@@ -178,21 +204,42 @@ Open **Output files** from the sidebar.
 
 1. Select a configured PROD credential for Chile, Peru, Colombia, or Mexico.
 2. Enter the numeric `process_ref_no`.
-3. The app searches the active/archive upload masters and file logs, then
-   automatically detects the input interface, its outgoing mapping, the
-   reconstructible source, file date, and physical filename. It never treats
+3. Choose the event/interface in the searchable selector. Typing filters by
+   prefix; enable **Detect the interface automatically** only when the process
+   contains one unambiguous interface.
+4. Pick the expected input launch date from the calendar, which is visible by
+   default. Alternatively, enable **Detect date automatically**. A manually
+   selected date is validated against the unique date persisted in PROD; it
+   never overrides Oracle data or partitions upload rows that cannot be safely
+   separated.
+5. The app searches the active/archive upload masters and file logs, then
+   detects the outgoing mapping, reconstructible source, file date, and physical
+   filename. It never treats
    `ARCHIVAL_DATE` as the client file date: automatic date resolution uses
    `UPLOAD_DATE` from the matching `GITB_FILE_LOG`/`GITA_FILE_LOG`, with
    `START_DATE_STAMP` only as a legacy fallback.
-4. Click **Generate file**, review the preview/counts, and open the output
+6. Click **Generate file**, review the preview/counts, and open the output
    folder when complete.
 
 Process discovery and input/output mapping run against whichever configured
 PROD country is selected. Exact generation is enabled for the 39 Chile-QA
-contracts below and for the separate Colombia-QA `IFICOWCG → OFICOWCG`
-contract. Every other Peru, Colombia, or Mexico pair is still detected, but the
-app stops with the required `GIPKS_<OUTPUT>` package from that country's QA
-instead of silently reusing a Chile layout.
+contracts below and for these primary regional contracts verified from their
+own QA packages:
+
+- Colombia: active `CHISALCA → CHISALOU` and
+  `IFICOWCG → OFICOWCG`.
+- Peru: `CHISALCA → CHISALOU`, `IFDOBIEL → OFDOBIEL`, and
+  `IFICOWCG → OFICOWCG`, currently ACTIVE-only.
+- Mexico: active `CHISALCA → CHISALOU` and
+  `IFICOWCG → OFICOWCG`.
+
+Every other Peru, Colombia, or Mexico pair is still detected, but the app stops
+with the required `GIPKS_<OUTPUT>` package from that country's QA instead of
+silently reusing a Chile layout. `GITM_INTERFACE_DEFINITION` remains an
+independent runtime guard: in the currently inspected PROD data, Peru does not
+declare `IFDOBIEL → OFDOBIEL`, and Mexico does not declare
+`IFICOWCG → OFICOWCG`. Those verified adapters become usable when the matching
+PROD mapping is present; the app does not bypass or invent that mapping.
 
 Discovery is generic: it can identify any input/output pair currently declared
 in `GITM_INTERFACE_DEFINITION` (49 pairs in the development snapshot). Exact
@@ -204,7 +251,7 @@ its own client contract. The 39 currently verified Chile adapters are:
 | `ACCBLOCK` | `ACCBLKOU` | active or archived |
 | `CHBOOKIN` | `CHBOOKOU` | active or archived |
 | `CHICLUPD` | `CHICLOU` | active or archived while clearing data is retained |
-| `CHISALCA` | `CHISALOU` | active or archived while teller/file data and one physical upload filename are retained |
+| `CHISALCA` | `CHISALOU` | Chile active/archive; Colombia, Mexico, and Peru active; regional variants preserve raw FLD16 and TYPE-O errors, and Peru additionally emits CCICODE |
 | `CLADCHG` | `CLADCHGO` | active or archived |
 | `CLIIRFAP` | `CLOIRFAP` | active or archived |
 | `CLISLRES` | `CLOSLRES` | active or archived |
@@ -220,11 +267,11 @@ its own client contract. The 39 currently verified Chile adapters are:
 | `IFCLPMNT` | `IFCLPMTO` | active or archived |
 | `IFCRELVP` | `OFCRELVP` | active or archived |
 | `IFDDISSU` | `OFDDISSU` | active or archived; no footer by QA contract |
-| `IFDOBIEL` | `OFDOBIEL` | active or archived |
+| `IFDOBIEL` | `OFDOBIEL` | Chile active/archive; Peru active contract verified, but the current Peru PROD mapping is absent |
 | `IFEARLCG` | `IFOARLCG` | active or archived while clearing rows are retained |
 | `IFGLCRTE` | `OFGLCRTE` | active or archived |
 | `IFGLMDFY` | `OFGLMDFY` | active or archived while lookup rows are retained |
-| `IFICOWCG` | `OFICOWCG` | active only; Chile and Colombia have separate QA contracts; Colombia additionally requires retained IFCC and rejection rows |
+| `IFICOWCG` | `OFICOWCG` | active only; Chile, Colombia/Mexico, and Peru QA contracts are separate; every non-Chile variant requires retained IFCC and rejection rows |
 | `IFIWADOC` | `OFIWADOC` | active or archived only while ADOC/file-master rows remain complete |
 | `IFIWDCLG` | `OFIWDCLG` | active only; requires current clearing/file-master rows |
 | `IFLOCREC` | `OFLOCREC` | active or archived |
@@ -267,34 +314,44 @@ If a process has multiple reconstructible interfaces or sources, has ambiguous
 log dates, or a pre-save recheck observes changed rows or mapping, generation
 stops instead of guessing.
 
+For CHISALOU and OFICOWCG, the physical input filename printed by QA comes from
+the trigger's exact successful file-master row: the logical
+`GITM_FILE_NAMES.FILE_NAME`, matching process/interface,
+`UPLOAD_STATUS='P'`, and `PROCESS_CODE='FP'`. The app reproduces that lookup
+and requires one row; unrelated file-master rows can neither supply nor
+ambiguously block the header.
+
 Archived tables may have no usable `PROCESS_REF_NO` index. Large historical
 reconstructions can therefore take several minutes because the app performs
 stability rechecks before saving; the UI remains cancellable throughout.
-For archived `CHISALCA`, the app derives the six-column upload index key from
-the matching `GITA_FILE_LOG` rows and then resolves teller XREFs separately.
-This avoids repeated wide scans of the 4.3-billion-row Chile PROD archive after
-initial process discovery. A temporary read-only run for process `2744251`
-completed in about 1m56s with five body rows and `FTR;5;0;`.
+For manually selected archived `CHISALCA`, discovery and reconstruction derive
+the six-column upload index key from matching `GITA_FILE_LOG` rows and resolve
+teller XREFs separately. This avoids a direct process-number scan of the
+4.3-billion-row Chile PROD archive. A read-only PROD DR verification for process
+`2744251` reduced discovery from two 120-second timeouts to 31.5 seconds and
+found its five archived upload rows.
 
 `OFICOWCG` ACTIVE additionally proves per-row identity. Chile requires every
 IFICOWCG upload to have a unique `RECORD_REFERENCE`, exactly one clearing-log
 match, exactly one pre-UNION output, and no orphan clearing-upload row. Colombia
-reproduces its four-branch QA cursor, `SUCC/ERRO/REJR` transaction status,
-`IFTB_CLEARING_UPLOAD_C`, and clearing-rejection lookup. Because the Colombia
-DD branches can legitimately emit more than one row per upload, its guard
-instead requires every upload to reach at least one branch, processed clearing
-rows to have one upload owner, and the final UNION count to match the body. All
-mutable inputs are read again before the local save.
+and Mexico share a byte-identical four-branch QA cursor; Peru has the same wire
+format but preserves its own null-safe `INSTRNO2` join. All three reproduce
+`SUCC/ERRO/REJR` transaction status, `IFTB_CLEARING_UPLOAD_C`, and the
+clearing-rejection lookup. Because their DD branches can legitimately emit more
+than one row per upload, the regional guard requires every upload to reach at
+least one branch, processed clearing rows to have one upload owner, and the
+final UNION count to match the body. All mutable inputs are read again before
+the local save.
 
 `ACTIVE` does not mean that clearing dependencies are guaranteed to remain.
-Colombia cleanup can remove `GITM_CLEARING_LOG` on the same day while upload
+Regional cleanup can remove `GITM_CLEARING_LOG` on the same day while upload
 rows are still present. In that case the app stops with an incomplete-clearing
 error rather than inferring `SUCC`, `ERRO`, or `REJR`.
 
 The operation executes only `SELECT` queries in PROD. It never calls
 `fn_handoff`, performs DML/`COMMIT`, or writes to an Oracle server directory.
-Files are validated before an atomic local save, and an existing file is not
-replaced unless the user explicitly enables that option.
+Files are validated before an atomic local save. A successfully validated file
+automatically replaces an existing local file with the same managed name.
 
 Generated files land in:
 `%LOCALAPPDATA%\OracleTasksChile\output_files\<Country>\`

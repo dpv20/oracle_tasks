@@ -25,6 +25,8 @@ class GenerationRequest:
     target: OracleTarget
     process_ref_no: str
     overwrite: bool = False
+    interface_code: str | None = None
+    input_file_date: str | None = None
 
 
 @dataclass(frozen=True)

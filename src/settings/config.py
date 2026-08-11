@@ -4,9 +4,9 @@ Passwords inside credential dicts are encrypted with DPAPI before being written
 to disk and decrypted on read. Encryption is per-Windows-user, so the file is
 unreadable by other accounts on the same machine.
 
-Config schema (v8):
+Config schema (v10):
 {
-  "version": 8,
+  "version": 10,
   "language": "en" | "es",
   "theme": "light" | "dark",
   "sqlcl_path": "<absolute path to sql.exe>",
@@ -22,6 +22,14 @@ Config schema (v8):
   "fbbatch_mail_method": "new" | "classic" | "graph",
   "spools_cl_output_dir": "<override; empty = use default in DATA_DIR>",
   "verify_savings_apply": false,
+  "database_failover": {
+      "chile_prod_oci": true,
+      "colombia_prod_oci": true
+  },
+  "fbbatch_preferred_databases": {
+      "chile": "FXBFCL_19C_PROD_OCI_DR",
+      "colombia": "BFCO_POCISANTIAGO"
+  },
   "start_with_windows": true,
   "vpn_show_forti": true,
   "vpn_show_bice": false,
@@ -46,11 +54,16 @@ from copy import deepcopy
 from typing import Any
 
 from paths import CONFIG_DIR, CONFIG_FILE
+from settings.database_failover import (
+    DEFAULT_DATABASE_FAILOVER,
+    DEFAULT_DATABASE_PREFERENCES,
+    normalize_database_preferences,
+)
 
 log = logging.getLogger(__name__)
 
 DEFAULTS: dict[str, Any] = {
-    "version": 8,
+    "version": 10,
     "language": "en",
     "theme": "light",
     "sqlcl_path": "",
@@ -66,6 +79,8 @@ DEFAULTS: dict[str, Any] = {
     "fbbatch_mail_method": "new",
     "spools_cl_output_dir": "",
     "verify_savings_apply": False,
+    "database_failover": deepcopy(DEFAULT_DATABASE_FAILOVER),
+    "fbbatch_preferred_databases": deepcopy(DEFAULT_DATABASE_PREFERENCES),
     "start_with_windows": True,
     "vpn_show_forti": True,
     "vpn_show_bice": False,
@@ -195,6 +210,16 @@ class ConfigManager:
             merged["fbbatch_mail_method"] = (
                 "classic" if bool(merged.get("fbbatch_use_classic_outlook")) else "new"
             )
+        raw_database_failover = merged.get("database_failover", {})
+        if not isinstance(raw_database_failover, dict):
+            raw_database_failover = {}
+        merged["database_failover"] = {
+            key: bool(raw_database_failover.get(key, enabled))
+            for key, enabled in DEFAULT_DATABASE_FAILOVER.items()
+        }
+        merged["fbbatch_preferred_databases"] = normalize_database_preferences(
+            merged.get("fbbatch_preferred_databases")
+        )
         merged["version"] = DEFAULTS["version"]
         return merged
 
@@ -373,3 +398,28 @@ class ConfigManager:
 
     def all_credentials(self) -> dict[str, dict[str, dict[str, dict[str, str]]]]:
         return self._data["credentials"]
+
+    # -- database failover helpers --
+    def database_failover_enabled(self, pair_key: str) -> bool:
+        return bool(self._data.get("database_failover", {}).get(pair_key, False))
+
+    def set_database_failover_enabled(self, pair_key: str, enabled: bool) -> None:
+        values = dict(self._data.get("database_failover", {}))
+        if pair_key not in DEFAULT_DATABASE_FAILOVER:
+            raise ValueError(f"Unknown database failover pair: {pair_key}")
+        values[pair_key] = bool(enabled)
+        self._data["database_failover"] = values
+        self.save()
+
+    def set_fbbatch_preferred_database(self, country: str, alias: str) -> None:
+        values = normalize_database_preferences(
+            {
+                **self._data.get("fbbatch_preferred_databases", {}),
+                country.strip().lower(): alias,
+            }
+        )
+        country_key = country.strip().lower()
+        if country_key not in DEFAULT_DATABASE_PREFERENCES:
+            raise ValueError(f"Unknown Night Shift database country: {country}")
+        self._data["fbbatch_preferred_databases"] = values
+        self.save()

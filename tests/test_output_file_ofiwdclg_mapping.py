@@ -300,6 +300,7 @@ class OfiwdclgCentralAdapterContractTests(unittest.TestCase):
         self.assertIn("status <> 'p'", compact)
         self.assertIn("nvl(ifc.status, 'err') = 'err'", compact)
         self.assertIn("ifc.status = 'succ'", compact)
+        self.assertEqual(compact.count("gic.interface_code = 'ifiwdclg'"), 3)
         self.assertIn("to_char(r.instramt, 'tm9'", compact)
         self.assertIn("nls_numeric_characters=''.,''", compact)
         self.assertIn("order by record_reference", compact)

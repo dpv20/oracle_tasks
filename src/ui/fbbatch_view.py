@@ -5,7 +5,6 @@ import os
 import logging
 import queue
 import threading
-import calendar
 import webbrowser
 from datetime import date, datetime, timedelta
 from dataclasses import dataclass
@@ -41,12 +40,20 @@ from fbbatch.runner import (
     write_issue_properties,
 )
 from i18n import t
+from settings.database_failover import (
+    DATABASE_FAILOVER_PAIRS,
+    normalize_database_preferences,
+)
 
+from .calendar_dialog import CalendarDialog
 from .widgets import CardFrame, IconButton, SectionLabel
 
 
 log = logging.getLogger(__name__)
 ENVIRONMENTS = ("PROD", "QA", "DEV")
+DATABASE_PAIR_BY_COUNTRY = {
+    pair.country: pair for pair in DATABASE_FAILOVER_PAIRS
+}
 COUNTRIES = ("CHILE", "PERU", "COLOMBIA", "MEXICO")
 TEXT_FIELDS = {"ISSUE_DETAILS", "ACTION_TAKEN", "FURTHER_ACTION_REQUIRED"}
 TIME_FIELDS = {
@@ -203,6 +210,7 @@ class FBBatchSetupView(ctk.CTkFrame):
         super().__init__(master, fg_color="transparent")
         self.app = app
         self._running = False
+        self._cancel_event: threading.Event | None = None
         self._last_pdf: Path | None = None
         self._last_html: Path | None = None
         self._last_images_dir: Path | None = None
@@ -217,6 +225,14 @@ class FBBatchSetupView(ctk.CTkFrame):
         self._worker_events: queue.Queue[tuple[str, object]] | None = None
         self._active_progress = "event"
         self.full_env_var = ctk.StringVar(value=ENVIRONMENTS[0])
+        preferred_databases = normalize_database_preferences(
+            self.app.config.get("fbbatch_preferred_databases", {})
+        )
+        self._preferred_database_vars = {
+            country: ctk.StringVar(value=alias)
+            for country, alias in preferred_databases.items()
+        }
+        self._preferred_database_controls: list[tuple[ctk.CTkOptionMenu, object]] = []
 
         header = ctk.CTkFrame(self, fg_color="transparent")
         header.pack(side="top", fill="x", padx=20, pady=(20, 10))
@@ -260,6 +276,7 @@ class FBBatchSetupView(ctk.CTkFrame):
 
         self.report_body = ctk.CTkScrollableFrame(self, fg_color="transparent")
         self._build_simple_report_card()
+        self._sync_database_preference_controls()
 
         default_page = t("fbbatch.page.report")
         self.report_page_control.set(default_page)
@@ -291,6 +308,102 @@ class FBBatchSetupView(ctk.CTkFrame):
         self._sync_simple_report_controls()
         self.report_body.pack(fill="both", expand=True, padx=20, pady=(0, 20))
 
+    def _build_database_preference_row(
+        self,
+        parent,
+        *,
+        row: int,
+        columnspan: int,
+        environment_getter,
+        countries: tuple[str, ...] = ("chile", "colombia"),
+    ) -> None:
+        frame = ctk.CTkFrame(parent, fg_color="transparent")
+        frame.grid(
+            row=row,
+            column=0,
+            columnspan=columnspan,
+            sticky="ew",
+            pady=(4, 8),
+        )
+        self._add_database_preference_controls(
+            frame,
+            environment_getter=environment_getter,
+            countries=countries,
+            show_heading=True,
+        )
+
+    def _add_database_preference_controls(
+        self,
+        parent,
+        *,
+        environment_getter,
+        countries: tuple[str, ...],
+        show_heading: bool,
+    ) -> None:
+        if show_heading:
+            ctk.CTkLabel(
+                parent,
+                text=t("fbbatch.database.preferred"),
+                width=120,
+                anchor="w",
+            ).pack(side="left")
+        for country in countries:
+            pair = DATABASE_PAIR_BY_COUNTRY[country]
+            ctk.CTkLabel(
+                parent,
+                text=t(f"fbbatch.database.{country}"),
+                anchor="w",
+            ).pack(side="left", padx=(14, 6))
+            menu = ctk.CTkOptionMenu(
+                parent,
+                values=list(pair.aliases),
+                variable=self._preferred_database_vars[country],
+                width=250 if country == "chile" else 220,
+                command=lambda value, selected_country=country: (
+                    self._save_preferred_database(selected_country, value)
+                ),
+            )
+            menu.pack(side="left")
+            self._preferred_database_controls.append((menu, environment_getter))
+
+    def _save_preferred_database(self, country: str, alias: str) -> None:
+        self.app.config.set_fbbatch_preferred_database(country, alias)
+        normalized = normalize_database_preferences(
+            self.app.config.get("fbbatch_preferred_databases", {})
+        )
+        for key, value in normalized.items():
+            self._preferred_database_vars[key].set(value)
+        log.info(
+            "night_shift: preferred PROD database changed country=%s alias=%s",
+            country,
+            normalized[country],
+        )
+
+    def _sync_database_preference_controls(self, _selected: str | None = None) -> None:
+        for menu, environment_getter in self._preferred_database_controls:
+            state = "normal" if environment_getter() == "PROD" else "disabled"
+            menu.configure(state=state)
+
+    def _selected_preferred_databases(self) -> dict[str, str]:
+        return normalize_database_preferences(
+            {
+                country: variable.get()
+                for country, variable in self._preferred_database_vars.items()
+            }
+        )
+
+    def _create_cancel_button(self, parent) -> ctk.CTkButton:
+        return ctk.CTkButton(
+            parent,
+            text=t("fbbatch.cancel"),
+            width=150,
+            state="disabled",
+            fg_color=("#D9534F", "#A8322C"),
+            hover_color=("#C9302C", "#8B1F1A"),
+            text_color="white",
+            command=self._on_cancel,
+        )
+
     def _build_simple_report_card(self) -> None:
         card = CardFrame(self.report_body)
         card.pack(fill="x", pady=(0, 12))
@@ -309,21 +422,45 @@ class FBBatchSetupView(ctk.CTkFrame):
             width=120,
             anchor="w",
         ).grid(row=1, column=0, sticky="w", pady=(18, 8))
+        simple_environment_row = ctk.CTkFrame(inner, fg_color="transparent")
+        simple_environment_row.grid(
+            row=1,
+            column=1,
+            columnspan=3,
+            sticky="ew",
+            padx=(8, 0),
+            pady=(18, 8),
+        )
         self.simple_env = ctk.CTkOptionMenu(
-            inner,
+            simple_environment_row,
             values=list(ENVIRONMENTS),
             variable=self.full_env_var,
+            width=180,
+            command=self._sync_database_preference_controls,
         )
-        self.simple_env.grid(row=1, column=1, sticky="ew", padx=(8, 28), pady=(18, 8))
+        self.simple_env.pack(side="left")
+        self._add_database_preference_controls(
+            simple_environment_row,
+            environment_getter=self.full_env_var.get,
+            countries=("chile", "colombia"),
+            show_heading=False,
+        )
 
         ctk.CTkLabel(
             inner,
             text=t("fbbatch.simple.date"),
             width=90,
             anchor="w",
-        ).grid(row=1, column=2, sticky="w", pady=(18, 8))
+        ).grid(row=2, column=0, sticky="w", pady=(8, 8))
         simple_date_frame = ctk.CTkFrame(inner, fg_color="transparent")
-        simple_date_frame.grid(row=1, column=3, sticky="ew", pady=(18, 8))
+        simple_date_frame.grid(
+            row=2,
+            column=1,
+            columnspan=3,
+            sticky="ew",
+            padx=(8, 0),
+            pady=(8, 8),
+        )
         simple_date_frame.grid_columnconfigure(0, weight=1)
         self.simple_date = ctk.CTkEntry(simple_date_frame)
         self.simple_date.grid(row=0, column=0, sticky="ew")
@@ -336,7 +473,7 @@ class FBBatchSetupView(ctk.CTkFrame):
         ).grid(row=0, column=1, padx=(8, 0))
 
         issue_row = ctk.CTkFrame(inner, fg_color="transparent")
-        issue_row.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(10, 8))
+        issue_row.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(10, 8))
         ctk.CTkButton(
             issue_row,
             text=t("fbbatch.issue.new"),
@@ -353,7 +490,7 @@ class FBBatchSetupView(ctk.CTkFrame):
         self.simple_issue_status.pack(side="left", fill="x", expand=True, padx=(14, 0))
 
         action_row = ctk.CTkFrame(inner, fg_color="transparent")
-        action_row.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(14, 4))
+        action_row.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(14, 4))
         action_row.grid_columnconfigure(1, weight=1)
         ctk.CTkLabel(
             action_row,
@@ -380,7 +517,7 @@ class FBBatchSetupView(ctk.CTkFrame):
         self.simple_progress_bar = ctk.CTkProgressBar(inner)
         self.simple_progress_bar.set(0)
         self.simple_progress_bar.grid(
-            row=4, column=0, columnspan=4, sticky="ew", pady=(16, 2)
+            row=5, column=0, columnspan=4, sticky="ew", pady=(16, 2)
         )
         self.simple_progress_label = ctk.CTkLabel(
             inner,
@@ -390,13 +527,15 @@ class FBBatchSetupView(ctk.CTkFrame):
             font=ctk.CTkFont(size=11),
         )
         self.simple_progress_label.grid(
-            row=5, column=0, columnspan=4, sticky="ew"
+            row=6, column=0, columnspan=4, sticky="ew"
         )
         self.simple_progress_bar.grid_remove()
         self.simple_progress_label.grid_remove()
 
         output_row = ctk.CTkFrame(inner, fg_color="transparent")
-        output_row.grid(row=6, column=0, columnspan=4, sticky="e", pady=(16, 0))
+        output_row.grid(row=7, column=0, columnspan=4, sticky="e", pady=(16, 0))
+        self.simple_cancel_btn = self._create_cancel_button(output_row)
+        self.simple_cancel_btn.pack(side="left", padx=5)
         self.simple_retry_draft_btn = ctk.CTkButton(
             output_row,
             text=t("fbbatch.mail.retry"),
@@ -432,8 +571,10 @@ class FBBatchSetupView(ctk.CTkFrame):
             inner,
             values=list(ENVIRONMENTS),
             variable=self.full_env_var,
+            width=180,
+            command=self._sync_database_preference_controls,
         )
-        self.full_env.grid(row=2, column=1, sticky="ew", padx=8, pady=4)
+        self.full_env.grid(row=2, column=1, sticky="w", padx=8, pady=4)
         self.full_latest_var = ctk.BooleanVar(value=True)
         ctk.CTkCheckBox(inner, text=t("fbbatch.report.latest"), variable=self.full_latest_var, command=self._sync_full_date_state).grid(
             row=2, column=2, sticky="w", padx=8, pady=4
@@ -456,8 +597,14 @@ class FBBatchSetupView(ctk.CTkFrame):
         IconButton(inner, text=t("fbbatch.full.run"), width=180, command=self._on_generate_full_report).grid(
             row=2, column=4, sticky="e", padx=8, pady=4
         )
+        self._build_database_preference_row(
+            inner,
+            row=3,
+            columnspan=5,
+            environment_getter=self.full_env_var.get,
+        )
         mail_row = ctk.CTkFrame(inner, fg_color="transparent")
-        mail_row.grid(row=3, column=0, columnspan=5, sticky="ew", pady=(14, 0))
+        mail_row.grid(row=4, column=0, columnspan=5, sticky="ew", pady=(14, 0))
         mail_row.grid_columnconfigure(0, weight=1)
         self.mail_summary = ctk.CTkLabel(
             mail_row,
@@ -524,6 +671,8 @@ class FBBatchSetupView(ctk.CTkFrame):
             command=self._on_retry_draft,
         )
         self.full_retry_draft_btn.pack(side="right", padx=5)
+        self.full_cancel_btn = self._create_cancel_button(self.full_output_row)
+        self.full_cancel_btn.pack(side="right", padx=5)
         self.full_progress_bar = ctk.CTkProgressBar(inner)
         self.full_progress_bar.set(0)
         self.full_progress_bar.grid(row=5, column=0, columnspan=5, sticky="ew", pady=(14, 2))
@@ -552,8 +701,13 @@ class FBBatchSetupView(ctk.CTkFrame):
         ).grid(row=1, column=0, columnspan=5, sticky="ew", pady=(4, 10))
 
         ctk.CTkLabel(inner, text=t("fbbatch.env"), width=120, anchor="w").grid(row=2, column=0, sticky="w", pady=4)
-        self.event_env = ctk.CTkOptionMenu(inner, values=list(ENVIRONMENTS))
-        self.event_env.grid(row=2, column=1, sticky="ew", padx=8, pady=4)
+        self.event_env = ctk.CTkOptionMenu(
+            inner,
+            values=list(ENVIRONMENTS),
+            width=180,
+            command=self._sync_database_preference_controls,
+        )
+        self.event_env.grid(row=2, column=1, sticky="w", padx=8, pady=4)
         self.event_latest_var = ctk.BooleanVar(value=True)
         ctk.CTkCheckBox(
             inner,
@@ -568,6 +722,14 @@ class FBBatchSetupView(ctk.CTkFrame):
             command=self._on_run_event,
         ).grid(row=2, column=4, sticky="e", padx=8, pady=4)
 
+        self._build_database_preference_row(
+            inner,
+            row=3,
+            columnspan=5,
+            environment_getter=self.event_env.get,
+            countries=("chile",),
+        )
+
         self._event_selected_date = date.today() - timedelta(days=1)
         self.event_date_label = ctk.CTkLabel(
             inner,
@@ -575,9 +737,9 @@ class FBBatchSetupView(ctk.CTkFrame):
             width=120,
             anchor="w",
         )
-        self.event_date_label.grid(row=3, column=0, sticky="w", pady=4)
+        self.event_date_label.grid(row=4, column=0, sticky="w", pady=4)
         self.event_date_frame = ctk.CTkFrame(inner, fg_color="transparent")
-        self.event_date_frame.grid(row=3, column=1, columnspan=3, sticky="ew", padx=8, pady=4)
+        self.event_date_frame.grid(row=4, column=1, columnspan=3, sticky="ew", padx=8, pady=4)
         self.event_date_frame.grid_columnconfigure(0, weight=1)
         self.event_date = ctk.CTkEntry(self.event_date_frame)
         self.event_date.insert(0, _format_issue_date(self._event_selected_date))
@@ -593,7 +755,7 @@ class FBBatchSetupView(ctk.CTkFrame):
 
         self.event_progress_bar = ctk.CTkProgressBar(inner)
         self.event_progress_bar.set(0)
-        self.event_progress_bar.grid(row=4, column=0, columnspan=5, sticky="ew", pady=(12, 2))
+        self.event_progress_bar.grid(row=5, column=0, columnspan=5, sticky="ew", pady=(12, 2))
         self.event_progress_label = ctk.CTkLabel(
             inner,
             text="",
@@ -602,9 +764,9 @@ class FBBatchSetupView(ctk.CTkFrame):
             text_color=("gray40", "gray65"),
             font=ctk.CTkFont(size=11),
         )
-        self.event_progress_label.grid(row=5, column=0, columnspan=5, sticky="ew")
+        self.event_progress_label.grid(row=6, column=0, columnspan=5, sticky="ew")
         self.event_output_row = ctk.CTkFrame(inner, fg_color="transparent")
-        self.event_output_row.grid(row=6, column=0, columnspan=5, sticky="e", pady=(10, 0))
+        self.event_output_row.grid(row=7, column=0, columnspan=5, sticky="e", pady=(10, 0))
         self.event_open_location_btn = ctk.CTkButton(
             self.event_output_row,
             text=t("fbbatch.open_location"),
@@ -613,6 +775,8 @@ class FBBatchSetupView(ctk.CTkFrame):
             command=lambda: self._open_path(self._event_output_dir),
         )
         self.event_open_location_btn.pack(side="right", padx=5)
+        self.event_cancel_btn = self._create_cancel_button(self.event_output_row)
+        self.event_cancel_btn.pack(side="right", padx=5)
         self._sync_event_date_state()
         self._hide_progress("event")
         inner.grid_columnconfigure(1, weight=1)
@@ -633,8 +797,13 @@ class FBBatchSetupView(ctk.CTkFrame):
         ).grid(row=1, column=0, columnspan=4, sticky="ew", pady=(4, 10))
 
         ctk.CTkLabel(inner, text=t("fbbatch.env"), width=120, anchor="w").grid(row=2, column=0, sticky="w", pady=4)
-        self.report_env = ctk.CTkOptionMenu(inner, values=list(ENVIRONMENTS))
-        self.report_env.grid(row=2, column=1, sticky="ew", padx=8, pady=4)
+        self.report_env = ctk.CTkOptionMenu(
+            inner,
+            values=list(ENVIRONMENTS),
+            width=180,
+            command=self._sync_database_preference_controls,
+        )
+        self.report_env.grid(row=2, column=1, sticky="w", padx=8, pady=4)
 
         self.latest_var = ctk.BooleanVar(value=True)
         ctk.CTkCheckBox(
@@ -660,6 +829,13 @@ class FBBatchSetupView(ctk.CTkFrame):
         )
         self.report_calendar_btn.grid(row=0, column=1, padx=(8, 0))
 
+        self._build_database_preference_row(
+            inner,
+            row=3,
+            columnspan=4,
+            environment_getter=self.report_env.get,
+        )
+
         self.report_issue_status = ctk.CTkLabel(
             inner,
             text="",
@@ -667,13 +843,13 @@ class FBBatchSetupView(ctk.CTkFrame):
             justify="left",
             text_color=("gray40", "gray65"),
         )
-        self.report_issue_status.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(10, 0))
+        self.report_issue_status.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(10, 0))
 
         issue_actions = ctk.CTkFrame(
             inner,
             fg_color="transparent",
         )
-        issue_actions.grid(row=4, column=0, columnspan=3, sticky="w", pady=(16, 0))
+        issue_actions.grid(row=5, column=0, columnspan=3, sticky="w", pady=(16, 0))
         IconButton(
             issue_actions,
             text=t("fbbatch.issue.new_batch"),
@@ -698,10 +874,10 @@ class FBBatchSetupView(ctk.CTkFrame):
             text=t("fbbatch.report.run"),
             width=180,
             command=self._on_run_report,
-        ).grid(row=4, column=3, sticky="e", padx=8, pady=(26, 0))
+        ).grid(row=5, column=3, sticky="e", padx=8, pady=(26, 0))
         self.report_progress_bar = ctk.CTkProgressBar(inner)
         self.report_progress_bar.set(0)
-        self.report_progress_bar.grid(row=5, column=0, columnspan=4, sticky="ew", pady=(14, 2))
+        self.report_progress_bar.grid(row=6, column=0, columnspan=4, sticky="ew", pady=(14, 2))
         self.report_progress_label = ctk.CTkLabel(
             inner,
             text="",
@@ -710,9 +886,9 @@ class FBBatchSetupView(ctk.CTkFrame):
             text_color=("gray40", "gray65"),
             font=ctk.CTkFont(size=11),
         )
-        self.report_progress_label.grid(row=6, column=0, columnspan=4, sticky="ew")
+        self.report_progress_label.grid(row=7, column=0, columnspan=4, sticky="ew")
         self.report_output_row = ctk.CTkFrame(inner, fg_color="transparent")
-        self.report_output_row.grid(row=7, column=0, columnspan=4, sticky="e", pady=(10, 0))
+        self.report_output_row.grid(row=8, column=0, columnspan=4, sticky="e", pady=(10, 0))
         self.report_open_location_btn = ctk.CTkButton(
             self.report_output_row,
             text=t("fbbatch.open_location"),
@@ -721,6 +897,8 @@ class FBBatchSetupView(ctk.CTkFrame):
             command=lambda: self._open_path(self._report_output_dir),
         )
         self.report_open_location_btn.pack(side="right", padx=5)
+        self.report_cancel_btn = self._create_cancel_button(self.report_output_row)
+        self.report_cancel_btn.pack(side="right", padx=5)
         self._hide_progress("report")
 
         inner.grid_columnconfigure(1, weight=1)
@@ -1118,16 +1296,18 @@ class FBBatchSetupView(ctk.CTkFrame):
         mail_method, from_account = selected_mail
 
         latest = bool(self.full_latest_var.get())
+        preferred_aliases = self._selected_preferred_databases()
         log.info(
             "night_shift: generate requested env=%s report_date=%s latest=%s "
             "has_batch_issue=%s has_other_issue=%s "
-            "root=%s from_configured=%s to_chars=%s cc_chars=%s",
+            "root=%s preferred_aliases=%s from_configured=%s to_chars=%s cc_chars=%s",
             env,
             report_date,
             latest,
             has_batch_issue,
             has_other_issue,
             root,
+            preferred_aliases,
             bool(from_account),
             len(to),
             len(cc),
@@ -1138,7 +1318,7 @@ class FBBatchSetupView(ctk.CTkFrame):
         )
         self._active_progress = "full"
         self._run_background(
-            lambda progress: self._run_full_report(
+            lambda progress, cancel_event: self._run_full_report(
                 env=env,
                 latest=latest,
                 report_date=report_date,
@@ -1152,7 +1332,10 @@ class FBBatchSetupView(ctk.CTkFrame):
                 body_template=body_template,
                 mail_method=mail_method,
                 credentials=self.app.config.all_credentials(),
+                database_failover=self.app.config.get("database_failover", {}),
+                preferred_aliases=preferred_aliases,
                 progress=progress,
+                cancel_event=cancel_event,
             )
         )
 
@@ -1209,7 +1392,7 @@ class FBBatchSetupView(ctk.CTkFrame):
             mail_method,
         )
         self._run_background(
-            lambda progress: self._retry_draft(
+            lambda progress, cancel_event: self._retry_draft(
                 context=context,
                 subject=mail_values["subject"],
                 from_account=from_account,
@@ -1218,6 +1401,7 @@ class FBBatchSetupView(ctk.CTkFrame):
                 body=mail_values["body"],
                 mail_method=mail_method,
                 progress=progress,
+                cancel_event=cancel_event,
             ),
             preserve_outputs=True,
         )
@@ -1233,7 +1417,24 @@ class FBBatchSetupView(ctk.CTkFrame):
         body: str,
         mail_method: str,
         progress,
+        cancel_event: threading.Event | None = None,
     ) -> BatchResult:
+        def cancelled_result() -> BatchResult:
+            return BatchResult(
+                False,
+                t("fbbatch.cancelled"),
+                html_path=context.html_path,
+                pdf_path=context.pdf_path,
+                image_paths=list(context.inline_images),
+                images_dir=context.images_dir,
+                output_dir=context.output_dir,
+                event_skipped=not context.include_event,
+                exit_code=130,
+                cancelled=True,
+            )
+
+        if cancel_event is not None and cancel_event.is_set():
+            return cancelled_result()
         log.info(
             "night_shift: retry draft starting report_date=%s include_event=%s "
             "attachments=%s inline_images=%s",
@@ -1244,6 +1445,8 @@ class FBBatchSetupView(ctk.CTkFrame):
         )
         progress(91, t("fbbatch.mail.preparing"))
         progress(94, t("fbbatch.mail.retrying"))
+        if cancel_event is not None and cancel_event.is_set():
+            return cancelled_result()
         create_outlook_draft(
             subject=subject,
             from_account=from_account,
@@ -1254,6 +1457,13 @@ class FBBatchSetupView(ctk.CTkFrame):
             inline_images=list(context.inline_images),
             mail_method=mail_method,
         )
+        if cancel_event is not None and cancel_event.is_set():
+            log.info(
+                "night_shift: cancellation arrived while retry draft was already running "
+                "report_date=%s",
+                context.report_date,
+            )
+            return cancelled_result()
         log.info("night_shift: retry draft completed report_date=%s", context.report_date)
         progress(100, t("fbbatch.mail.opened"))
         return BatchResult(
@@ -1283,8 +1493,18 @@ class FBBatchSetupView(ctk.CTkFrame):
         body_template: str,
         mail_method: str,
         credentials: dict,
+        database_failover: dict,
+        preferred_aliases: dict[str, str],
         progress,
+        cancel_event: threading.Event | None = None,
     ) -> BatchResult:
+        if cancel_event is not None and cancel_event.is_set():
+            return BatchResult(
+                False,
+                t("fbbatch.cancelled"),
+                exit_code=130,
+                cancelled=True,
+            )
         report_day = datetime.strptime(report_date, "%d%m%Y").date()
         event_next_date = _next_weekday(report_day).strftime("%d%m%Y")
         include_event = report_day.weekday() not in (5, 6)
@@ -1314,6 +1534,9 @@ class FBBatchSetupView(ctk.CTkFrame):
             ),
             has_other_issue=has_other_issue,
             credentials=credentials,
+            database_failover=database_failover,
+            preferred_aliases=preferred_aliases,
+            cancel_event=cancel_event,
         )
         log.info(
             "night_shift: report completed ok=%s message=%r html=%s images=%s output_dir=%s",
@@ -1323,6 +1546,14 @@ class FBBatchSetupView(ctk.CTkFrame):
             [str(path) for path in (report_result.image_paths or [])],
             report_result.output_dir,
         )
+        if report_result.cancelled:
+            return report_result
+        if cancel_event is not None and cancel_event.is_set():
+            report_result.ok = False
+            report_result.message = t("fbbatch.cancelled")
+            report_result.exit_code = 130
+            report_result.cancelled = True
+            return report_result
         if not report_result.ok:
             return report_result
         if not report_result.image_paths:
@@ -1344,6 +1575,9 @@ class FBBatchSetupView(ctk.CTkFrame):
                         _scale_phase_progress(percent, 50, 90), f"Event: {message}"
                     ),
                     credentials=credentials,
+                    database_failover=database_failover,
+                    preferred_aliases=preferred_aliases,
+                    cancel_event=cancel_event,
                 )
                 log.info(
                     "night_shift: event completed ok=%s message=%r pdf=%s output_dir=%s",
@@ -1352,6 +1586,20 @@ class FBBatchSetupView(ctk.CTkFrame):
                     event_result.pdf_path,
                     event_result.output_dir,
                 )
+                if event_result.cancelled or (
+                    cancel_event is not None and cancel_event.is_set()
+                ):
+                    return BatchResult(
+                        False,
+                        t("fbbatch.cancelled"),
+                        html_path=report_result.html_path,
+                        pdf_path=event_result.pdf_path,
+                        image_paths=report_result.image_paths,
+                        images_dir=report_result.images_dir,
+                        output_dir=report_result.output_dir,
+                        exit_code=130,
+                        cancelled=True,
+                    )
                 if not event_result.ok:
                     return event_result
                 event_pdf = event_result.pdf_path
@@ -1369,9 +1617,12 @@ class FBBatchSetupView(ctk.CTkFrame):
                             _scale_phase_progress(percent, 50, 90), f"Event: {message}"
                         ),
                         credentials=credentials,
+                        database_failover=database_failover,
+                        preferred_aliases=preferred_aliases,
                         latest=False,
                         event_date=report_date,
                         next_date=event_next_date,
+                        cancel_event=cancel_event,
                     )
                     log.info(
                         "night_shift: historical event completed ok=%s message=%r pdf=%s "
@@ -1383,6 +1634,20 @@ class FBBatchSetupView(ctk.CTkFrame):
                         report_date,
                         event_next_date,
                     )
+                    if event_result.cancelled or (
+                        cancel_event is not None and cancel_event.is_set()
+                    ):
+                        return BatchResult(
+                            False,
+                            t("fbbatch.cancelled"),
+                            html_path=report_result.html_path,
+                            pdf_path=event_result.pdf_path,
+                            image_paths=report_result.image_paths,
+                            images_dir=report_result.images_dir,
+                            output_dir=report_result.output_dir,
+                            exit_code=130,
+                            cancelled=True,
+                        )
                     if not event_result.ok:
                         return event_result
                     event_pdf = event_result.pdf_path
@@ -1394,6 +1659,20 @@ class FBBatchSetupView(ctk.CTkFrame):
         else:
             if not chile_batch_skipped:
                 progress(90, t("fbbatch.mail.event_skipped"))
+
+        if cancel_event is not None and cancel_event.is_set():
+            return BatchResult(
+                False,
+                t("fbbatch.cancelled"),
+                html_path=report_result.html_path,
+                pdf_path=event_pdf,
+                image_paths=report_result.image_paths,
+                images_dir=report_result.images_dir,
+                output_dir=report_result.output_dir,
+                event_skipped=not bool(event_pdf),
+                exit_code=130,
+                cancelled=True,
+            )
 
         progress(91, t("fbbatch.mail.preparing"))
         subject = render_mail_template(subject_template, report_date, include_event=include_event)
@@ -1419,6 +1698,19 @@ class FBBatchSetupView(ctk.CTkFrame):
             bool(from_account),
         )
         progress(94, t("fbbatch.mail.creating"))
+        if cancel_event is not None and cancel_event.is_set():
+            return BatchResult(
+                False,
+                t("fbbatch.cancelled"),
+                html_path=retry_context.html_path,
+                pdf_path=retry_context.pdf_path,
+                image_paths=list(retry_context.inline_images),
+                images_dir=retry_context.images_dir,
+                output_dir=retry_context.output_dir,
+                event_skipped=not retry_context.include_event,
+                exit_code=130,
+                cancelled=True,
+            )
         try:
             create_outlook_draft(
                 subject=subject,
@@ -1466,15 +1758,25 @@ class FBBatchSetupView(ctk.CTkFrame):
             return
         self._active_progress = "event"
         credentials = self.app.config.all_credentials()
+        database_failover = self.app.config.get("database_failover", {})
+        preferred_aliases = self._selected_preferred_databases()
+        log.info(
+            "night_shift: standalone event requested env=%s preferred_aliases=%s",
+            env,
+            preferred_aliases,
+        )
         self._run_background(
-            lambda progress: run_eod_batch_event(
+            lambda progress, cancel_event: run_eod_batch_event(
                 env,
                 root,
                 progress,
                 credentials=credentials,
+                database_failover=database_failover,
+                preferred_aliases=preferred_aliases,
                 latest=latest,
                 event_date=event_date,
                 next_date=next_date,
+                cancel_event=cancel_event,
             )
         )
 
@@ -1495,9 +1797,16 @@ class FBBatchSetupView(ctk.CTkFrame):
             return
         write_issue_properties(issues, root)
         credentials = self.app.config.all_credentials()
+        database_failover = self.app.config.get("database_failover", {})
+        preferred_aliases = self._selected_preferred_databases()
+        log.info(
+            "night_shift: standalone report requested env=%s preferred_aliases=%s",
+            env,
+            preferred_aliases,
+        )
         self._active_progress = "report"
         self._run_background(
-            lambda progress: run_batch_report(
+            lambda progress, cancel_event: run_batch_report(
                 env,
                 latest,
                 report_date,
@@ -1506,6 +1815,9 @@ class FBBatchSetupView(ctk.CTkFrame):
                 progress,
                 has_other_issue=has_other_issue,
                 credentials=credentials,
+                database_failover=database_failover,
+                preferred_aliases=preferred_aliases,
+                cancel_event=cancel_event,
             )
         )
 
@@ -1538,10 +1850,51 @@ class FBBatchSetupView(ctk.CTkFrame):
             parent=self,
         )
 
+    def _cancel_buttons(self):
+        for name in (
+            "simple_cancel_btn",
+            "full_cancel_btn",
+            "event_cancel_btn",
+            "report_cancel_btn",
+        ):
+            button = getattr(self, name, None)
+            if button is not None:
+                yield button
+
+    def _set_cancel_controls(self, *, state: str, text_key: str) -> None:
+        for button in self._cancel_buttons():
+            button.configure(state=state, text=t(text_key))
+
+    def _on_cancel(self) -> None:
+        cancel_event = self._cancel_event
+        if not self._running or cancel_event is None or cancel_event.is_set():
+            return
+
+        log.info(
+            "night_shift: cancellation requested active_progress=%s",
+            self._active_progress,
+        )
+        cancel_event.set()
+        self._set_cancel_controls(
+            state="disabled",
+            text_key="fbbatch.cancelling",
+        )
+        _bar, label = self._progress_widgets()
+        label.configure(text=t("fbbatch.progress.cancelling"))
+        if self._active_progress == "full" and hasattr(self, "simple_progress_label"):
+            self.simple_progress_label.configure(text=t("fbbatch.progress.cancelling"))
+        self.status_label.configure(
+            text=t("fbbatch.cancel_requested"),
+            text_color=("gray40", "gray65"),
+        )
+
     def _run_background(self, work, *, preserve_outputs: bool = False) -> None:
         if self._running:
             return
         self._running = True
+        cancel_event = threading.Event()
+        self._cancel_event = cancel_event
+        self._set_cancel_controls(state="normal", text_key="fbbatch.cancel")
         self.full_retry_draft_btn.configure(state="disabled")
         if hasattr(self, "simple_retry_draft_btn"):
             self.simple_retry_draft_btn.configure(state="disabled")
@@ -1581,9 +1934,10 @@ class FBBatchSetupView(ctk.CTkFrame):
         worker_events: queue.Queue[tuple[str, object]] = queue.Queue()
         self._worker_events = worker_events
         self.after(50, lambda events=worker_events: self._poll_worker_events(events))
+        wrapped_work = lambda progress: work(progress, cancel_event)
         threading.Thread(
             target=self._worker,
-            args=(work, worker_events),
+            args=(wrapped_work, worker_events),
             daemon=True,
         ).start()
 
@@ -1621,8 +1975,9 @@ class FBBatchSetupView(ctk.CTkFrame):
                 self._worker_events = None
                 result = payload
                 log.info(
-                    "FBBatchSetup UI received background completion ok=%s",
+                    "FBBatchSetup UI received background completion ok=%s cancelled=%s",
                     getattr(result, "ok", False),
+                    getattr(result, "cancelled", False),
                 )
                 self._finish(result)
                 return
@@ -1678,20 +2033,31 @@ class FBBatchSetupView(ctk.CTkFrame):
 
     def _finish(self, result: BatchResult) -> None:
         self._running = False
+        self._cancel_event = None
+        self._set_cancel_controls(state="disabled", text_key="fbbatch.cancel")
         self.full_retry_draft_btn.configure(state="normal")
         if hasattr(self, "simple_retry_draft_btn"):
             self.simple_retry_draft_btn.configure(state="normal")
         self._last_html = result.html_path
         self._last_pdf = result.pdf_path
         self._last_images_dir = result.images_dir
-        color = ("#1A7F37", "#3FB950") if result.ok else ("#CF222E", "#FF6B6B")
-        if result.ok:
+        if result.cancelled:
+            color = ("gray40", "gray65")
+            self._progress_widgets()[1].configure(text=t("fbbatch.progress.cancelled"))
+            if self._active_progress == "full" and hasattr(self, "simple_progress_label"):
+                self.simple_progress_label.configure(text=t("fbbatch.progress.cancelled"))
+        elif result.ok:
+            color = ("#1A7F37", "#3FB950")
             self._set_progress(100, t("fbbatch.progress.done"))
         else:
+            color = ("#CF222E", "#FF6B6B")
             self._progress_widgets()[1].configure(text=t("fbbatch.progress.failed"))
             if self._active_progress == "full" and hasattr(self, "simple_progress_label"):
                 self.simple_progress_label.configure(text=t("fbbatch.progress.failed"))
-        self.status_label.configure(text="" if result.ok else result.message, text_color=color)
+        self.status_label.configure(
+            text="" if result.ok else result.message,
+            text_color=color,
+        )
         if self._active_progress == "event":
             self._event_pdf = result.pdf_path
             self._event_html = result.html_path
@@ -2476,91 +2842,6 @@ class IssueListDialog(ctk.CTkToplevel):
         w, h = self.winfo_width(), self.winfo_height()
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
         self.geometry(f"+{max(0, (sw - w) // 2)}+{max(0, (sh - h) // 2)}")
-
-
-class CalendarDialog(ctk.CTkToplevel):
-    def __init__(self, master, *, selected: date, on_pick, on_close=None):
-        super().__init__(master)
-        self.on_pick = on_pick
-        self.on_close = on_close
-        self.current = date(selected.year, selected.month, 1)
-        self.selected = selected
-        self.title(t("fbbatch.calendar"))
-        self.transient(master.winfo_toplevel())
-        self._window_size = (360, 360)
-        self._set_initial_geometry()
-        self.resizable(False, False)
-        self.grab_set()
-
-        wrap = ctk.CTkFrame(self, fg_color="transparent")
-        wrap.pack(fill="both", expand=True, padx=16, pady=16)
-        nav = ctk.CTkFrame(wrap, fg_color="transparent")
-        nav.pack(fill="x", pady=(0, 10))
-        ctk.CTkButton(nav, text="<", width=42, command=self._prev_month).pack(side="left")
-        self.title_label = ctk.CTkLabel(nav, text="", font=ctk.CTkFont(size=15, weight="bold"))
-        self.title_label.pack(side="left", fill="x", expand=True)
-        ctk.CTkButton(nav, text=">", width=42, command=self._next_month).pack(side="right")
-        self.grid_frame = ctk.CTkFrame(wrap, fg_color="transparent")
-        self.grid_frame.pack(fill="both", expand=True)
-        self._render()
-        self.protocol("WM_DELETE_WINDOW", self._close)
-
-    def _render(self) -> None:
-        for child in self.grid_frame.winfo_children():
-            child.destroy()
-        self.title_label.configure(text=f"{MONTH_ABBR[self.current.month - 1]} {self.current.year}")
-        for col, label in enumerate(("Mo", "Tu", "We", "Th", "Fr", "Sa", "Su")):
-            ctk.CTkLabel(self.grid_frame, text=label, width=42).grid(row=0, column=col, padx=2, pady=2)
-        cal = calendar.Calendar(firstweekday=0)
-        for row, week in enumerate(cal.monthdatescalendar(self.current.year, self.current.month), start=1):
-            for col, day in enumerate(week):
-                same_month = day.month == self.current.month
-                is_selected = day == self.selected
-                btn = ctk.CTkButton(
-                    self.grid_frame,
-                    text=str(day.day),
-                    width=42,
-                    height=32,
-                    state="normal" if same_month else "disabled",
-                    fg_color=("#4f46e5", "#6366f1") if is_selected else ("#ffffff", "#1e293b"),
-                    text_color="white" if is_selected else ("#0f172a", "#f8fafc"),
-                    command=lambda d=day: self._pick(d),
-                )
-                btn.grid(row=row, column=col, padx=2, pady=2)
-
-    def _pick(self, value: date) -> None:
-        self.on_pick(value)
-        self._close()
-
-    def _close(self) -> None:
-        if callable(self.on_close):
-            self.on_close()
-        self.destroy()
-
-    def _prev_month(self) -> None:
-        year = self.current.year if self.current.month > 1 else self.current.year - 1
-        month = self.current.month - 1 if self.current.month > 1 else 12
-        self.current = date(year, month, 1)
-        self._render()
-
-    def _next_month(self) -> None:
-        year = self.current.year if self.current.month < 12 else self.current.year + 1
-        month = self.current.month + 1 if self.current.month < 12 else 1
-        self.current = date(year, month, 1)
-        self._render()
-
-    def _center_on_screen(self) -> None:
-        self.update_idletasks()
-        w, h = self.winfo_width(), self.winfo_height()
-        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
-        self.geometry(f"+{max(0, (sw - w) // 2)}+{max(0, (sh - h) // 2)}")
-
-    def _set_initial_geometry(self) -> None:
-        w, h = self._window_size
-        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
-        x = max(0, (sw - w) // 2)
-        y = max(0, (sh - h) // 2)
-        self.geometry(f"{w}x{h}+{x}+{y}")
 
 
 def _format_issue_date(value: date) -> str:

@@ -6,16 +6,19 @@ import os
 import queue
 import re
 import threading
+from datetime import date
 from pathlib import Path
+import tkinter as tk
 from tkinter import messagebox
 
 import customtkinter as ctk
 
 from i18n import t
 from paths import OUTPUT_FILES_OUT_DIR
+from ui.calendar_dialog import CalendarDialog
 from ui.widgets import CardFrame, IconButton
 
-from .formats import validate_process_ref
+from .formats import InterfaceSpec, validate_process_ref
 from .models import GenerationRequest, GenerationResult, OracleTarget
 from .service import (
     GenerationCancelled,
@@ -28,6 +31,11 @@ log = logging.getLogger(__name__)
 
 _ENV_TAG = {"prod": "PROD"}
 _TARGET_COUNTRIES = ("chile", "peru", "colombia", "mexico")
+_AUTO_INTERFACE_SEPARATOR = "----------------"
+_DEFAULT_AUTO_DETECT = False
+_DEFAULT_AUTO_DETECT_DATE = False
+_DEFAULT_DISCLAIMER_EXPANDED = False
+_PRIORITY_INTERFACE_LABELS = ("CHISALCA", "OFDOBIEL", "OFICOWCG")
 _COUNTRY_LABELS = {
     "chile": "Chile",
     "peru": "Peru",
@@ -46,6 +54,243 @@ def _safe_log_message(value: object) -> str:
     return compact[:500] or "Output reconstruction failed"
 
 
+def _interface_options(
+    specs: tuple[InterfaceSpec, ...],
+) -> tuple[tuple[str, str], ...]:
+    """Return stable display labels mapped to canonical input codes."""
+    options = [
+        (
+            "CHISALCA" if spec.input_code == "CHISALCA" else spec.output_code,
+            spec.input_code,
+        )
+        for spec in specs
+    ]
+    priority = {
+        label: position
+        for position, label in enumerate(_PRIORITY_INTERFACE_LABELS)
+    }
+    ordered = sorted(
+        options,
+        key=lambda option: (
+            priority.get(option[0], len(priority)),
+            option[0],
+            option[1],
+        ),
+    )
+    labels = [label for label, _input_code in ordered]
+    if len(labels) != len(set(labels)):
+        raise RuntimeError("Output interface dropdown labels must be unique")
+    return tuple(ordered)
+
+
+def _filtered_interface_values(
+    values: tuple[str, ...],
+    query: str,
+) -> tuple[str, ...]:
+    """Filter interface labels by a case-insensitive typed prefix."""
+    prefix = str(query or "").strip().casefold()
+    if not prefix:
+        return values
+    return tuple(value for value in values if value.casefold().startswith(prefix))
+
+
+class _SearchableComboBox(ctk.CTkFrame):
+    """Editable selector with an inline, non-modal suggestion list.
+
+    CustomTkinter's combo-box dropdown is a native Tk menu.  Posting that menu
+    while handling every key release transfers keyboard interaction away from
+    the entry on Windows.  Keeping the suggestions in the normal widget tree
+    lets typing remain responsive and avoids relying on CustomTkinter internals.
+    """
+
+    def __init__(
+        self,
+        master,
+        *,
+        values: list[str],
+        variable: tk.Variable,
+        command,
+    ) -> None:
+        super().__init__(master, fg_color="transparent")
+        self._values = list(values)
+        self._variable = variable
+        self._command = command
+        self._state = "normal"
+
+        self.grid_columnconfigure(0, weight=1)
+        self.entry = ctk.CTkEntry(self, textvariable=variable)
+        self.entry.grid(row=0, column=0, sticky="ew")
+        self.dropdown_button = ctk.CTkButton(
+            self,
+            text="▼",
+            width=34,
+            command=self._toggle_suggestions,
+        )
+        self.dropdown_button.grid(row=0, column=1, padx=(4, 0), sticky="ns")
+
+        self.suggestion_frame = ctk.CTkFrame(
+            self,
+            corner_radius=6,
+            border_width=1,
+        )
+        self.suggestions = tk.Listbox(
+            self.suggestion_frame,
+            activestyle="none",
+            borderwidth=0,
+            exportselection=False,
+            highlightthickness=0,
+            selectmode=tk.BROWSE,
+            font=("Segoe UI", 10),
+        )
+        self.suggestions.pack(
+            side="left",
+            fill="both",
+            expand=True,
+            padx=(2, 0),
+            pady=2,
+        )
+        self.suggestion_scrollbar = ctk.CTkScrollbar(
+            self.suggestion_frame,
+            width=14,
+            command=self.suggestions.yview,
+        )
+        self.suggestion_scrollbar.pack(
+            side="right",
+            fill="y",
+            padx=(2, 2),
+            pady=2,
+        )
+        self.suggestions.configure(yscrollcommand=self.suggestion_scrollbar.set)
+
+        self.entry.bind("<FocusIn>", self._select_existing_value, add="+")
+        self.entry.bind("<Down>", self._focus_first_suggestion, add="+")
+        self.entry.bind("<Escape>", self._on_escape, add="+")
+        self.entry.bind("<FocusOut>", self._on_focus_out, add="+")
+        self.suggestions.bind(
+            "<ButtonRelease-1>",
+            self._commit_suggestion,
+            add="+",
+        )
+        self.suggestions.bind("<Return>", self._commit_suggestion, add="+")
+        self.suggestions.bind("<Escape>", self._on_escape, add="+")
+        self.suggestions.bind("<FocusOut>", self._on_focus_out, add="+")
+
+    def bind(self, sequence=None, command=None, add=True):
+        return self.entry.bind(sequence, command, add=add)
+
+    def get(self) -> str:
+        return str(self._variable.get() or "")
+
+    def set(self, value: str) -> None:
+        self._variable.set(value)
+
+    def focus_set(self) -> None:
+        self.entry.focus_set()
+
+    def configure(self, require_redraw: bool = False, **kwargs) -> None:
+        values = kwargs.pop("values", None)
+        if values is not None:
+            self._values = list(values)
+
+        state = kwargs.pop("state", None)
+        if state is not None:
+            self._state = str(state)
+            self.entry.configure(state=state)
+            self.dropdown_button.configure(state=state)
+            if state == "disabled":
+                self.hide_suggestions()
+
+        if kwargs:
+            super().configure(require_redraw=require_redraw, **kwargs)
+
+    config = configure
+
+    def show_suggestions(self, values: tuple[str, ...] | list[str] | None = None) -> None:
+        if values is not None:
+            self._values = list(values)
+        if self._state == "disabled" or not self._values:
+            self.hide_suggestions()
+            return
+
+        self.suggestions.delete(0, tk.END)
+        for value in self._values:
+            self.suggestions.insert(tk.END, value)
+        self.suggestions.configure(height=min(6, len(self._values)))
+        self._apply_suggestion_colors()
+        self.suggestion_frame.grid(
+            row=1,
+            column=0,
+            columnspan=2,
+            sticky="ew",
+            pady=(3, 0),
+        )
+        self.suggestion_frame.lift()
+
+    def hide_suggestions(self) -> None:
+        self.suggestion_frame.grid_remove()
+
+    def _toggle_suggestions(self) -> None:
+        if self.suggestion_frame.winfo_manager():
+            self.hide_suggestions()
+        else:
+            self.show_suggestions()
+
+    def _select_existing_value(self, _event: object | None = None) -> None:
+        self.after_idle(self._select_entry_contents)
+
+    def _select_entry_contents(self) -> None:
+        if self._state != "disabled":
+            self.entry.select_range(0, tk.END)
+            self.entry.icursor(tk.END)
+
+    def _focus_first_suggestion(self, _event: object | None = None) -> str:
+        if not self.suggestion_frame.winfo_manager():
+            self.show_suggestions()
+        if self.suggestions.size():
+            self.suggestions.selection_clear(0, tk.END)
+            self.suggestions.selection_set(0)
+            self.suggestions.activate(0)
+            self.suggestions.focus_set()
+        return "break"
+
+    def _commit_suggestion(self, _event: object | None = None) -> str:
+        selection = self.suggestions.curselection()
+        if not selection:
+            return "break"
+        value = str(self.suggestions.get(selection[0]))
+        self._variable.set(value)
+        self.hide_suggestions()
+        self.entry.focus_set()
+        if self._command is not None:
+            self._command(value)
+        return "break"
+
+    def _on_escape(self, _event: object | None = None) -> str:
+        self.hide_suggestions()
+        self.entry.focus_set()
+        return "break"
+
+    def _on_focus_out(self, _event: object | None = None) -> None:
+        self.after_idle(self._hide_if_focus_left_selector)
+
+    def _hide_if_focus_left_selector(self) -> None:
+        focused = self.focus_get()
+        while focused is not None:
+            if focused is self:
+                return
+            focused = getattr(focused, "master", None)
+        self.hide_suggestions()
+
+    def _apply_suggestion_colors(self) -> None:
+        dark = ctk.get_appearance_mode().lower() == "dark"
+        self.suggestions.configure(
+            background="#2B2B2B" if dark else "#FFFFFF",
+            foreground="#DCE4EE" if dark else "#111827",
+            selectbackground="#1F6AA5" if dark else "#3B8ED0",
+            selectforeground="#FFFFFF",
+        )
+
+
 class OutputFileGenerationView(ctk.CTkFrame):
     def __init__(self, master, app) -> None:
         super().__init__(master, fg_color="transparent")
@@ -55,6 +300,10 @@ class OutputFileGenerationView(ctk.CTkFrame):
         self._cancel_event: threading.Event | None = None
         self._events: queue.Queue[tuple[str, object]] = queue.Queue()
         self._db_lookup: dict[str, dict] = {}
+        self._interface_lookup: dict[str, str] = {}
+        self._interface_values: tuple[str, ...] = ()
+        self._last_manual_interface = ""
+        self._selected_input_date: date | None = None
         self._last_output_folder: Path | None = None
 
         self._build_header()
@@ -99,13 +348,21 @@ class OutputFileGenerationView(ctk.CTkFrame):
         form = ctk.CTkFrame(config_card, fg_color="transparent")
         form.pack(fill="x", padx=20, pady=20)
         form.grid_columnconfigure(1, weight=1)
+        form.grid_columnconfigure(2, weight=0)
 
         ctk.CTkLabel(form, text=t("output_files.prod_db"), width=170, anchor="w").grid(
             row=0, column=0, padx=4, pady=5, sticky="w"
         )
         self.db_var = ctk.StringVar(value="—")
         self.db_menu = ctk.CTkOptionMenu(form, values=["—"], variable=self.db_var)
-        self.db_menu.grid(row=0, column=1, padx=4, pady=5, sticky="ew")
+        self.db_menu.grid(
+            row=0,
+            column=1,
+            columnspan=2,
+            padx=4,
+            pady=5,
+            sticky="ew",
+        )
 
         ctk.CTkLabel(form, text=t("output_files.process_ref"), width=170, anchor="w").grid(
             row=1, column=0, padx=4, pady=5, sticky="w"
@@ -115,36 +372,165 @@ class OutputFileGenerationView(ctk.CTkFrame):
             placeholder_text="1234567",
             font=ctk.CTkFont(family="Consolas", size=13),
         )
-        self.process_ref_entry.grid(row=1, column=1, padx=4, pady=5, sticky="ew")
+        self.process_ref_entry.grid(
+            row=1,
+            column=1,
+            columnspan=2,
+            padx=4,
+            pady=5,
+            sticky="ew",
+        )
         self.process_ref_entry.bind("<Return>", lambda _event: self._start())
 
         ctk.CTkLabel(
             form,
-            text=t(
-                "output_files.auto_detection",
-                count=len(self.service.supported_interfaces()),
-            ),
+            text=t("output_files.interface_output"),
+            width=170,
+            anchor="w",
+        ).grid(row=2, column=0, padx=4, pady=5, sticky="w")
+        interface_options = _interface_options(self.service.supported_interfaces())
+        self._interface_lookup = dict(interface_options)
+        self._interface_values = tuple(label for label, _code in interface_options)
+        initial_interface = (
+            self._interface_values[0]
+            if self._interface_values
+            else _AUTO_INTERFACE_SEPARATOR
+        )
+        self._last_manual_interface = initial_interface
+        self.interface_var = ctk.StringVar(value=initial_interface)
+        self.interface_menu = _SearchableComboBox(
+            form,
+            values=list(self._interface_values) or [_AUTO_INTERFACE_SEPARATOR],
+            variable=self.interface_var,
+            command=self._on_interface_selected,
+        )
+        self.interface_menu.grid(row=2, column=1, padx=4, pady=5, sticky="ew")
+        self.interface_menu.bind("<KeyRelease>", self._on_interface_key_release)
+        self.interface_menu.bind("<Return>", self._on_interface_return)
+
+        self.auto_detect_var = ctk.BooleanVar(value=_DEFAULT_AUTO_DETECT)
+        self.auto_detect_checkbox = ctk.CTkCheckBox(
+            form,
+            text=t("output_files.detect_interface_automatically"),
+            variable=self.auto_detect_var,
+            command=self._on_auto_detect_changed,
+        )
+        self.auto_detect_checkbox.grid(
+            row=2,
+            column=2,
+            padx=(12, 4),
+            pady=5,
+            sticky="nw",
+        )
+
+        ctk.CTkLabel(
+            form,
+            text=t("output_files.input_launch_date"),
+            width=170,
+            anchor="w",
+        ).grid(row=3, column=0, padx=4, pady=5, sticky="w")
+        self.input_date_display_var = ctk.StringVar(
+            value=t("output_files.choose_input_date")
+        )
+        self.input_date_frame = ctk.CTkFrame(form, fg_color="transparent")
+        self.input_date_frame.grid_columnconfigure(0, weight=1)
+        self.input_date_entry = ctk.CTkEntry(
+            self.input_date_frame,
+            textvariable=self.input_date_display_var,
+            state="readonly",
+        )
+        self.input_date_entry.grid(row=0, column=0, sticky="ew")
+        self.input_date_calendar_button = ctk.CTkButton(
+            self.input_date_frame,
+            text=t("common.calendar"),
+            width=105,
+            command=self._open_input_date_calendar,
+        )
+        self.input_date_calendar_button.grid(
+            row=0,
+            column=1,
+            padx=(8, 0),
+        )
+        self.input_date_frame.grid(
+            row=3,
+            column=1,
+            padx=4,
+            pady=5,
+            sticky="ew",
+        )
+
+        self.auto_detect_date_var = ctk.BooleanVar(value=_DEFAULT_AUTO_DETECT_DATE)
+        self.auto_detect_date_checkbox = ctk.CTkCheckBox(
+            form,
+            text=t("output_files.detect_date_automatically"),
+            variable=self.auto_detect_date_var,
+            command=self._on_auto_detect_date_changed,
+        )
+        self.auto_detect_date_checkbox.grid(
+            row=3,
+            column=2,
+            padx=(12, 4),
+            pady=5,
+            sticky="w",
+        )
+
+        self.disclaimer_expanded_var = ctk.BooleanVar(
+            value=_DEFAULT_DISCLAIMER_EXPANDED
+        )
+        self.disclaimer_button = ctk.CTkButton(
+            form,
+            text=t("output_files.disclaimer_show"),
+            command=self._toggle_disclaimer,
+            fg_color="transparent",
+            hover_color=("#dbeafe", "#1e3a5f"),
+            text_color=("#1D4ED8", "#60A5FA"),
+            anchor="w",
+            width=150,
+            height=28,
+        )
+        # CustomTkinter rejects Tk's takefocus option in CTkButton.__init__.
+        # Apply the native Frame option only after CTk has built the widget.
+        tk.Frame.configure(self.disclaimer_button, takefocus=True)
+        self.disclaimer_button.grid(
+            row=4,
+            column=0,
+            columnspan=3,
+            padx=4,
+            pady=(10, 0),
+            sticky="w",
+        )
+        # CTkButton.bind targets its internal canvas. Bind the focusable outer
+        # Tk widget explicitly so keyboard activation works when Tab focuses it.
+        tk.Misc.bind(
+            self.disclaimer_button,
+            "<Return>",
+            self._activate_disclaimer_from_keyboard,
+            add="+",
+        )
+        tk.Misc.bind(
+            self.disclaimer_button,
+            "<space>",
+            self._activate_disclaimer_from_keyboard,
+            add="+",
+        )
+        self.disclaimer_body = ctk.CTkLabel(
+            form,
+            text=t("output_files.disclaimer_body"),
             justify="left",
             anchor="w",
             width=500,
             wraplength=500,
             text_color=("#1D4ED8", "#60A5FA"),
-        ).grid(row=2, column=0, columnspan=2, padx=4, pady=(10, 4), sticky="ew")
-
-        self.overwrite_var = ctk.BooleanVar(value=False)
-        self.overwrite_checkbox = ctk.CTkCheckBox(
-            form,
-            text=t("output_files.overwrite"),
-            variable=self.overwrite_var,
         )
-        self.overwrite_checkbox.grid(
-            row=3,
+        self.disclaimer_body.grid(
+            row=5,
             column=0,
-            columnspan=2,
+            columnspan=3,
             padx=4,
-            pady=(9, 2),
-            sticky="w",
+            pady=(4, 4),
+            sticky="ew",
         )
+        self._sync_disclaimer_visibility()
 
         ctk.CTkLabel(
             form,
@@ -154,7 +540,7 @@ class OutputFileGenerationView(ctk.CTkFrame):
             width=500,
             wraplength=500,
             text_color=("#475569", "#94a3b8"),
-        ).grid(row=4, column=0, columnspan=2, padx=4, pady=(12, 0), sticky="ew")
+        ).grid(row=6, column=0, columnspan=3, padx=4, pady=(12, 0), sticky="ew")
 
         result_card = CardFrame(self.body)
         result_card.pack(fill="both", expand=True)
@@ -294,6 +680,172 @@ class OutputFileGenerationView(ctk.CTkFrame):
             None,
         )
 
+    def _matching_interface_label(self, value: object) -> str | None:
+        needle = str(value or "").strip().casefold()
+        if not needle:
+            return None
+        return next(
+            (
+                label
+                for label in self._interface_values
+                if label.casefold() == needle
+            ),
+            None,
+        )
+
+    def _on_interface_selected(self, value: str) -> None:
+        if bool(self.auto_detect_var.get()):
+            return
+        label = self._matching_interface_label(value)
+        if label is None:
+            return
+        self._last_manual_interface = label
+        self.interface_var.set(label)
+        self.interface_menu.configure(values=list(self._interface_values))
+        self._hide_interface_suggestions()
+
+    def _on_interface_key_release(self, event: object | None = None) -> None:
+        if bool(self.auto_detect_var.get()) or getattr(self, "_running", False):
+            return
+        matches = _filtered_interface_values(
+            self._interface_values,
+            str(self.interface_var.get() or ""),
+        )
+        self.interface_menu.configure(values=list(matches))
+        keysym = str(getattr(event, "keysym", "") or "")
+        if not matches:
+            self._hide_interface_suggestions()
+            return
+        if keysym in {
+            "Escape",
+            "Return",
+            "Tab",
+            "Up",
+            "Down",
+            "Left",
+            "Right",
+        }:
+            return
+        self._show_interface_suggestions(matches)
+
+    def _show_interface_suggestions(self, values: tuple[str, ...]) -> None:
+        self.interface_menu.show_suggestions(values)
+
+    def _hide_interface_suggestions(self) -> None:
+        self.interface_menu.hide_suggestions()
+
+    def _on_interface_return(self, _event: object | None = None) -> str:
+        if bool(self.auto_detect_var.get()):
+            return "break"
+        typed = str(self.interface_var.get() or "")
+        exact = self._matching_interface_label(typed)
+        matches = _filtered_interface_values(self._interface_values, typed)
+        selected = exact or (matches[0] if len(matches) == 1 else None)
+        if selected is not None:
+            self._on_interface_selected(selected)
+        return "break"
+
+    def _close_interface_dropdown(self) -> None:
+        self._hide_interface_suggestions()
+
+    def _on_auto_detect_changed(self) -> None:
+        automatic = bool(self.auto_detect_var.get())
+        if automatic:
+            self._close_interface_dropdown()
+            current = str(self.interface_var.get() or "")
+            label = self._matching_interface_label(current)
+            if label is not None:
+                self._last_manual_interface = label
+            self.interface_menu.configure(
+                values=[_AUTO_INTERFACE_SEPARATOR],
+                state="disabled",
+            )
+            self.interface_var.set(_AUTO_INTERFACE_SEPARATOR)
+            return
+
+        values = list(self._interface_values)
+        restored = self._last_manual_interface
+        if restored not in self._interface_lookup:
+            restored = values[0] if values else _AUTO_INTERFACE_SEPARATOR
+        self.interface_menu.configure(
+            values=values or [_AUTO_INTERFACE_SEPARATOR],
+            state=(
+                "disabled"
+                if getattr(self, "_running", False) or not values
+                else "normal"
+            ),
+        )
+        self.interface_var.set(restored)
+
+    def _on_auto_detect_date_changed(self) -> None:
+        if bool(self.auto_detect_date_var.get()):
+            self._selected_input_date = None
+            self.input_date_display_var.set(t("output_files.choose_input_date"))
+        self._sync_input_date_controls()
+
+    def _toggle_disclaimer(self) -> None:
+        self.disclaimer_expanded_var.set(
+            not bool(self.disclaimer_expanded_var.get())
+        )
+        self._sync_disclaimer_visibility()
+
+    def _activate_disclaimer_from_keyboard(
+        self,
+        _event: object | None = None,
+    ) -> str:
+        self._toggle_disclaimer()
+        return "break"
+
+    def _sync_disclaimer_visibility(self) -> None:
+        expanded = bool(self.disclaimer_expanded_var.get())
+        if expanded:
+            self.disclaimer_body.grid()
+        else:
+            self.disclaimer_body.grid_remove()
+        self.disclaimer_button.configure(
+            text=t(
+                "output_files.disclaimer_hide"
+                if expanded
+                else "output_files.disclaimer_show"
+            )
+        )
+
+    def _sync_input_date_controls(self, running: bool | None = None) -> None:
+        is_running = (
+            bool(getattr(self, "_running", False))
+            if running is None
+            else bool(running)
+        )
+        manual = not bool(self.auto_detect_date_var.get())
+        if manual:
+            self.input_date_frame.grid()
+        else:
+            self.input_date_frame.grid_remove()
+        enabled = manual and not is_running
+        self.input_date_entry.configure(
+            state="readonly" if enabled else "disabled"
+        )
+        self.input_date_calendar_button.configure(
+            state="normal" if enabled else "disabled"
+        )
+
+    def _open_input_date_calendar(self) -> None:
+        if (
+            getattr(self, "_running", False)
+            or bool(self.auto_detect_date_var.get())
+        ):
+            return
+        CalendarDialog(
+            self,
+            selected=self._selected_input_date or date.today(),
+            on_pick=self._set_input_date,
+        )
+
+    def _set_input_date(self, value: date) -> None:
+        self._selected_input_date = value
+        self.input_date_display_var.set(value.isoformat())
+        self._sync_input_date_controls()
+
     def _start(self) -> None:
         if self._running:
             return
@@ -330,6 +882,30 @@ class OutputFileGenerationView(ctk.CTkFrame):
                 parent=self,
             )
             return
+        interface_code: str | None = None
+        if not bool(self.auto_detect_var.get()):
+            label = self._matching_interface_label(self.interface_var.get())
+            interface_code = self._interface_lookup.get(label or "")
+            if interface_code is None:
+                messagebox.showerror(
+                    t("common.error"),
+                    t("output_files.interface_required"),
+                    parent=self,
+                )
+                return
+            self._last_manual_interface = label
+            self.interface_var.set(label)
+            self.interface_menu.configure(values=list(self._interface_values))
+        input_file_date: str | None = None
+        if not bool(self.auto_detect_date_var.get()):
+            if self._selected_input_date is None:
+                messagebox.showerror(
+                    t("common.error"),
+                    t("output_files.input_date_required"),
+                    parent=self,
+                )
+                return
+            input_file_date = self._selected_input_date.strftime("%Y%m%d")
         target = OracleTarget(
             country=country,
             database_key=str(database.get("database_key") or database["id"]),
@@ -340,7 +916,9 @@ class OutputFileGenerationView(ctk.CTkFrame):
         request = GenerationRequest(
             target=target,
             process_ref_no=process_ref,
-            overwrite=bool(self.overwrite_var.get()),
+            overwrite=True,
+            interface_code=interface_code,
+            input_file_date=input_file_date,
         )
 
         self._running = True
@@ -481,13 +1059,26 @@ class OutputFileGenerationView(ctk.CTkFrame):
         self._set_controls_running(False)
 
     def _set_controls_running(self, running: bool) -> None:
+        if running:
+            self._close_interface_dropdown()
         state = "disabled" if running else "normal"
         for widget in (
             self.db_menu,
             self.process_ref_entry,
-            self.overwrite_checkbox,
+            self.auto_detect_checkbox,
+            self.auto_detect_date_checkbox,
         ):
             widget.configure(state=state)
+        self.interface_menu.configure(
+            state=(
+                "disabled"
+                if running
+                or bool(self.auto_detect_var.get())
+                or not self._interface_values
+                else "normal"
+            )
+        )
+        self._sync_input_date_controls(running=running)
         self.generate_button.configure(state=state)
         self.cancel_button.configure(state="normal" if running else "disabled")
 

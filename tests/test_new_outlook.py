@@ -19,10 +19,12 @@ from fbbatch.new_outlook import (  # noqa: E402
     _control_contains_text,
     _discard_failed_compose,
     _ensure_from_account,
+    _fill_body,
     _fill_recipient_fields,
     _fill_subject,
     _fit_image_size,
     _find_recipient_input,
+    _image_control_count,
     _launch_new_outlook,
     _open_new_outlook_main_window,
     _open_new_mail,
@@ -30,6 +32,7 @@ from fbbatch.new_outlook import (  # noqa: E402
     _recipient_is_visible,
     _split_recipients,
     _wait_for_main_window,
+    _wait_for_inline_image_materialization,
     _wait_for_saved_confirmation,
     find_new_outlook_executable,
     make_file_drop_payload,
@@ -367,6 +370,81 @@ class NewOutlookTests(unittest.TestCase):
         control.iface_value.CurrentValue = "NSSR test"
 
         self.assertTrue(_control_contains_text(control, "NSSR test"))
+
+    def test_control_text_reads_body_through_text_pattern(self) -> None:
+        control = Mock()
+        control.window_text.return_value = ""
+        control.get_value.side_effect = RuntimeError("not supported")
+        control.element_info.name = "Message body"
+        control.iface_value.CurrentValue = ""
+        control.iface_text.DocumentRange.GetText.return_value = (
+            "Estimados,\r\nA continuacion se presentan los tiempos de ejecucion."
+        )
+        control.descendants.return_value = []
+
+        self.assertTrue(
+            _control_contains_text(
+                control,
+                "A continuacion se presentan los tiempos de ejecucion.",
+            )
+        )
+
+    def test_body_paste_refocuses_and_retries_when_first_paste_is_not_visible(self) -> None:
+        body = Mock()
+        keyboard = Mock()
+
+        with (
+            patch("fbbatch.new_outlook._set_clipboard_text") as set_clipboard,
+            patch(
+                "fbbatch.new_outlook._control_contains_text",
+                side_effect=[False, True],
+            ),
+            patch(
+                "fbbatch.new_outlook.time.monotonic",
+                side_effect=[0.0, 1.0, 9.0, 10.0, 11.0],
+            ),
+            patch("fbbatch.new_outlook.time.sleep"),
+        ):
+            _fill_body(body, "Estimados,\nTexto principal del reporte.", keyboard)
+
+        self.assertEqual(set_clipboard.call_count, 2)
+        self.assertEqual(
+            [call.args for call in keyboard.send_keys.call_args_list],
+            [("^{HOME}",), ("^v",), ("^{HOME}",), ("^v",)],
+        )
+        self.assertEqual(body.set_focus.call_count, 2)
+        self.assertEqual(body.click_input.call_count, 2)
+
+    def test_inline_image_waits_until_uia_exposes_new_image(self) -> None:
+        window = Mock()
+        with (
+            patch(
+                "fbbatch.new_outlook._image_control_count",
+                side_effect=[1, 1, 2],
+            ),
+            patch(
+                "fbbatch.new_outlook.time.monotonic",
+                side_effect=[0.0, 1.0, 2.0],
+            ),
+            patch("fbbatch.new_outlook.time.sleep"),
+        ):
+            result = _wait_for_inline_image_materialization(
+                window,
+                previous_count=1,
+                timeout=10.0,
+            )
+
+        self.assertEqual(result, 2)
+
+    def test_image_control_count_ignores_non_image_controls(self) -> None:
+        image = Mock()
+        image.element_info.control_type = "Image"
+        text_control = Mock()
+        text_control.element_info.control_type = "Text"
+        window = Mock()
+        window.descendants.return_value = [image, text_control]
+
+        self.assertEqual(_image_control_count(window), 1)
 
     def test_failed_compose_is_closed_without_saving(self) -> None:
         button = Mock()

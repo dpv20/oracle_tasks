@@ -21,6 +21,11 @@ from paths import SPOOLS_SAVINGS_OUT_DIR
 from settings.config import decrypt_password
 from settings.credentials import to_sqlcl_arg
 from spools_cl_accounts import databases as dbs
+from spools_cl_accounts.database_failover import (
+    ConnectionCandidate,
+    FailoverSqlclRunner,
+    fallback_candidates_for_source,
+)
 from spools_cl_accounts.sqlcl import SqlclRunner
 from spools_savings_accounts.spool_savings_engine import (
     MAX_PARALLEL_SAVINGS_ACCOUNTS,
@@ -969,6 +974,12 @@ class SpoolsSavingsView(ctk.CTkFrame):
                 return
 
         source_connection = self._connection_for_credential(source_cred, db["id"])
+        source_fallbacks = fallback_candidates_for_source(
+            self.app.config,
+            country,
+            db,
+            self._connection_for_credential,
+        )
         self._show_results_card()
         self._prepare_results(accounts)
 
@@ -1001,6 +1012,8 @@ class SpoolsSavingsView(ctk.CTkFrame):
                 inject_max_workers,
                 verify_after_apply,
                 extract_archive_dir,
+                str(db["id"]),
+                source_fallbacks,
             ),
             daemon=True,
         ).start()
@@ -1133,8 +1146,22 @@ class SpoolsSavingsView(ctk.CTkFrame):
         inject_max_workers: int,
         verify_after_apply: bool,
         extract_archive_dir: Path | None,
+        source_alias: str = "",
+        source_fallbacks: tuple[ConnectionCandidate, ...] = (),
     ) -> None:
-        engine = SpoolSavingsEngine(SqlclRunner(sqlcl_path))
+        sqlcl_runner = SqlclRunner(sqlcl_path)
+        if source_alias and source_fallbacks:
+            sqlcl_runner = FailoverSqlclRunner(
+                sqlcl_runner,
+                ConnectionCandidate(source_alias, source_connection),
+                source_fallbacks,
+            )
+            log.info(
+                "CASA source failover enabled: source=%s alternatives=%s",
+                source_alias,
+                [candidate.alias for candidate in source_fallbacks],
+            )
+        engine = SpoolSavingsEngine(sqlcl_runner)
         total = len(accounts)
         workers = worker_count_for(total, extract_max_workers)
         log.info("Starting Savings extraction batch: accounts=%s workers=%s", total, workers)

@@ -84,6 +84,7 @@ class ColombiaOficowcgQueryTests(unittest.TestCase):
 
         self.assertIn("process_ref_no = '5328716'", compact)
         self.assertRegex(compact, r"interface_code\)?\)?\s*=\s*'ificowcg'")
+        self.assertEqual(compact.count("gic.interface_code = 'ificowcg'"), 4)
         self.assertNotIn("fn_handoff", compact)
         self.assertNotIn("gipks_", compact)
         self.assertNotRegex(
@@ -110,6 +111,10 @@ class ColombiaOficowcgQueryTests(unittest.TestCase):
         self.assertIn("cstb_clearing_rejection", compact)
         self.assertIn("upload_owner_count", compact)
         self.assertIn("count(distinct record_reference)", compact)
+        self.assertGreaterEqual(
+            compact.count("gic.interface_code = 'ificowcg'"),
+            9,
+        )
         self.assertNotRegex(
             compact,
             r"\b(?:insert|update|delete|merge|commit|rollback)\b",
@@ -139,24 +144,38 @@ class ColombiaOficowcgQueryTests(unittest.TestCase):
                 country="colombia",
             )
 
-    def test_oficowcg_builders_reject_unverified_country_contracts(self) -> None:
+    def test_oficowcg_builders_accept_the_verified_mexico_and_peru_contracts(
+        self,
+    ) -> None:
         for country in ("peru", "mexico"):
             with self.subTest(country=country, builder="body"):
-                with self.assertRaisesRegex(ValueError, "country"):
-                    build_body_query(
-                        "5328716",
-                        "IFICOWCG",
-                        DataSourceChoice.ACTIVE,
-                        "20260604",
-                        country=country,
-                    )
+                body = build_body_query(
+                    "5328716",
+                    "IFICOWCG",
+                    DataSourceChoice.ACTIVE,
+                    "20260604",
+                    country=country,
+                )
+                compact = " ".join(body.script.lower().split())
+                self.assertGreaterEqual(compact.count(" union "), 3)
+                self.assertIn("iftb_clearing_upload_c", compact)
+                self.assertIn("cstb_clearing_rejection", compact)
+                self.assertIn("txn_status", compact)
             with self.subTest(country=country, builder="coverage"):
-                with self.assertRaisesRegex(ValueError, "country"):
-                    build_oficowcg_coverage_query(
-                        "5328716",
-                        country=country,
-                        file_date="20260604",
-                    )
+                coverage = build_oficowcg_coverage_query(
+                    "5328716",
+                    country=country,
+                    file_date="20260604",
+                )
+                compact = " ".join(coverage.script.lower().split())
+                for branch in (
+                    "branch_a_count",
+                    "branch_b_count",
+                    "branch_c_count",
+                    "branch_d_count",
+                ):
+                    self.assertIn(branch, compact)
+                self.assertIn("upload_owner_count", compact)
 
 
 class ColombiaOficowcgContractTests(unittest.TestCase):
@@ -166,20 +185,27 @@ class ColombiaOficowcgContractTests(unittest.TestCase):
         self.base_spec = base_spec
         self.spec = _validate_country_contract("colombia", base_spec)
 
-    def test_only_colombia_oficowcg_gets_the_country_specific_contract(self) -> None:
+    def test_each_verified_country_gets_its_specific_oficowcg_contract(self) -> None:
         self.assertEqual(self.spec.contract, "oficowcg_colombia")
         self.assertEqual(self.spec.body_field_count, 14)
         self.assertEqual(self.spec.error_body_field_count, 16)
         self.assertIs(_validate_country_contract("chile", self.base_spec), self.base_spec)
 
+        for country in ("peru", "mexico"):
+            with self.subTest(country=country):
+                regional = _validate_country_contract(country, self.base_spec)
+                self.assertEqual(regional.contract, f"oficowcg_{country}")
+                self.assertEqual(regional.body_field_count, 14)
+                self.assertEqual(regional.error_body_field_count, 16)
+                self.assertTrue(regional.revalidate_external_inputs)
+
         other_spec = spec_for_code("IFDOBIEL")
         assert other_spec is not None
         with self.assertRaisesRegex(OutputFileGenerationError, "Colombia"):
             _validate_country_contract("colombia", other_spec)
-        for country in ("peru", "mexico"):
-            with self.subTest(country=country):
-                with self.assertRaises(OutputFileGenerationError):
-                    _validate_country_contract(country, self.base_spec)
+        with self.assertRaisesRegex(OutputFileGenerationError, "Mexico"):
+            _validate_country_contract("mexico", other_spec)
+        self.assertIs(_validate_country_contract("peru", other_spec), other_spec)
 
     def test_coverage_parser_uses_colombia_specific_cardinalities(self) -> None:
         valid = ["3|3|3|3|0|3|0|0"]

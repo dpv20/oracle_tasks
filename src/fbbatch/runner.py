@@ -15,7 +15,7 @@ from datetime import date
 from html import unescape
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Mapping
 
 from fbbatch.outlook_diagnostics import (
     describe_com_object,
@@ -26,6 +26,11 @@ from fbbatch.outlook_diagnostics import (
 )
 from paths import DATA_DIR, LOG_FILE, REPO_ROOT
 from settings.config import decrypt_password
+from settings.database_failover import (
+    DEFAULT_DATABASE_FAILOVER,
+    alternative_alias,
+    normalize_database_preferences,
+)
 
 
 log = logging.getLogger(__name__)
@@ -43,6 +48,9 @@ JAVA_DEFAULT_IDLE_TIMEOUT_SECONDS = 10 * 60.0
 JAVA_EVENT_IDLE_TIMEOUT_SECONDS = 40 * 60.0
 JAVA_MAX_RUNTIME_SECONDS = 90 * 60.0
 JAVA_EXIT_GRACE_SECONDS = 60.0
+_CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+_CREATE_NEW_PROCESS_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+_JAVA_CREATION_FLAGS = _CREATE_NO_WINDOW | _CREATE_NEW_PROCESS_GROUP
 ProgressCallback = Callable[[int, str], None]
 _ENV_CREDENTIAL_BUCKET = {
     "PROD": "shared_prod",
@@ -50,12 +58,34 @@ _ENV_CREDENTIAL_BUCKET = {
     "DEV": "user_dev",
 }
 _PRIMARY_TNS = {
-    ("chile", "PROD"): "FXBFCL_19C_PROD_OCI",
+    ("chile", "PROD"): "FXBFCL_19C_PROD_OCI_DR",
     ("chile", "QA"): "CHILE_QA_19C",
     ("chile", "DEV"): "CHILE_DEV",
     ("peru", "PROD"): "PERU_OCI_PROD",
     ("colombia", "PROD"): "BFCO_POCISANTIAGO",
     ("mexico", "PROD"): "MX_PROD_OCI",
+}
+_FBBATCH_JDBC_URL_BY_TNS = {
+    "FXBFCL_19C_PROD_OCI": (
+        "jdbc:oracle:thin:@//bfa-cl-flx-db-sascl1-priv.fifcore.com:1541/"
+        "bfclflxprd.fif.tech"
+    ),
+    "FXBFCL_19C_PROD_OCI_DR": (
+        "jdbc:oracle:thin:@//bfa-cl-flx-db-savap1-priv.fifcore.com:1541/"
+        "bfclflxprd.val.fif.tech"
+    ),
+    "BFCO_POCISANTIAGO": (
+        "jdbc:oracle:thin:@//bfa-co-flx-db-priv.fif.tech:1541/"
+        "bfcoflxprod.fif.tech"
+    ),
+    "BFCO_POCISAOPALO": (
+        "jdbc:oracle:thin:@//bfa-co-flx-db-sasao1.fif.tech:1541/"
+        "bfcoflxprod.fif.tech"
+    ),
+}
+_CONNECTION_KEY_COUNTRY = {
+    "CL_PROD": "chile",
+    "COL_PROD": "colombia",
 }
 _COUNTRY_PROPERTY_PREFIX = {
     "chile": "CL",
@@ -81,6 +111,28 @@ class BatchResult:
     output_dir: Path | None = None
     exit_code: int | None = None
     event_skipped: bool = False
+    connection_failure: bool = False
+    failed_connection_key: str = ""
+    cancelled: bool = False
+
+
+def _is_cancelled(cancel_event: threading.Event | None) -> bool:
+    return cancel_event is not None and cancel_event.is_set()
+
+
+def _cancelled_batch_result() -> BatchResult:
+    return BatchResult(
+        False,
+        "Night Shift was cancelled.",
+        exit_code=130,
+        cancelled=True,
+    )
+
+
+@dataclass
+class _MaterializedFBBatchConfiguration:
+    paths: list[Path]
+    aliases: dict[str, str]
 
 
 @dataclass
@@ -169,6 +221,23 @@ def materialize_fbbatch_credentials(
     include_common: bool,
 ) -> list[Path]:
     """Create ignored Java property files from the current user's saved credentials."""
+    return _materialize_fbbatch_configuration(
+        configured_root,
+        env,
+        credentials,
+        include_common=include_common,
+    ).paths
+
+
+def _materialize_fbbatch_configuration(
+    configured_root: str | Path,
+    env: str,
+    credentials: dict,
+    *,
+    include_common: bool,
+    alias_overrides: Mapping[str, str] | None = None,
+) -> _MaterializedFBBatchConfiguration:
+    """Write Java properties and report the exact aliases used by each country."""
     ok, msg, root = validate_fbbatch_root(configured_root)
     if not ok:
         raise ValueError(msg)
@@ -182,14 +251,21 @@ def materialize_fbbatch_credentials(
     if include_common and environment == "PROD":
         required_countries.extend(("peru", "colombia", "mexico"))
 
+    overrides = {
+        str(country).strip().lower(): str(alias).strip()
+        for country, alias in (alias_overrides or {}).items()
+        if str(alias).strip()
+    }
     selected: dict[str, dict[str, str]] = {}
     for country in required_countries:
+        preferred_tns = overrides.get(country) or _PRIMARY_TNS.get((country, environment), "")
         selected[country] = _select_fbbatch_credential(
             credentials,
             country,
             bucket,
-            _PRIMARY_TNS.get((country, environment), ""),
+            preferred_tns,
             environment,
+            require_preferred=country in overrides,
         )
 
     generated: list[Path] = []
@@ -219,7 +295,17 @@ def materialize_fbbatch_credentials(
                     common_replacements,
                 )
             )
-        return generated
+        selected_aliases = {
+            country: str(credential.get("tns", "")).strip()
+            for country, credential in selected.items()
+        }
+        log.info(
+            "fbbatch_config: materialized environment=%s include_common=%s aliases=%s",
+            environment,
+            include_common,
+            selected_aliases,
+        )
+        return _MaterializedFBBatchConfiguration(generated, selected_aliases)
     except Exception:
         remove_materialized_fbbatch_credentials(generated)
         raise
@@ -233,12 +319,118 @@ def remove_materialized_fbbatch_credentials(paths: list[Path]) -> None:
             log.exception("Could not remove temporary FBBatch credential file path=%s", path)
 
 
+def _has_fbbatch_credential_alias(
+    credentials: dict,
+    country: str,
+    bucket: str,
+    alias: str,
+) -> bool:
+    wanted = alias.strip().upper()
+    for by_login in credentials.get(country, {}).values():
+        if not isinstance(by_login, dict):
+            continue
+        for credential in by_login.values():
+            if not isinstance(credential, dict):
+                continue
+            if credential.get("bucket") != bucket:
+                continue
+            if str(credential.get("tns", "")).strip().upper() == wanted:
+                return True
+    return False
+
+
+def _next_fbbatch_failover_overrides(
+    result: BatchResult,
+    environment: str,
+    credentials: dict,
+    failover_flags: Mapping[str, object],
+    selected_aliases: Mapping[str, str],
+    current_overrides: Mapping[str, str],
+    attempted_aliases: Mapping[str, set[str]],
+    *,
+    event_only: bool,
+) -> dict[str, str] | None:
+    """Choose untried equivalent aliases after an actual Java connection error."""
+    if environment.strip().upper() != "PROD" or not result.connection_failure:
+        return None
+
+    failed_key = result.failed_connection_key.upper()
+    failed_country = _CONNECTION_KEY_COUNTRY.get(failed_key)
+    if event_only:
+        if failed_key and failed_country != "chile":
+            return None
+        countries = ("chile",)
+    elif failed_country:
+        countries = (failed_country,)
+    elif failed_key:
+        # Peru, Mexico, and any future logical connections do not inherit an
+        # unrelated fallback merely because their own connection failed.
+        return None
+    else:
+        # Older Java builds sometimes omit the logical connection name. In that
+        # case switch every enabled, available pair once rather than guessing.
+        countries = ("chile", "colombia")
+
+    overrides = dict(current_overrides)
+    changed = False
+    for country in countries:
+        selected_alias = str(selected_aliases.get(country, "")).strip()
+        alternative = alternative_alias(country, selected_alias, failover_flags)
+        if not alternative:
+            continue
+        attempted = attempted_aliases.get(country, set())
+        if alternative.upper() in attempted:
+            continue
+        if not _has_fbbatch_credential_alias(
+            credentials,
+            country,
+            _ENV_CREDENTIAL_BUCKET["PROD"],
+            alternative,
+        ):
+            log.warning(
+                "fbbatch_failover: alternative credential unavailable country=%s "
+                "selected=%s alternative=%s",
+                country,
+                selected_alias,
+                alternative,
+            )
+            continue
+        overrides[country] = alternative
+        changed = True
+        log.warning(
+            "fbbatch_failover: scheduling retry country=%s selected=%s alternative=%s "
+            "connection_key=%s",
+            country,
+            selected_alias,
+            alternative,
+            result.failed_connection_key or "unknown",
+        )
+    return overrides if changed else None
+
+
+def _initial_fbbatch_alias_overrides(
+    environment: str,
+    preferred_aliases: Mapping[str, object] | None,
+    *,
+    event_only: bool,
+) -> dict[str, str]:
+    """Build the validated first-choice aliases for a PROD Night Shift run."""
+    if environment.strip().upper() != "PROD" or preferred_aliases is None:
+        return {}
+    normalized = normalize_database_preferences(preferred_aliases)
+    if event_only:
+        return {"chile": normalized["chile"]}
+    return normalized
+
+
 def _select_fbbatch_credential(
     credentials: dict,
     country: str,
     bucket: str,
     preferred_tns: str,
     environment: str,
+    *,
+    require_preferred: bool = False,
 ) -> dict[str, str]:
     candidates: list[dict[str, str]] = []
     for by_login in credentials.get(country, {}).values():
@@ -255,6 +447,14 @@ def _select_fbbatch_credential(
         )
 
     preferred = preferred_tns.upper()
+    if require_preferred and not any(
+        str(item.get("tns", "")).strip().upper() == preferred for item in candidates
+    ):
+        label = country.capitalize()
+        raise ValueError(
+            f"Missing {environment} credential for {label} alias {preferred_tns}. "
+            "Add it in Settings > Credentials."
+        )
     candidates.sort(
         key=lambda item: (
             0 if str(item.get("tns", "")).upper() == preferred else 1,
@@ -267,19 +467,28 @@ def _select_fbbatch_credential(
     password = decrypt_password(str(credential.get("password_enc", "")))
     user = str(credential.get("user", "")).strip()
     schema = str(credential.get("schema", "")).strip()
+    tns = str(credential.get("tns", "")).strip()
     if not user or not password:
         label = country.capitalize()
         raise ValueError(
             f"The saved {environment} credential for {label} is incomplete. Update it in Settings > Credentials."
         )
-    return {"user": f"{user}[{schema}]" if schema else user, "password": password}
+    return {
+        "user": f"{user}[{schema}]" if schema else user,
+        "password": password,
+        "tns": tns,
+    }
 
 
 def _credential_property_values(prefix: str, credential: dict[str, str]) -> dict[str, str]:
-    return {
+    values = {
         f"{prefix}_DB_USER": credential["user"],
         f"{prefix}_DB_PASSWORD": credential["password"],
     }
+    jdbc_url = _FBBATCH_JDBC_URL_BY_TNS.get(credential.get("tns", "").upper())
+    if jdbc_url:
+        values[f"{prefix}_DB_URL"] = jdbc_url
+    return values
 
 
 def _write_runtime_configuration(template: Path, target: Path, replacements: dict[str, str]) -> Path:
@@ -378,39 +587,107 @@ def run_eod_batch_event(
     progress: ProgressCallback | None = None,
     *,
     credentials: dict | None = None,
+    database_failover: Mapping[str, object] | None = None,
+    preferred_aliases: Mapping[str, object] | None = None,
     latest: bool = True,
     event_date: str = "",
     next_date: str = "",
+    cancel_event: threading.Event | None = None,
 ) -> BatchResult:
+    if _is_cancelled(cancel_event):
+        return _cancelled_batch_result()
     ok, msg, base_root = validate_fbbatch_root(fbbatch_root)
     if not ok:
         return BatchResult(False, msg)
     generated_configs: list[Path] = []
+    alias_overrides = _initial_fbbatch_alias_overrides(
+        env,
+        preferred_aliases,
+        event_only=True,
+    )
+    attempted_aliases: dict[str, set[str]] = {}
+    failover_flags = (
+        DEFAULT_DATABASE_FAILOVER
+        if database_failover is None
+        else database_failover
+    )
+    log.info(
+        "fbbatch_event: initial database aliases environment=%s aliases=%s",
+        env,
+        alias_overrides or "automatic",
+    )
     try:
-        if credentials is not None:
-            generated_configs = materialize_fbbatch_credentials(
-                base_root, env, credentials, include_common=False
-            )
         root = base_root / "CHILE"
-        if latest:
-            return _execute_eod_batch_event(root, env, progress)
+        historical_dates = (
+            None
+            if latest
+            else _parse_historical_event_dates(event_date, next_date)
+        )
+        while True:
+            if _is_cancelled(cancel_event):
+                return _cancelled_batch_result()
+            selected_aliases: dict[str, str] = {}
+            if credentials is not None:
+                materialized = _materialize_fbbatch_configuration(
+                    base_root,
+                    env,
+                    credentials,
+                    include_common=False,
+                    alias_overrides=alias_overrides,
+                )
+                generated_configs = materialized.paths
+                selected_aliases = materialized.aliases
+                for country, alias in selected_aliases.items():
+                    attempted_aliases.setdefault(country, set()).add(alias.upper())
 
-        batch_day, next_processing_day = _parse_historical_event_dates(event_date, next_date)
-        _emit_progress(progress, 1, "Preparing historical EOD Batch Event")
-        with tempfile.TemporaryDirectory(prefix="oracle_tasks_eod_event_") as temp_dir:
-            runtime_root = _prepare_historical_event_runtime(
-                root,
-                Path(temp_dir) / "CHILE",
-                batch_day,
-                next_processing_day,
-            )
-            return _execute_eod_batch_event(
-                runtime_root,
-                env,
-                progress,
-                classpath_root=root,
-                expected_event_date=batch_day,
-            )
+            if latest:
+                result = _execute_eod_batch_event(
+                    root,
+                    env,
+                    progress,
+                    cancel_event=cancel_event,
+                )
+            else:
+                assert historical_dates is not None
+                batch_day, next_processing_day = historical_dates
+                _emit_progress(progress, 1, "Preparing historical EOD Batch Event")
+                with tempfile.TemporaryDirectory(prefix="oracle_tasks_eod_event_") as temp_dir:
+                    runtime_root = _prepare_historical_event_runtime(
+                        root,
+                        Path(temp_dir) / "CHILE",
+                        batch_day,
+                        next_processing_day,
+                    )
+                    result = _execute_eod_batch_event(
+                        runtime_root,
+                        env,
+                        progress,
+                        classpath_root=root,
+                        expected_event_date=batch_day,
+                        cancel_event=cancel_event,
+                    )
+
+            if result.cancelled or _is_cancelled(cancel_event):
+                return result if result.cancelled else _cancelled_batch_result()
+            next_overrides = None
+            if credentials is not None:
+                next_overrides = _next_fbbatch_failover_overrides(
+                    result,
+                    env,
+                    credentials,
+                    failover_flags,
+                    selected_aliases,
+                    alias_overrides,
+                    attempted_aliases,
+                    event_only=True,
+                )
+            if next_overrides is None:
+                return result
+
+            remove_materialized_fbbatch_credentials(generated_configs)
+            generated_configs = []
+            alias_overrides = next_overrides
+            _emit_progress(progress, 3, "Retrying EOD Batch Event on equivalent database")
     except (OSError, ValueError) as exc:
         return BatchResult(False, str(exc))
     finally:
@@ -424,7 +701,10 @@ def _execute_eod_batch_event(
     *,
     classpath_root: Path | None = None,
     expected_event_date: date | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> BatchResult:
+    if _is_cancelled(cancel_event):
+        return _cancelled_batch_result()
     output_dir = root / "output" / "EODBatchEvent"
     output_dir.mkdir(parents=True, exist_ok=True)
     before = _snapshot_html_outputs(output_dir)
@@ -436,7 +716,10 @@ def _execute_eod_batch_event(
         progress=progress,
         progress_kind="event",
         classpath_root=classpath_root,
+        cancel_event=cancel_event,
     )
+    if result.cancelled or _is_cancelled(cancel_event):
+        return result if result.cancelled else _cancelled_batch_result()
     html_path = _newest_after(output_dir, before)
     if result.ok and expected_event_date is not None:
         expected_token = expected_event_date.strftime("%d-%m-%Y")
@@ -452,7 +735,14 @@ def _execute_eod_batch_event(
                 f"Historical Event expected {expected_token}, but Java produced {actual}.",
                 exit_code=result.exit_code,
             )
-    return _with_pdf(result, html_path, "event", "EODBatchEvent", progress)
+    return _with_pdf(
+        result,
+        html_path,
+        "event",
+        "EODBatchEvent",
+        progress,
+        cancel_event=cancel_event,
+    )
 
 
 def _parse_historical_event_dates(event_date: str, next_date: str) -> tuple[date, date]:
@@ -529,16 +819,33 @@ def run_batch_report(
     *,
     has_other_issue: bool = False,
     credentials: dict | None = None,
+    database_failover: Mapping[str, object] | None = None,
+    preferred_aliases: Mapping[str, object] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> BatchResult:
+    if _is_cancelled(cancel_event):
+        return _cancelled_batch_result()
     ok, msg, base_root = validate_fbbatch_root(fbbatch_root)
     if not ok:
         return BatchResult(False, msg)
     generated_configs: list[Path] = []
+    alias_overrides = _initial_fbbatch_alias_overrides(
+        env,
+        preferred_aliases,
+        event_only=False,
+    )
+    attempted_aliases: dict[str, set[str]] = {}
+    failover_flags = (
+        DEFAULT_DATABASE_FAILOVER
+        if database_failover is None
+        else database_failover
+    )
+    log.info(
+        "fbbatch_report: initial database aliases environment=%s aliases=%s",
+        env,
+        alias_overrides or "automatic",
+    )
     try:
-        if credentials is not None:
-            generated_configs = materialize_fbbatch_credentials(
-                base_root, env, credentials, include_common=True
-            )
         root = base_root / "CommonBatches"
         output_dir = root / "output" / "EODBATCH"
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -559,13 +866,55 @@ def run_batch_report(
             other_issue_answer,
             not has_batch_issue,
         )
-        result = _run_java(
-            root,
-            "com.fellabela.custom.common.eodbatch.FBEODBatchTimingApp",
-            "\n".join(lines) + "\n",
-            progress=progress,
-            progress_kind="report_issue" if has_batch_issue or has_other_issue else "report_no_issue",
-        )
+        while True:
+            if _is_cancelled(cancel_event):
+                return _cancelled_batch_result()
+            selected_aliases: dict[str, str] = {}
+            if credentials is not None:
+                materialized = _materialize_fbbatch_configuration(
+                    base_root,
+                    env,
+                    credentials,
+                    include_common=True,
+                    alias_overrides=alias_overrides,
+                )
+                generated_configs = materialized.paths
+                selected_aliases = materialized.aliases
+                for country, alias in selected_aliases.items():
+                    attempted_aliases.setdefault(country, set()).add(alias.upper())
+
+            result = _run_java(
+                root,
+                "com.fellabela.custom.common.eodbatch.FBEODBatchTimingApp",
+                "\n".join(lines) + "\n",
+                progress=progress,
+                progress_kind="report_issue" if has_batch_issue or has_other_issue else "report_no_issue",
+                cancel_event=cancel_event,
+            )
+            if result.cancelled or _is_cancelled(cancel_event):
+                return result if result.cancelled else _cancelled_batch_result()
+            next_overrides = None
+            if credentials is not None:
+                next_overrides = _next_fbbatch_failover_overrides(
+                    result,
+                    env,
+                    credentials,
+                    failover_flags,
+                    selected_aliases,
+                    alias_overrides,
+                    attempted_aliases,
+                    event_only=False,
+                )
+            if next_overrides is None:
+                break
+
+            remove_materialized_fbbatch_credentials(generated_configs)
+            generated_configs = []
+            alias_overrides = next_overrides
+            _emit_progress(progress, 3, "Retrying EOD Batch Report on equivalent database")
+
+        if _is_cancelled(cancel_event):
+            return _cancelled_batch_result()
         html_path = _newest_after(output_dir, before)
         if result.ok and not latest:
             from datetime import datetime
@@ -583,7 +932,14 @@ def run_batch_report(
                     f"Batch Report expected {expected_token}, but Java produced {actual}.",
                     exit_code=result.exit_code,
                 )
-        return _with_report_images(result, html_path, "report", "BatchReport", progress)
+        return _with_report_images(
+            result,
+            html_path,
+            "report",
+            "BatchReport",
+            progress,
+            cancel_event=cancel_event,
+        )
     except (OSError, ValueError) as exc:
         return BatchResult(False, str(exc))
     finally:
@@ -1574,6 +1930,65 @@ def issues_for_date(issue_date: str) -> list[dict[str, str]]:
     ]
 
 
+def _terminate_java_process_tree(
+    process: subprocess.Popen,
+    process_label: str,
+) -> None:
+    if process.poll() is not None:
+        return
+
+    pid = getattr(process, "pid", None)
+    if os.name == "nt" and pid:
+        try:
+            completed = subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                creationflags=_CREATE_NO_WINDOW,
+            )
+            log.info(
+                "fbbatch_java: taskkill process=%s pid=%s exit_code=%s",
+                process_label,
+                pid,
+                completed.returncode,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            log.warning(
+                "fbbatch_java: could not taskkill process tree process=%s pid=%s error=%s",
+                process_label,
+                pid,
+                exc,
+            )
+    else:
+        try:
+            process.terminate()
+        except OSError as exc:
+            log.debug(
+                "fbbatch_java: could not terminate process=%s pid=%s error=%s",
+                process_label,
+                pid,
+                exc,
+            )
+
+    try:
+        process.wait(timeout=5)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+
+    try:
+        process.kill()
+        process.wait(timeout=5)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log.warning(
+            "fbbatch_java: process did not exit after forced termination process=%s pid=%s error=%s",
+            process_label,
+            pid,
+            exc,
+        )
+
+
 def _run_java(
     root: Path,
     main_class: str,
@@ -1582,7 +1997,11 @@ def _run_java(
     progress: ProgressCallback | None = None,
     progress_kind: str = "",
     classpath_root: Path | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> BatchResult:
+    if _is_cancelled(cancel_event):
+        log.info("fbbatch_java: cancelled before process start class=%s", main_class)
+        return _cancelled_batch_result()
     if not root.exists():
         return BatchResult(False, f"FBBatchSetup folder not found: {root}")
     java = shutil.which("java")
@@ -1610,7 +2029,7 @@ def _run_java(
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            creationflags=_JAVA_CREATION_FLAGS,
         )
         log.info(
             "fbbatch_java: started process=%s pid=%s stdin_chars=%s stdin_lines=%s",
@@ -1646,8 +2065,12 @@ def _run_java(
         last_output = started
         last_heartbeat_minute = 0
         timeout_message = ""
+        cancel_requested = False
 
         while True:
+            if _is_cancelled(cancel_event):
+                cancel_requested = True
+                break
             now = time.monotonic()
             elapsed = now - started
             idle = now - last_output
@@ -1700,12 +2123,22 @@ def _run_java(
                 )
             tracker.update(line)
 
+        if _is_cancelled(cancel_event):
+            cancel_requested = True
+
+        if cancel_requested:
+            log.info(
+                "fbbatch_java: cancellation requested process=%s pid=%s elapsed=%.1fs",
+                process_label,
+                getattr(process, "pid", "<unknown>"),
+                time.monotonic() - started,
+            )
+            _terminate_java_process_tree(process, process_label)
+            reader.join(timeout=1)
+            return _cancelled_batch_result()
+
         if timeout_message:
-            process.kill()
-            try:
-                process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                log.warning("fbbatch_java: process did not exit promptly after kill process=%s", process_label)
+            _terminate_java_process_tree(process, process_label)
             output_tail = _safe_tail("".join(lines))
             log.error(
                 "fbbatch_java: timeout process=%s elapsed=%.1fs idle=%.1fs message=%s output_tail=%s",
@@ -1726,7 +2159,7 @@ def _run_java(
                 reader_errors[-1],
             )
     except subprocess.TimeoutExpired:
-        process.kill()
+        _terminate_java_process_tree(process, process_label)
         message = f"{process_label} finished its output but did not exit cleanly."
         log.exception("fbbatch_java: exit timeout process=%s", process_label)
         return BatchResult(False, message)
@@ -1735,6 +2168,10 @@ def _run_java(
         return BatchResult(False, f"Could not start Java: {exc}")
 
     combined_output = "".join(lines)
+    connection_failure = _java_connection_failed(combined_output)
+    failed_connection_key = (
+        _java_failed_connection_key(combined_output) if connection_failure else ""
+    )
     reported_failure = _java_reported_failure(combined_output)
     ok = exit_code == 0 and not reported_failure
     elapsed = time.monotonic() - started
@@ -1750,7 +2187,57 @@ def _run_java(
             _redact_process_output_for_log(_safe_tail(combined_output)),
         )
     message = "Completed." if ok else (reported_failure or _safe_tail(combined_output))
-    return BatchResult(ok, message, exit_code=exit_code)
+    return BatchResult(
+        ok,
+        message,
+        exit_code=exit_code,
+        connection_failure=connection_failure,
+        failed_connection_key=failed_connection_key,
+    )
+
+
+_JAVA_CONNECTION_ORA_RE = re.compile(
+    r"\bORA-(?:"
+    r"01012|01033|01034|01089|"
+    r"03113|03114|03135|"
+    r"12154|12162|"
+    r"12504|12505|12514|12516|12518|12519|12520|12521|12525|12528|"
+    r"12535|12537|12541|12543|12545|12547|12560|12571|12637|17002"
+    r")\b",
+    re.IGNORECASE,
+)
+_JAVA_CONNECTION_TEXT_RE = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"unable to establish a connection to the oracle database",
+        r"listener does not currently know",
+        r"no listener",
+        r"network adapter could not establish",
+        r"connection (?:was )?refused",
+        r"connection (?:was )?reset",
+        r"closed connection",
+        r"not connected to oracle",
+        r"connect(?:ion)? timed out",
+        r"could not resolve (?:the )?connect identifier",
+        r"io error:\s*(?:the network adapter|connection|socket)",
+        r"tns:.*(?:listener|connect|resolve)",
+    )
+)
+_JAVA_CONNECTION_KEY_RE = re.compile(
+    r"connecting\s+to\s+the\s*(?:-->|=)\s*'?([A-Z]+_(?:PROD|DEV))",
+    re.IGNORECASE,
+)
+
+
+def _java_connection_failed(output: str) -> bool:
+    if _JAVA_CONNECTION_ORA_RE.search(output):
+        return True
+    return any(pattern.search(output) for pattern in _JAVA_CONNECTION_TEXT_RE)
+
+
+def _java_failed_connection_key(output: str) -> str:
+    matches = _JAVA_CONNECTION_KEY_RE.findall(output)
+    return matches[-1].upper() if matches else ""
 
 
 def _java_reported_failure(output: str) -> str:
@@ -1760,11 +2247,12 @@ def _java_reported_failure(output: str) -> str:
             "EOD Batch Event received an incompatible processing-date format. "
             "Update Oracle Tasks and retry the historical report."
         )
+    if _java_connection_failed(output):
+        return (
+            "Java could not connect to one of the required Oracle databases. "
+            "Check the VPN and database configuration."
+        )
     failure_markers = (
-        (
-            "unable to establish a connection to the oracle database",
-            "Java could not connect to one of the required Oracle databases. Check the VPN and database configuration.",
-        ),
         (
             "exception occurred during processing",
             "Java reported an exception while processing the report. Check the application log for details.",
@@ -1874,15 +2362,29 @@ def _emit_progress(callback: ProgressCallback | None, percent: int, message: str
         callback(max(0, min(100, int(percent))), message)
 
 
-def _with_pdf(result: BatchResult, html_path: Path | None, output_kind: str, default_stem: str, progress: ProgressCallback | None = None) -> BatchResult:
+def _with_pdf(
+    result: BatchResult,
+    html_path: Path | None,
+    output_kind: str,
+    default_stem: str,
+    progress: ProgressCallback | None = None,
+    *,
+    cancel_event: threading.Event | None = None,
+) -> BatchResult:
+    if _is_cancelled(cancel_event):
+        return _cancelled_batch_result()
     if html_path and html_path.exists():
         _emit_progress(progress, 93, "Copying HTML output")
         local_html = _copy_to_project_output(html_path, output_kind, default_stem)
         result.html_path = local_html
         result.output_dir = local_html.parent
         pdf_path = local_html.with_suffix(".pdf")
+        if _is_cancelled(cancel_event):
+            return _cancelled_batch_result()
         _emit_progress(progress, 96, "Creating PDF")
         pdf_ok, pdf_msg = html_to_pdf(local_html, pdf_path)
+        if _is_cancelled(cancel_event):
+            return _cancelled_batch_result()
         if pdf_ok:
             result.pdf_path = pdf_path
             try:
@@ -1920,15 +2422,33 @@ def _night_shift_output_dir(html_path: Path, output_kind: str, default_stem: str
     return FBBATCH_OUTPUT_DIR / folder_name
 
 
-def _with_report_images(result: BatchResult, html_path: Path | None, output_kind: str, default_stem: str, progress: ProgressCallback | None = None) -> BatchResult:
+def _with_report_images(
+    result: BatchResult,
+    html_path: Path | None,
+    output_kind: str,
+    default_stem: str,
+    progress: ProgressCallback | None = None,
+    *,
+    cancel_event: threading.Event | None = None,
+) -> BatchResult:
+    if _is_cancelled(cancel_event):
+        return _cancelled_batch_result()
     if html_path and html_path.exists():
         _emit_progress(progress, 93, "Copying HTML output")
         local_html = _copy_to_project_output(html_path, output_kind, default_stem)
         result.html_path = local_html
         result.output_dir = local_html.parent
         images_dir = local_html.parent
+        if _is_cancelled(cancel_event):
+            return _cancelled_batch_result()
         _emit_progress(progress, 96, "Creating image segments")
-        image_paths, image_msg = report_html_to_segment_images(local_html, images_dir)
+        image_paths, image_msg = report_html_to_segment_images(
+            local_html,
+            images_dir,
+            cancel_event=cancel_event,
+        )
+        if _is_cancelled(cancel_event):
+            return _cancelled_batch_result()
         result.images_dir = images_dir
         result.image_paths = image_paths
         if result.ok and image_msg:
@@ -1969,7 +2489,14 @@ def _with_image(result: BatchResult, html_path: Path | None, default_stem: str) 
     return result
 
 
-def report_html_to_segment_images(html_path: Path, images_dir: Path) -> tuple[list[Path], str]:
+def report_html_to_segment_images(
+    html_path: Path,
+    images_dir: Path,
+    *,
+    cancel_event: threading.Event | None = None,
+) -> tuple[list[Path], str]:
+    if _is_cancelled(cancel_event):
+        return [], "Night Shift was cancelled."
     text = html_path.read_text(encoding="utf-8")
     segments = _build_report_segment_html(text)
     if not segments:
@@ -1981,6 +2508,8 @@ def report_html_to_segment_images(html_path: Path, images_dir: Path) -> tuple[li
     image_paths: list[Path] = []
     failures: list[str] = []
     for name, segment_html in segments:
+        if _is_cancelled(cancel_event):
+            return image_paths, "Night Shift was cancelled."
         segment_path = images_dir / f"{name}.html"
         image_path = images_dir / f"{name}.png"
         segment_path.write_text(segment_html, encoding="utf-8")
