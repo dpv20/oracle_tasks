@@ -6,7 +6,32 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from spools_cl_accounts.sqlcl import SqlclRunner, _thin_sqlcl_environment
+from spools_cl_accounts.sqlcl import (
+    SqlclRunner,
+    _force_jdbc_thin,
+    _thin_sqlcl_environment,
+)
+
+
+class SqlclThinConnectionTests(unittest.TestCase):
+    def test_tns_alias_is_forced_to_jdbc_thin(self):
+        self.assertEqual(
+            _force_jdbc_thin("user/password@DATABASE"),
+            "user/password@jdbc:oracle:thin:@DATABASE",
+        )
+
+    def test_proxy_and_at_sign_in_password_are_preserved(self):
+        self.assertEqual(
+            _force_jdbc_thin("proxy[schema]/pass@word@DATABASE"),
+            "proxy[schema]/pass@word@jdbc:oracle:thin:@DATABASE",
+        )
+
+    def test_existing_thin_url_is_not_changed(self):
+        connection = "user/password@jdbc:oracle:thin:@DATABASE"
+        self.assertEqual(_force_jdbc_thin(connection), connection)
+
+    def test_unrecognized_connection_is_left_unchanged(self):
+        self.assertEqual(_force_jdbc_thin("/nolog"), "/nolog")
 
 
 class SqlclEnvironmentTests(unittest.TestCase):
@@ -62,6 +87,28 @@ class SqlclEnvironmentTests(unittest.TestCase):
         child_env = run_mock.call_args.kwargs["env"]
         self.assertFalse(any(key.upper() == "ORACLE_HOME" for key in child_env))
         self.assertEqual(child_env["TNS_ADMIN"], r"C:\Oracle\network\admin")
+        self.assertEqual(
+            run_mock.call_args.args[0][3],
+            "user/password@jdbc:oracle:thin:@DATABASE",
+        )
+
+    @patch("spools_cl_accounts.sqlcl.subprocess.run")
+    def test_script_with_args_uses_explicit_jdbc_thin(self, run_mock):
+        run_mock.return_value.returncode = 0
+        run_mock.return_value.stdout = ""
+        run_mock.return_value.stderr = ""
+
+        result = SqlclRunner("sql.exe").run_script(
+            "user/password@DATABASE",
+            "extract.sql",
+            args=["123"],
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(
+            run_mock.call_args.args[0][3],
+            "user/password@jdbc:oracle:thin:@DATABASE",
+        )
 
 
 if __name__ == "__main__":

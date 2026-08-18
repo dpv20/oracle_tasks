@@ -1,7 +1,9 @@
 """SqlclRunner: thin wrapper around invoking `sql.exe`.
 
 `-S` silences the banner, `-L` makes login failures fail fast (no interactive
-password retry). `CREATE_NO_WINDOW` keeps the SQLcl console from flashing.
+password retry). Connections use an explicit JDBC Thin URL so a workstation's
+Oracle Client installation cannot make SQLcl select the OCI driver.
+`CREATE_NO_WINDOW` keeps the SQLcl console from flashing.
 """
 from __future__ import annotations
 
@@ -22,6 +24,23 @@ _SQLCL_CREATION_FLAGS = _CREATE_NO_WINDOW | _CREATE_NEW_PROCESS_GROUP
 _ES_CONTINUOUS = 0x80000000
 _ES_SYSTEM_REQUIRED = 0x00000001
 _ES_DISPLAY_REQUIRED = 0x00000002
+
+
+def _force_jdbc_thin(connection: str) -> str:
+    """Return a SQLcl connection string with an explicit JDBC Thin URL.
+
+    Credentials are already formatted as ``user[schema]/password@alias``.
+    Split on the last ``@`` so passwords containing that character remain
+    intact. SQLcl accepts TNS aliases and Easy Connect identifiers after
+    ``jdbc:oracle:thin:@``.
+    """
+    if "@jdbc:oracle:thin:@" in connection.lower():
+        return connection
+
+    credentials, separator, connect_identifier = connection.rpartition("@")
+    if not separator or not credentials or not connect_identifier:
+        return connection
+    return f"{credentials}@jdbc:oracle:thin:@{connect_identifier}"
 
 
 def _thin_sqlcl_environment() -> dict[str, str]:
@@ -98,8 +117,9 @@ class SqlclRunner:
     ) -> RunResult:
         """Run a one-off SQL statement and capture its output.
 
-        `connection` is what SQLcl expects after `-S`: `user[schema]/pass@DB`.
-        The SQL is fed via stdin to avoid quoting issues on Windows.
+        `connection` is `user[schema]/pass@DB`; it is converted to an explicit
+        JDBC Thin URL before SQLcl starts. The SQL is fed via stdin to avoid
+        quoting issues on Windows.
         """
         script = (
             "set heading off\n"
@@ -109,7 +129,7 @@ class SqlclRunner:
             "exit\n"
         )
         return self._invoke(
-            [self.exe, "-S", "-L", connection],
+            [self.exe, "-S", "-L", _force_jdbc_thin(connection)],
             stdin=script,
             timeout=timeout,
             cancel_event=cancel_event,
@@ -130,13 +150,19 @@ class SqlclRunner:
             except OSError as e:
                 return RunResult(127, "", f"SQL script not found: {script_path} ({e})")
             return self._invoke(
-                [self.exe, "-S", "-L", connection],
+                [self.exe, "-S", "-L", _force_jdbc_thin(connection)],
                 stdin=script_text,
                 timeout=timeout,
                 cancel_event=cancel_event,
             )
 
-        cmd: list[str] = [self.exe, "-S", "-L", connection, f"@{script_path}"]
+        cmd: list[str] = [
+            self.exe,
+            "-S",
+            "-L",
+            _force_jdbc_thin(connection),
+            f"@{script_path}",
+        ]
         if args:
             cmd.extend(args)
         return self._invoke(cmd, stdin=None, timeout=timeout, cancel_event=cancel_event)
