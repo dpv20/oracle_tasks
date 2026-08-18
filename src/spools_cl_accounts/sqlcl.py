@@ -24,6 +24,32 @@ _ES_SYSTEM_REQUIRED = 0x00000001
 _ES_DISPLAY_REQUIRED = 0x00000002
 
 
+def _thin_sqlcl_environment() -> dict[str, str]:
+    """Build an isolated environment that keeps SQLcl on JDBC Thin.
+
+    Recent SQLcl releases enable the native OCI/thick driver when
+    ``ORACLE_HOME`` is present. Workstations commonly still need a 19c Oracle
+    client for other tools, while current SQLcl requires a 23+ native client.
+    Preserve the Oracle home's network configuration when necessary, then
+    remove only ``ORACLE_HOME`` from the SQLcl child process.
+    """
+    env = os.environ.copy()
+    oracle_home = next(
+        (value for key, value in env.items() if key.upper() == "ORACLE_HOME"),
+        "",
+    )
+    has_tns_admin = any(key.upper() == "TNS_ADMIN" for key in env)
+    if oracle_home and not has_tns_admin:
+        network_admin = Path(oracle_home) / "network" / "admin"
+        if network_admin.is_dir():
+            env["TNS_ADMIN"] = str(network_admin)
+
+    for key in list(env):
+        if key.upper() == "ORACLE_HOME":
+            env.pop(key, None)
+    return env
+
+
 @contextmanager
 def _keep_windows_awake():
     """Ask Windows not to sleep or turn off the display while SQLcl is busy."""
@@ -124,6 +150,7 @@ class SqlclRunner:
     ) -> RunResult:
         if cancel_event is not None and cancel_event.is_set():
             return RunResult(130, "", "Cancelled")
+        child_env = _thin_sqlcl_environment()
         with _keep_windows_awake():
             if cancel_event is None:
                 try:
@@ -136,6 +163,7 @@ class SqlclRunner:
                         errors="replace",
                         timeout=timeout,
                         creationflags=_SQLCL_CREATION_FLAGS,
+                        env=child_env,
                     )
                 except FileNotFoundError as e:
                     log.error("SQLcl binary not found at %s: %s", self.exe, e)
@@ -155,6 +183,7 @@ class SqlclRunner:
                     encoding="utf-8",
                     errors="replace",
                     creationflags=_SQLCL_CREATION_FLAGS,
+                    env=child_env,
                 )
             except FileNotFoundError as e:
                 log.error("SQLcl binary not found at %s: %s", self.exe, e)
