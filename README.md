@@ -130,8 +130,13 @@ normally needed only for the first authorization or after access expires.
 
 VPN control is built directly into Oracle Tasks. The VPN tab and the system
 tray menu can connect Oracle/Cisco, Falabella/FortiClient, BICE/GlobalProtect,
-or disconnect every active VPN. Provider paths, sign-in accounts, encrypted
-passwords and FortiClient MFA flow are configured in the VPN settings tab.
+Banco de Chile/GlobalProtect, or disconnect every active VPN. Provider paths,
+sign-in accounts and encrypted passwords are configured in the VPN settings
+tab. Banco de Chile selects `bchmfa.bancochile.cl`, enters the DPAPI-protected
+password only when Microsoft requests it, and leaves MFA approval to the user
+in Microsoft Authenticator. Banco de Chile uses an isolated switcher module;
+the existing Oracle, Falabella, and BICE connection/disconnection paths keep
+their pre-existing behavior.
 
 The global **Start Oracle Tasks with Windows** option is available under
 Settings -> **General**. A lightweight background monitor keeps the visual VPN

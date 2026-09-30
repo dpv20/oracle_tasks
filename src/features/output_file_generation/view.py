@@ -35,7 +35,7 @@ _AUTO_INTERFACE_SEPARATOR = "----------------"
 _DEFAULT_AUTO_DETECT = False
 _DEFAULT_AUTO_DETECT_DATE = False
 _DEFAULT_DISCLAIMER_EXPANDED = False
-_PRIORITY_INTERFACE_LABELS = ("CHISALCA", "OFDOBIEL", "OFICOWCG")
+_PRIORITY_INTERFACE_CODES = ("CHISALCA", "IFDOBIEL", "IFICOWCG")
 _COUNTRY_LABELS = {
     "chile": "Chile",
     "peru": "Peru",
@@ -60,19 +60,23 @@ def _interface_options(
     """Return stable display labels mapped to canonical input codes."""
     options = [
         (
-            "CHISALCA" if spec.input_code == "CHISALCA" else spec.output_code,
+            (
+                f"{spec.output_code} ({spec.input_code})"
+                if spec.input_code == "CHISALCA"
+                else spec.output_code
+            ),
             spec.input_code,
         )
         for spec in specs
     ]
     priority = {
-        label: position
-        for position, label in enumerate(_PRIORITY_INTERFACE_LABELS)
+        input_code: position
+        for position, input_code in enumerate(_PRIORITY_INTERFACE_CODES)
     }
     ordered = sorted(
         options,
         key=lambda option: (
-            priority.get(option[0], len(priority)),
+            priority.get(option[1], len(priority)),
             option[0],
             option[1],
         ),
@@ -83,15 +87,30 @@ def _interface_options(
     return tuple(ordered)
 
 
+def _interface_label_aliases(value: str) -> tuple[str, ...]:
+    """Return searchable interface codes embedded in a display label."""
+    return tuple(
+        dict.fromkeys(
+            token.casefold()
+            for token in re.findall(r"[A-Z0-9_$#]+", str(value or "").upper())
+            if token
+        )
+    )
+
+
 def _filtered_interface_values(
     values: tuple[str, ...],
     query: str,
 ) -> tuple[str, ...]:
-    """Filter interface labels by a case-insensitive typed prefix."""
+    """Filter interface labels by any case-insensitive code prefix."""
     prefix = str(query or "").strip().casefold()
     if not prefix:
         return values
-    return tuple(value for value in values if value.casefold().startswith(prefix))
+    return tuple(
+        value
+        for value in values
+        if any(alias.startswith(prefix) for alias in _interface_label_aliases(value))
+    )
 
 
 class _SearchableComboBox(ctk.CTkFrame):
@@ -684,14 +703,13 @@ class OutputFileGenerationView(ctk.CTkFrame):
         needle = str(value or "").strip().casefold()
         if not needle:
             return None
-        return next(
-            (
-                label
-                for label in self._interface_values
-                if label.casefold() == needle
-            ),
-            None,
+        matches = tuple(
+            label
+            for label in self._interface_values
+            if label.casefold() == needle
+            or needle in _interface_label_aliases(label)
         )
+        return matches[0] if len(matches) == 1 else None
 
     def _on_interface_selected(self, value: str) -> None:
         if bool(self.auto_detect_var.get()):

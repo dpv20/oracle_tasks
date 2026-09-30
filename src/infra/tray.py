@@ -23,6 +23,7 @@ class TrayController:
         labels: dict[str, str] | None = None,
         show_forti: Callable[[], bool] | None = None,
         show_bice: Callable[[], bool] | None = None,
+        show_bancochile: Callable[[], bool] | None = None,
     ) -> None:
         self._on_open = on_open
         self._on_exit = on_exit
@@ -33,6 +34,7 @@ class TrayController:
         self._labels = labels or {}
         self._show_forti = show_forti or (lambda: True)
         self._show_bice = show_bice or (lambda: True)
+        self._show_bancochile = show_bancochile or (lambda: True)
         self._icon = None
         self._base_image = None
         self._status = "disconnected"
@@ -67,6 +69,13 @@ class TrayController:
                         self._labels.get("globalprotect", "BICE VPN (GlobalProtect)"),
                         lambda _icon=None, _item=None: self._vpn("globalprotect"),
                         visible=lambda _item: self._show_bice(),
+                    ),
+                    pystray.MenuItem(
+                        self._labels.get(
+                            "bancochile", "Banco de Chile VPN (GlobalProtect)"
+                        ),
+                        lambda _icon=None, _item=None: self._vpn("bancochile"),
+                        visible=lambda _item: self._show_bancochile(),
                     ),
                     pystray.MenuItem(
                         self._labels.get("disconnected", "No VPN"),
@@ -128,6 +137,8 @@ class TrayController:
             "cisco": "#cf3f32",
             "forti": "#16a34a",
             "globalprotect": "#2563eb",
+            "bancochile": "#0f766e",
+            "globalprotect_unknown": "#2563eb",
             "disconnected": "#64748b",
         }
         draw = ImageDraw.Draw(image)

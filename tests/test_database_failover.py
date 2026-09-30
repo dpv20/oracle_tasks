@@ -8,7 +8,7 @@ from pathlib import Path
 SRC_DIR = Path(__file__).resolve().parents[1] / "src"
 sys.path.insert(0, str(SRC_DIR))
 
-from settings.config import ConfigManager  # noqa: E402
+from settings.config import DEFAULTS, ConfigManager  # noqa: E402
 from settings.database_failover import (  # noqa: E402
     DATABASE_FAILOVER_PAIRS,
     DEFAULT_DATABASE_FAILOVER,
@@ -315,7 +315,7 @@ class ConfigMigrationTests(unittest.TestCase):
             merged["fbbatch_preferred_databases"],
             DEFAULT_DATABASE_PREFERENCES,
         )
-        self.assertEqual(merged["version"], 10)
+        self.assertEqual(merged["version"], DEFAULTS["version"])
 
 
 if __name__ == "__main__":

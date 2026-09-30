@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 
@@ -90,6 +91,61 @@ class TrayControllerTests(unittest.TestCase):
         tray._vpn("forti")
 
         self.assertEqual(actions, ["settings", "forti"])
+
+    def test_bancochile_menu_item_has_independent_visibility_and_target(self) -> None:
+        actions: list[str] = []
+        is_visible = [False]
+
+        class _MenuItem:
+            def __init__(self, text, action, **options) -> None:
+                self.text = text
+                self.action = action
+                self.visible = options.get("visible")
+
+        class _Menu:
+            SEPARATOR = object()
+
+            def __init__(self, *items) -> None:
+                self.items = items
+
+        class _Icon:
+            def __init__(self, _name, _image, _title, menu) -> None:
+                self.menu = menu
+
+            def run_detached(self) -> None:
+                pass
+
+        pystray = SimpleNamespace(MenuItem=_MenuItem, Menu=_Menu, Icon=_Icon)
+        tray = TrayController(
+            on_open=lambda: None,
+            on_exit=lambda: None,
+            open_label="Open",
+            exit_label="Exit",
+            on_vpn=actions.append,
+            labels={"bancochile": "Banco de Chile VPN"},
+            show_bancochile=lambda: is_visible[0],
+        )
+
+        with (
+            patch.dict(sys.modules, {"pystray": pystray}),
+            patch("PIL.Image.open") as open_image,
+            patch.object(TrayController, "_render_icon", return_value=object()),
+        ):
+            open_image.return_value.convert.return_value = object()
+            self.assertTrue(tray.start())
+
+        item = next(
+            candidate
+            for candidate in tray._icon.menu.items
+            if getattr(candidate, "text", None) == "Banco de Chile VPN"
+        )
+        self.assertFalse(item.visible(None))
+        is_visible[0] = True
+        self.assertTrue(item.visible(None))
+
+        item.action(None, None)
+
+        self.assertEqual(actions, ["bancochile"])
 
 
 if __name__ == "__main__":

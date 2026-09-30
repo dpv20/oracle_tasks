@@ -72,13 +72,17 @@ class OutputFileGenerationViewTests(unittest.TestCase):
         view.db_var = _FakeVar("—")
         view.db_menu = Mock()
         view._interface_lookup = {
-            "CHISALCA": "CHISALCA",
+            "CHISALOU (CHISALCA)": "CHISALCA",
             "OFDOBIEL": "IFDOBIEL",
             "OFICOWCG": "IFICOWCG",
         }
-        view._interface_values = ("CHISALCA", "OFDOBIEL", "OFICOWCG")
-        view._last_manual_interface = "CHISALCA"
-        view.interface_var = _FakeVar("CHISALCA")
+        view._interface_values = (
+            "CHISALOU (CHISALCA)",
+            "OFDOBIEL",
+            "OFICOWCG",
+        )
+        view._last_manual_interface = "CHISALOU (CHISALCA)"
+        view.interface_var = _FakeVar("CHISALOU (CHISALCA)")
         view.interface_menu = Mock()
         view.auto_detect_var = _FakeVar(False)
         view.auto_detect_checkbox = Mock()
@@ -104,9 +108,14 @@ class OutputFileGenerationViewTests(unittest.TestCase):
         labels = [label for label, _input_code in options]
         input_codes = [input_code for _label, input_code in options]
 
-        self.assertEqual(labels[:3], ["CHISALCA", "OFDOBIEL", "OFICOWCG"])
+        self.assertEqual(
+            labels[:3],
+            ["CHISALOU (CHISALCA)", "OFDOBIEL", "OFICOWCG"],
+        )
         self.assertEqual(len(labels), len(set(labels)))
         self.assertEqual(set(input_codes), {spec.input_code for spec in specs})
+        self.assertEqual(dict(options)["CHISALOU (CHISALCA)"], "CHISALCA")
+        self.assertEqual(dict(options)["CHICLOU"], "CHICLUPD")
         self.assertFalse(_DEFAULT_AUTO_DETECT)
 
     def test_auto_detection_toggle_shows_separator_and_restores_manual_choice(self) -> None:
@@ -129,7 +138,7 @@ class OutputFileGenerationViewTests(unittest.TestCase):
 
         self.assertEqual(view.interface_var.get(), "OFDOBIEL")
         view.interface_menu.configure.assert_called_with(
-            values=["CHISALCA", "OFDOBIEL", "OFICOWCG"],
+            values=["CHISALOU (CHISALCA)", "OFDOBIEL", "OFICOWCG"],
             state="normal",
         )
 
@@ -144,7 +153,7 @@ class OutputFileGenerationViewTests(unittest.TestCase):
         self.assertEqual(
             _filtered_interface_values(values, "c"),
             (
-                "CHISALCA",
+                "CHISALOU (CHISALCA)",
                 "CHBOOKOU",
                 "CHICLOU",
                 "CLADCHGO",
@@ -159,7 +168,15 @@ class OutputFileGenerationViewTests(unittest.TestCase):
         )
         self.assertEqual(
             _filtered_interface_values(values, "cHi"),
-            ("CHISALCA", "CHICLOU"),
+            ("CHISALOU (CHISALCA)", "CHICLOU"),
+        )
+        self.assertEqual(
+            _filtered_interface_values(values, "cHiSaLcA"),
+            ("CHISALOU (CHISALCA)",),
+        )
+        self.assertEqual(
+            _filtered_interface_values(values, "cHiSaLoU"),
+            ("CHISALOU (CHISALCA)",),
         )
         outputs = _filtered_interface_values(values, "O")
         self.assertEqual(outputs[:2], ("OFDOBIEL", "OFICOWCG"))
@@ -169,7 +186,11 @@ class OutputFileGenerationViewTests(unittest.TestCase):
 
     def test_typing_filters_without_posting_a_blocking_dropdown(self) -> None:
         view = self._bare_view()
-        view._interface_values = ("CHISALCA", "CHICLOU", "OFDOBIEL")
+        view._interface_values = (
+            "CHISALOU (CHISALCA)",
+            "CHICLOU",
+            "OFDOBIEL",
+        )
         view._show_interface_suggestions = Mock()
         view._hide_interface_suggestions = Mock()
         native_dropdown = view.interface_menu._dropdown_menu
@@ -178,11 +199,15 @@ class OutputFileGenerationViewTests(unittest.TestCase):
             "features.output_file_generation.view.messagebox"
         ) as modal_dialogs:
             for typed, keysym, expected in (
-                ("c", "c", ["CHISALCA", "CHICLOU"]),
-                ("ch", "h", ["CHISALCA", "CHICLOU"]),
-                ("chi", "i", ["CHISALCA", "CHICLOU"]),
-                ("ch", "BackSpace", ["CHISALCA", "CHICLOU"]),
-                ("", "BackSpace", ["CHISALCA", "CHICLOU", "OFDOBIEL"]),
+                ("c", "c", ["CHISALOU (CHISALCA)", "CHICLOU"]),
+                ("ch", "h", ["CHISALOU (CHISALCA)", "CHICLOU"]),
+                ("chi", "i", ["CHISALOU (CHISALCA)", "CHICLOU"]),
+                ("ch", "BackSpace", ["CHISALOU (CHISALCA)", "CHICLOU"]),
+                (
+                    "",
+                    "BackSpace",
+                    ["CHISALOU (CHISALCA)", "CHICLOU", "OFDOBIEL"],
+                ),
             ):
                 with self.subTest(typed=typed, keysym=keysym):
                     view.interface_var.set(typed)
@@ -214,7 +239,7 @@ class OutputFileGenerationViewTests(unittest.TestCase):
 
     def test_interface_suggestions_delegate_to_the_inline_selector(self) -> None:
         view = self._bare_view()
-        values = ("CHISALCA", "CHICLOU")
+        values = ("CHISALOU (CHISALCA)", "CHICLOU")
 
         view._show_interface_suggestions(values)
         view.interface_menu.show_suggestions.assert_called_once_with(values)
@@ -224,7 +249,11 @@ class OutputFileGenerationViewTests(unittest.TestCase):
 
     def test_interface_filter_hides_inline_suggestions_when_nothing_matches(self) -> None:
         view = self._bare_view()
-        view._interface_values = ("CHISALCA", "OFDOBIEL", "OFICOWCG")
+        view._interface_values = (
+            "CHISALOU (CHISALCA)",
+            "OFDOBIEL",
+            "OFICOWCG",
+        )
         view._show_interface_suggestions = Mock()
         view._hide_interface_suggestions = Mock()
         view.interface_var.set("zzz")
@@ -257,12 +286,57 @@ class OutputFileGenerationViewTests(unittest.TestCase):
         view = self._bare_view()
 
         self.assertEqual(view._matching_interface_label(" ofdobiel "), "OFDOBIEL")
+        self.assertEqual(
+            view._matching_interface_label(" chisalou "),
+            "CHISALOU (CHISALCA)",
+        )
+        self.assertEqual(
+            view._matching_interface_label(" cHiSaLcA "),
+            "CHISALOU (CHISALCA)",
+        )
         self.assertIsNone(view._matching_interface_label("ofd"))
 
         view.interface_var.set("ofdob")
         self.assertEqual(view._on_interface_return(), "break")
         self.assertEqual(view.interface_var.get(), "OFDOBIEL")
         self.assertEqual(view._last_manual_interface, "OFDOBIEL")
+
+        for typed in ("CHISALOU", "chisalca"):
+            with self.subTest(typed=typed):
+                view.interface_var.set(typed)
+                self.assertEqual(view._on_interface_return(), "break")
+                self.assertEqual(
+                    view.interface_var.get(),
+                    "CHISALOU (CHISALCA)",
+                )
+                self.assertEqual(
+                    view._interface_lookup[view.interface_var.get()],
+                    "CHISALCA",
+                )
+
+    def test_chisalou_selection_keeps_chiclou_as_a_separate_interface(self) -> None:
+        for selected in (
+            "CHISALOU (CHISALCA)",
+            "CHISALOU",
+            "CHISALCA",
+        ):
+            with self.subTest(selected=selected):
+                view = self._bare_view()
+                view._interface_lookup["CHICLOU"] = "CHICLUPD"
+                view._interface_values = (*view._interface_values, "CHICLOU")
+                view._hide_interface_suggestions = Mock()
+
+                view._on_interface_selected(selected)
+
+                self.assertEqual(
+                    view.interface_var.get(),
+                    "CHISALOU (CHISALCA)",
+                )
+                self.assertEqual(
+                    view._interface_lookup[view.interface_var.get()],
+                    "CHISALCA",
+                )
+                self.assertEqual(view._interface_lookup["CHICLOU"], "CHICLUPD")
 
     def test_date_auto_detection_defaults_to_unchecked_with_manual_calendar_visible(self) -> None:
         view = self._bare_view()
@@ -693,6 +767,38 @@ class OutputFileGenerationViewTests(unittest.TestCase):
         self.assertTrue(request.overwrite)
         self.assertIs(cancel_event, view._cancel_event)
         thread_class.return_value.start.assert_called_once_with()
+
+    def test_start_sends_canonical_chisalca_for_input_or_output_alias(self) -> None:
+        for typed in ("CHISALOU", "chisalca"):
+            with self.subTest(typed=typed):
+                view = self._bare_view()
+                database = _target("chile", tns="FXBFCL_19C_PROD_OCI")
+                view._db_lookup = {"selected": database}
+                view.db_var.set("selected")
+                view._running = False
+                view.process_ref_entry = Mock()
+                view.process_ref_entry.get.return_value = "5350740"
+                view.interface_var.set(typed)
+                view.auto_detect_date_var.set(True)
+                view._set_controls_running = Mock()
+                view._set_preview = Mock()
+                view.progress = Mock()
+                view.after = Mock()
+                view._worker = Mock()
+
+                with patch(
+                    "features.output_file_generation.view.threading.Thread"
+                ) as thread_class:
+                    view._start()
+
+                request, _cancel_event = thread_class.call_args.kwargs["args"]
+                self.assertEqual(request.process_ref_no, "5350740")
+                self.assertEqual(request.interface_code, "CHISALCA")
+                self.assertEqual(
+                    view.interface_var.get(),
+                    "CHISALOU (CHISALCA)",
+                )
+                thread_class.return_value.start.assert_called_once_with()
 
     def test_start_uses_none_when_automatic_interface_detection_is_enabled(self) -> None:
         view = self._bare_view()

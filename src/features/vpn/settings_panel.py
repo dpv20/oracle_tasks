@@ -12,8 +12,18 @@ from paths import LOG_FILE
 from settings.config import decrypt_password, encrypt_password
 from ui.widgets import IconButton
 
+from .settings_bancodechile import BancoChileSettingsSection
+
 
 class VPNSettingsPanel(ctk.CTkFrame):
+    _TAB_KEYS = (
+        "settings.vpn.oracle",
+        "settings.vpn.falabella",
+        "settings.vpn.bice",
+        "settings.vpn.bancochile",
+        "settings.vpn.diagnostics",
+    )
+
     def __init__(self, master, app, on_saved=None) -> None:
         super().__init__(master, fg_color="transparent")
         self.app = app
@@ -21,16 +31,29 @@ class VPNSettingsPanel(ctk.CTkFrame):
 
         tabs = ctk.CTkTabview(self)
         tabs.pack(fill="both", expand=True, padx=8, pady=(8, 4))
-        oracle_name = t("settings.vpn.oracle")
-        falabella_name = t("settings.vpn.falabella")
-        bice_name = t("settings.vpn.bice")
-        diagnostics_name = t("settings.vpn.diagnostics")
-        for name in (oracle_name, falabella_name, bice_name, diagnostics_name):
+        self.tabs = tabs
+        (
+            oracle_name,
+            falabella_name,
+            bice_name,
+            bancochile_name,
+            diagnostics_name,
+        ) = self._tab_names()
+        self._profile_tabs = {"bancochile": bancochile_name}
+        for name in (
+            oracle_name,
+            falabella_name,
+            bice_name,
+            bancochile_name,
+            diagnostics_name,
+        ):
             tabs.add(name)
 
         self._build_oracle(tabs.tab(oracle_name))
         self._build_falabella(tabs.tab(falabella_name))
         self._build_bice(tabs.tab(bice_name))
+        self._bancochile_settings = BancoChileSettingsSection(app)
+        self._bancochile_settings.build(tabs.tab(bancochile_name), self._entry)
         self._build_diagnostics(tabs.tab(diagnostics_name))
 
         IconButton(
@@ -38,6 +61,16 @@ class VPNSettingsPanel(ctk.CTkFrame):
             text=t("settings.vpn.save"),
             command=self._save,
         ).pack(anchor="e", padx=12, pady=(4, 10))
+
+    @classmethod
+    def _tab_names(cls) -> tuple[str, ...]:
+        return tuple(t(key) for key in cls._TAB_KEYS)
+
+    def show_profile(self, target: str) -> None:
+        """Select the credential tab associated with a GlobalProtect profile."""
+        tab_name = self._profile_tabs.get(target)
+        if tab_name:
+            self.tabs.set(tab_name)
 
     @staticmethod
     def _entry(parent, row: int, label: str, value: str = "", *, secret=False):
@@ -278,6 +311,7 @@ class VPNSettingsPanel(ctk.CTkFrame):
             "gp_exe_path": self.gp_exe.get().strip(),
             "vpn_show_bice": bool(self.show_bice.get()),
         })
+        self._bancochile_settings.save()
         if callable(self.on_saved):
             self.on_saved()
         messagebox.showinfo(

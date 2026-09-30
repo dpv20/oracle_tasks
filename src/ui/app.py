@@ -21,6 +21,12 @@ from infra.updater import check_for_update, launch_update
 from paths import ASSETS_DIR, REPO_ROOT, SHOW_FLAG_PATH
 from version import __version__
 from features.vpn.service import VPNService
+from features.vpn.coordinator_bancodechile import (
+    BANCOCHILE,
+    BancoChileVPNCoordinator,
+)
+from features.vpn.action_arbiter_bancodechile import BancoChileActionArbiter
+from features.vpn.config_bancodechile import ensure_bancochile_profile
 from features.output_file_generation.view import OutputFileGenerationView
 
 from .home_view import HomeView
@@ -137,9 +143,20 @@ class OracleTasksApp:
         self._start_hidden = start_hidden
         self._background_requests: SimpleQueue[object] = SimpleQueue()
         self._shutting_down = False
+        self._bancochile_action_arbiter = BancoChileActionArbiter()
+        self._vpn_result_revision_lock = threading.Lock()
+        self._vpn_result_revision = 0
         self.config = ConfigManager()
+        ensure_bancochile_profile(self.config)
         sync_startup_registration(bool(self.config.get("start_with_windows", True)))
+        # Keep the original service as the only owner of Oracle, Falabella and
+        # BICE. Banco de Chile is an independent service used only for
+        # transitions that explicitly enter or leave Banco.
         self.vpn_service = VPNService(self.config)
+        self.bancochile_vpn_service = BancoChileVPNCoordinator(
+            self.config,
+            legacy_service=self.vpn_service,
+        )
 
         # Apply persisted language + theme BEFORE creating widgets
         set_language(self.config.get("language", "en"))
@@ -280,18 +297,21 @@ class OracleTasksApp:
                 "cisco": t("tray.oracle_vpn"),
                 "forti": t("tray.falabella_vpn"),
                 "globalprotect": t("tray.bice_vpn"),
+                "bancochile": t("tray.bancochile_vpn"),
+                "globalprotect_unknown": t("tray.unknown_gp_vpn"),
                 "disconnected": t("tray.no_vpn"),
             },
             show_forti=lambda: bool(self.config.get("vpn_show_forti", True)),
             show_bice=lambda: bool(self.config.get("vpn_show_bice", False)),
+            show_bancochile=lambda: bool(
+                self.config.get("vpn_show_bancochile", True)
+            ),
         )
         tray_started = self._tray.start()
         if start_hidden and not tray_started:
             self.root.after(0, self._show_window)
         self.root.after(250, self._poll_background_requests)
-        self.vpn_service.start_monitor(
-            lambda status: self._background_requests.put(("vpn_status", status))
-        )
+        self.vpn_service.start_monitor(self._queue_legacy_vpn_status)
 
     # ── sidebar helpers ──
     def _update_sidebar_labels(self) -> None:
@@ -549,11 +569,14 @@ class OracleTasksApp:
                     if self._shutting_down:
                         return
                 elif isinstance(action, tuple) and action[0] == "vpn":
-                    self._start_vpn_action(str(action[1]))
+                    self._dispatch_vpn_action(str(action[1]))
                 elif isinstance(action, tuple) and action[0] == "vpn_result":
-                    self._finish_vpn_action(action[1])
+                    if len(action) >= 3:
+                        self._finish_vpn_action_snapshot(action[1], int(action[2]))
+                    else:
+                        self._finish_vpn_action(action[1])
                 elif isinstance(action, tuple) and action[0] == "vpn_status":
-                    self._apply_vpn_status(str(action[1]))
+                    self._apply_vpn_status_snapshot(str(action[1]), int(action[2]))
         except Empty:
             pass
 
@@ -575,6 +598,111 @@ class OracleTasksApp:
             self._background_requests.put(("vpn_result", result))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _dispatch_vpn_action(self, target: str) -> None:
+        """Keep the Git legacy tray entrypoint; route only Banco transitions."""
+        bank_service = self.bancochile_vpn_service
+        if target == BANCOCHILE or bank_service.owns_bancochile:
+            self._start_bancochile_vpn_action(target)
+            return
+        self._start_legacy_vpn_action_beside_bancochile(target)
+
+    def _start_legacy_vpn_action_beside_bancochile(self, target: str) -> None:
+        """Use the original service while excluding only an active Banco flow."""
+        if self.vpn_service.busy or not self._try_begin_legacy_vpn_action():
+            return
+        result_revision = self._advance_vpn_result_revision()
+
+        def worker() -> None:
+            try:
+                result = self.vpn_service.switch_to(target)
+                self._background_requests.put(
+                    ("vpn_result", result, result_revision)
+                )
+            finally:
+                self._finish_legacy_vpn_action()
+
+        try:
+            threading.Thread(target=worker, daemon=True).start()
+        except Exception:
+            self._finish_legacy_vpn_action()
+            raise
+
+    def _start_bancochile_vpn_action(self, target: str) -> None:
+        """Run a tray transition that explicitly enters or leaves Banco."""
+        bank_service = self.bancochile_vpn_service
+        if self._has_running_work() or not self._try_begin_vpn_action():
+            return
+
+        operation_token = bank_service.prepare_bancochile_operation()
+        if operation_token is None:
+            self._finish_vpn_action_gate()
+            return
+        result_revision = self._advance_vpn_result_revision()
+
+        def worker() -> None:
+            try:
+                result = bank_service.switch_to(
+                    target,
+                    operation_token=operation_token,
+                )
+                self._background_requests.put(
+                    ("vpn_result", result, result_revision)
+                )
+            finally:
+                self._finish_vpn_action_gate()
+
+        try:
+            threading.Thread(target=worker, daemon=True).start()
+        except Exception:
+            bank_service.abandon_prepared_operation(operation_token)
+            self._finish_vpn_action_gate()
+            raise
+
+    def _try_begin_vpn_action(self) -> bool:
+        """Reserve a Banco transition against legacy work."""
+        return self._bancochile_action_arbiter.begin_bancochile()
+
+    def _finish_vpn_action_gate(self) -> None:
+        self._bancochile_action_arbiter.finish_bancochile()
+
+    def _vpn_action_in_progress(self) -> bool:
+        return self._bancochile_action_arbiter.bancochile_active
+
+    def _try_begin_legacy_vpn_action(self) -> bool:
+        return self._bancochile_action_arbiter.begin_legacy()
+
+    def _finish_legacy_vpn_action(self) -> None:
+        self._bancochile_action_arbiter.finish_legacy()
+
+    def _advance_vpn_result_revision(self) -> int:
+        """Invalidate results from every VPN action started earlier."""
+        with self._vpn_result_revision_lock:
+            self._vpn_result_revision += 1
+            return self._vpn_result_revision
+
+    def _is_vpn_result_revision_current(self, revision: int) -> bool:
+        with self._vpn_result_revision_lock:
+            return revision == self._vpn_result_revision
+
+    def _queue_legacy_vpn_status(self, status: str) -> None:
+        """Forward legacy monitoring without probing Banco in the background."""
+        revision, visible_status = (
+            self.bancochile_vpn_service.visible_status_snapshot(status)
+        )
+        self._background_requests.put(("vpn_status", visible_status, revision))
+
+    def _apply_vpn_status_snapshot(self, status: str, revision: int) -> None:
+        """Drop a monitor sample captured before a Banco ownership transition."""
+        if not self.bancochile_vpn_service.is_status_snapshot_current(revision):
+            return
+        self._apply_vpn_status(status)
+
+    def _finish_vpn_action_snapshot(self, result, revision: int) -> None:
+        """Ignore a tray result superseded by a newer VPN action."""
+        if not self._is_vpn_result_revision_current(revision):
+            return
+        self._finish_vpn_action(result)
 
     def show_vpn_settings(self) -> None:
         if self._has_running_work():
