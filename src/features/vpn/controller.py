@@ -1202,7 +1202,7 @@ def _get_adapter_status(log_matches: bool = False) -> dict:
     """Use PowerShell Get-NetAdapter to check adapter states.
     Returns dict like {'cisco': 'Up', 'forti': 'Disabled', ...}
     """
-    result = {}
+    result = {"_probe_ok": False}
     log = get_logger()
     try:
         rc, out, err = _run(
@@ -1211,6 +1211,10 @@ def _get_adapter_status(log_matches: bool = False) -> dict:
              "Format-List"],
             timeout=10,
         )
+        if rc != 0:
+            log.warning("adapter_status: Get-NetAdapter failed rc=%s err=%r", rc, err)
+        else:
+            result["_probe_ok"] = True
         current_name = ""
         current_desc = ""
         for line in out.splitlines():
@@ -1759,6 +1763,25 @@ class VPNController:
         if self._forti_connected(adapters):
             return FORTI
         if self._gp_connected(adapters):
+            return GPROT
+        return NONE
+
+    def get_monitor_status(self) -> str | None:
+        """Read status for the shared background monitor without desktop UIA.
+
+        Connect/disconnect operations continue to use :meth:`get_status`, whose
+        GlobalProtect UI fallback is useful while a transition is in progress.
+        The periodic monitor only needs the authoritative tunnel adapter and
+        must never stall the other VPN status checks behind a WebView2/UIA scan.
+        """
+        if self._cisco_connected():
+            return CISCO
+        adapters = _get_adapter_status()
+        if not adapters.get("_probe_ok", True):
+            return None
+        if self._forti_connected(adapters):
+            return FORTI
+        if (adapters.get("globalprotect") or "").strip().casefold() == "up":
             return GPROT
         return NONE
 

@@ -19,6 +19,10 @@ def ensure_bancochile_profile(config: Any) -> None:
         values["bancochile_portal_url"] = _PORTAL
     if config.get("bancochile_gp_exe_path", _MISSING) is _MISSING:
         values["bancochile_gp_exe_path"] = ""
+    if config.get("bancochile_flow_mode", _MISSING) is _MISSING:
+        values["bancochile_flow_mode"] = "detect"
+    if config.get("bancochile_flow_steps", _MISSING) is _MISSING:
+        values["bancochile_flow_steps"] = ["account", "password", "mfa"]
     if config.get("vpn_show_bancochile", _MISSING) is _MISSING:
         values["vpn_show_bancochile"] = True
 

@@ -39,6 +39,16 @@ GP_NOTIFICATION_TITLE_PREFIX = "GlobalProtect Notification"
 
 GP_CLASS = "#32770"
 
+GP_TASKBAR_CLASS = "Shell_TrayWnd"
+
+GP_TRAY_OVERFLOW_CLASS = "TopLevelWindowForOverflowXamlIsland"
+
+GP_TRAY_ITEM_AUTOID = "NotifyItemIcon"
+
+GP_TRAY_ITEM_CLASS = "SystemTray.NormalButton"
+
+GP_SHOW_HIDDEN_AUTOID = "SystemTrayIcon"
+
 GP_BTN_CONNECT_AUTOID = "1160"
 
 GP_STATUS_AUTOID = "1165"
@@ -62,6 +72,15 @@ GP_ADAPTER_DISCONNECTED_STATES = frozenset(
         "lowerlayerdown",
     }
 )
+
+GP_ADAPTER_PROBE_TIMEOUT_SECONDS = 3
+GP_ADAPTER_CACHE_SECONDS = 0.75
+GP_CONNECTED_ADAPTER_GRACE_SECONDS = 15.0
+GP_POST_DISCONNECT_COOLDOWN_SECONDS = 4.0
+GP_DISCONNECT_VERIFY_TIMEOUT_SECONDS = 20.0
+
+_gp_adapter_cache_lock = threading.Lock()
+_gp_adapter_cache: tuple[float, bool, str] = (0.0, False, "")
 
 NO_WINDOW = subprocess.CREATE_NO_WINDOW
 
@@ -135,7 +154,7 @@ def _force_foreground(hwnd) -> bool:
     fg_thread = user32.GetWindowThreadProcessId(fg_hwnd, None)
     our_thread = user32.GetWindowThreadProcessId(hwnd, None)
 
-    # Attach our thread input to the foreground thread � this lets us steal focus
+    # Attach our thread input to the foreground thread — this lets us steal focus
     if fg_thread != our_thread:
         user32.AttachThreadInput(fg_thread, our_thread, True)
 
@@ -149,19 +168,27 @@ def _force_foreground(hwnd) -> bool:
 
     return True
 
-def _get_adapter_status(log_matches: bool = False) -> dict:
+def _get_adapter_status(
+    log_matches: bool = False,
+    *,
+    timeout: float = GP_ADAPTER_PROBE_TIMEOUT_SECONDS,
+) -> dict:
     """Use PowerShell Get-NetAdapter to check adapter states.
     Returns dict like {'cisco': 'Up', 'forti': 'Disabled', ...}
     """
-    result = {}
+    result = {"_probe_ok": False}
     log = get_logger()
     try:
         rc, out, err = _run(
             ["powershell.exe", "-NoProfile", "-Command",
              "Get-NetAdapter | Select-Object Name, InterfaceDescription, Status | "
              "Format-List"],
-            timeout=10,
+            timeout=max(0.1, float(timeout)),
         )
+        if rc != 0:
+            log.warning("adapter_status: Get-NetAdapter failed rc=%s err=%r", rc, err)
+            return result
+        result["_probe_ok"] = True
         current_name = ""
         current_desc = ""
         for line in out.splitlines():
@@ -195,10 +222,48 @@ def _get_adapter_status(log_matches: bool = False) -> dict:
 
 def _gp_adapter_status() -> str:
     """Return the best GlobalProtect adapter status seen by Get-NetAdapter."""
+    _ok, status = _gp_adapter_status_sample()
+    return status
+
+
+def _gp_adapter_status_sample(
+    *,
+    max_age: float = GP_ADAPTER_CACHE_SECONDS,
+    probe_timeout: float | None = None,
+) -> tuple[bool, str]:
+    """Return a cached tri-state adapter sample: probe success plus GP state."""
+    global _gp_adapter_cache
+    probe_started_at = time.monotonic()
+    with _gp_adapter_cache_lock:
+        sampled_at, probe_ok, status = _gp_adapter_cache
+        if (
+            sampled_at
+            and probe_started_at - sampled_at <= max(0.0, max_age)
+        ):
+            return probe_ok, status
+
+    # Do not hold the cache lock while PowerShell runs. A background status
+    # refresh may already be probing; serializing both external commands would
+    # let an action exceed its own disconnect deadline before its bounded probe
+    # even starts.
     try:
-        return (_get_adapter_status().get("globalprotect") or "").strip()
+        adapters = (
+            _get_adapter_status()
+            if probe_timeout is None
+            else _get_adapter_status(timeout=probe_timeout)
+        )
+        probe_ok = bool(adapters.get("_probe_ok", True))
+        status = (adapters.get("globalprotect") or "").strip()
     except Exception:
-        return ""
+        probe_ok = False
+        status = ""
+    sampled_at = time.monotonic()
+    with _gp_adapter_cache_lock:
+        cached_at, cached_ok, cached_status = _gp_adapter_cache
+        if cached_at > probe_started_at:
+            return cached_ok, cached_status
+        _gp_adapter_cache = (sampled_at, probe_ok, status)
+    return probe_ok, status
 
 def _gp_diagnostics():
     """Verbose dump of every GlobalProtect-related process and window for
@@ -276,6 +341,43 @@ def _gp_diagnostics():
     except Exception as e:
         log.warning(f"gp_diag: adapter probe failed: {e}")
 
+def _gp_find_main_hwnds() -> list[int]:
+    """List exact GlobalProtect main-window handles without global UIA scans."""
+    try:
+        import ctypes
+        import ctypes.wintypes
+
+        user32 = ctypes.windll.user32
+        found: list[tuple[int, bool]] = []
+        WNDENUMPROC = ctypes.WINFUNCTYPE(
+            ctypes.c_bool,
+            ctypes.wintypes.HWND,
+            ctypes.wintypes.LPARAM,
+        )
+
+        def _enum(hwnd, _):
+            length = user32.GetWindowTextLengthW(hwnd)
+            if length:
+                title = ctypes.create_unicode_buffer(length + 1)
+                class_name = ctypes.create_unicode_buffer(256)
+                user32.GetWindowTextW(hwnd, title, length + 1)
+                user32.GetClassNameW(hwnd, class_name, 256)
+                handle = _gp_hwnd_value(hwnd)
+                if (
+                    title.value == GP_TITLE
+                    and class_name.value == GP_CLASS
+                    and _gp_is_exact_pangpa_window(handle, GP_TITLE)
+                ):
+                    found.append((handle, bool(user32.IsWindowVisible(hwnd))))
+            return True
+
+        user32.EnumWindows(WNDENUMPROC(_enum), 0)
+        found.sort(key=lambda item: item[1], reverse=True)
+        return [hwnd for hwnd, _visible in found]
+    except Exception:
+        return []
+
+
 def _gp_get_window(timeout: float = 1.0):
     """Find the GlobalProtect main window via pywinauto UIA backend.
     Matches title=='GlobalProtect' AND class=='#32770' (filters out random
@@ -335,6 +437,507 @@ def _gp_get_window(timeout: float = 1.0):
             time.sleep(0.4)
     except Exception as e:
         log.warning(f"gp_get_window: failed: {e}")
+    return None
+
+
+def _gp_find_monitor_control(win, control_id: str):
+    """Read a native MFC control without using the action UIA tree."""
+    hidden_match = None
+    try:
+        for ctrl in win.descendants():
+            try:
+                if str(ctrl.control_id()) != str(control_id):
+                    continue
+                if ctrl.is_visible():
+                    return ctrl
+                if hidden_match is None:
+                    hidden_match = ctrl
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return hidden_match
+
+
+def _gp_find_monitor_portal_control(win):
+    for control_id in GP_PORTAL_AUTOIDS:
+        ctrl = _gp_find_monitor_control(win, control_id)
+        if ctrl:
+            return ctrl
+    return None
+
+
+def _gp_get_monitor_window(timeout: float = 1.0):
+    """Get a passive native snapshot; never focus or activate the GP popup.
+
+    Native HWND enumeration avoids background desktop-wide UIA scans. These
+    Win32 wrappers are only for reading status; connection actions use the
+    established UIA window and AutomationId controls independently.
+    """
+    log = get_logger()
+    try:
+        from pywinauto import Desktop
+
+        deadline = time.monotonic() + max(0.0, timeout)
+        desktop = Desktop(backend="win32")
+        while time.monotonic() < deadline:
+            hydrated = []
+            for hwnd in _gp_find_main_hwnds():
+                try:
+                    win = desktop.window(handle=hwnd).wrapper_object()
+                    button = _gp_find_monitor_control(win, GP_BTN_CONNECT_AUTOID)
+                    status_control = _gp_find_monitor_control(win, GP_STATUS_AUTOID)
+                    try:
+                        button_text = (button.window_text() or "").strip().casefold()
+                    except Exception:
+                        button_text = ""
+                    try:
+                        status_text = (status_control.window_text() or "").strip()
+                    except Exception:
+                        status_text = ""
+                    portal_control = _gp_find_monitor_portal_control(win)
+                    if "connect" not in button_text or not (status_text or portal_control):
+                        continue
+                    try:
+                        score = 10 if win.is_visible() else 0
+                    except Exception:
+                        score = 0
+                    score += 3 + (2 if status_text else 0) + (1 if portal_control else 0)
+                    hydrated.append((score, win))
+                except Exception as exc:
+                    log.debug("gp_monitor: could not read hwnd=%s: %s", hwnd, exc)
+            if hydrated:
+                return max(hydrated, key=lambda item: item[0])[1]
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(0.4, remaining))
+    except Exception as exc:
+        log.debug("gp_monitor: native snapshot failed: %s", exc)
+    return None
+
+
+def _gp_get_monitor_portal_text(win) -> str:
+    ctrl = _gp_find_monitor_portal_control(win)
+    if not ctrl:
+        return ""
+    candidates = []
+    try:
+        candidates.append(ctrl.window_text())
+    except Exception:
+        pass
+    try:
+        candidates.append(ctrl.get_value())
+    except Exception:
+        pass
+    try:
+        legacy = ctrl.legacy_properties()
+        candidates.extend((legacy.get("Value", ""), legacy.get("Name", "")))
+    except Exception:
+        pass
+    short_candidate = ""
+    for candidate in candidates:
+        normalized = _normalize_gp_portal(candidate)
+        if normalized and "." in normalized:
+            return normalized
+        if normalized and normalized != "portal":
+            short_candidate = normalized
+    return short_candidate
+
+
+def _gp_get_monitor_status_text(win) -> str:
+    try:
+        ctrl = _gp_find_monitor_control(win, GP_STATUS_AUTOID)
+        return (ctrl.window_text() or "").strip() if ctrl else ""
+    except Exception:
+        return ""
+
+
+
+
+def _gp_process_running(process_name: str) -> bool:
+    try:
+        import psutil
+
+        expected = str(process_name or "").casefold()
+        return any(
+            str(proc.info.get("name") or "").casefold() == expected
+            for proc in psutil.process_iter(["name"])
+        )
+    except Exception:
+        return False
+
+
+def _gp_find_exact_top_level_hwnd(window_class: str) -> int | None:
+    """Return a visible top-level HWND whose native class matches exactly."""
+    try:
+        import ctypes
+        import ctypes.wintypes
+
+        user32 = ctypes.windll.user32
+        try:
+            user32.FindWindowExW.argtypes = (
+                ctypes.wintypes.HWND,
+                ctypes.wintypes.HWND,
+                ctypes.wintypes.LPCWSTR,
+                ctypes.wintypes.LPCWSTR,
+            )
+            user32.FindWindowExW.restype = ctypes.wintypes.HWND
+            previous = ctypes.wintypes.HWND(0)
+            while True:
+                hwnd = user32.FindWindowExW(
+                    ctypes.wintypes.HWND(0),
+                    previous,
+                    window_class,
+                    None,
+                )
+                if not hwnd:
+                    break
+                if user32.IsWindowVisible(hwnd):
+                    return _gp_hwnd_value(hwnd)
+                previous = hwnd
+        except Exception:
+            # EnumWindows below is an independent fallback for Explorer/XAML
+            # versions where FindWindowExW intermittently misses the island.
+            pass
+
+        found: list[int] = []
+        WNDENUMPROC = ctypes.WINFUNCTYPE(
+            ctypes.c_bool,
+            ctypes.wintypes.HWND,
+            ctypes.wintypes.LPARAM,
+        )
+
+        def _enum(hwnd, _):
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            class_name = ctypes.create_unicode_buffer(256)
+            user32.GetClassNameW(hwnd, class_name, 256)
+            if class_name.value == window_class:
+                found.append(_gp_hwnd_value(hwnd))
+            return True
+
+        user32.EnumWindows(WNDENUMPROC(_enum), 0)
+        return found[0] if found else None
+    except Exception as exc:
+        get_logger().debug(
+            "gp_tray: native class lookup failed for %s: %s",
+            window_class,
+            exc,
+        )
+        return None
+
+
+def _gp_uia_control_text(control) -> str:
+    try:
+        return (control.window_text() or "").strip()
+    except Exception:
+        try:
+            return (control.element_info.name or "").strip()
+        except Exception:
+            return ""
+
+
+def _gp_is_exact_tray_icon(control) -> bool:
+    """Accept only Explorer's exact GlobalProtect notification-area item."""
+    try:
+        info = control.element_info
+        name = _gp_uia_control_text(control).casefold()
+        return (
+            info.control_type == "Button"
+            and info.automation_id == GP_TRAY_ITEM_AUTOID
+            and info.class_name == GP_TRAY_ITEM_CLASS
+            and (name == "globalprotect" or name.startswith("globalprotect "))
+        )
+    except Exception:
+        return False
+
+
+def _gp_find_exact_tray_icon(container):
+    """Return one unambiguous GlobalProtect tray icon from an exact subtree."""
+    try:
+        matches = [
+            control
+            for control in container.descendants()
+            if _gp_is_exact_tray_icon(control)
+        ]
+    except Exception:
+        return None
+    if len(matches) != 1:
+        if len(matches) > 1:
+            get_logger().warning(
+                "gp_tray: refusing ambiguous GlobalProtect icons count=%s",
+                len(matches),
+            )
+        return None
+    return matches[0]
+
+
+def _gp_is_exact_show_hidden_button(control) -> bool:
+    try:
+        info = control.element_info
+        name = _gp_uia_control_text(control).casefold()
+        return (
+            info.control_type == "Button"
+            and info.automation_id == GP_SHOW_HIDDEN_AUTOID
+            and info.class_name == GP_TRAY_ITEM_CLASS
+            and name == "show hidden icons"
+        )
+    except Exception:
+        return False
+
+
+def _gp_find_show_hidden_button(taskbar):
+    """Find Windows 11's notification-overflow toggle inside the taskbar."""
+    try:
+        for control in taskbar.descendants():
+            if _gp_is_exact_show_hidden_button(control):
+                return control
+    except Exception:
+        pass
+    return None
+
+
+def _gp_main_window_is_visible(win) -> bool:
+    try:
+        return bool(win and win.is_visible())
+    except Exception:
+        return False
+
+
+def _gp_any_native_main_window_visible() -> bool:
+    """Detect a visible exact PanGPA popup even before controls hydrate."""
+    try:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        return any(
+            bool(user32.IsWindowVisible(hwnd))
+            for hwnd in _gp_find_main_hwnds()
+        )
+    except Exception:
+        return False
+
+
+def _gp_uia_control_is_actionable(control) -> bool:
+    try:
+        if not control.is_visible() or not control.is_enabled():
+            return False
+        rect = control.rectangle()
+        return rect.width() > 0 and rect.height() > 0
+    except Exception:
+        return False
+
+
+def _gp_activate_overflow_toggle(toggle) -> bool:
+    """Use one revalidated physical click to show Explorer's tray overflow."""
+    if not _gp_is_exact_show_hidden_button(toggle):
+        return False
+    if not _gp_uia_control_is_actionable(toggle):
+        return False
+    try:
+        toggle.click_input()
+        return True
+    except Exception as exc:
+        get_logger().warning("gp_tray: overflow toggle action failed: %s", exc)
+        return False
+
+
+def _gp_activate_from_system_tray(timeout: float = 4.0) -> bool:
+    """Click the exact GlobalProtect tray icon at most once.
+
+    Explorer's Windows 11 notification area is XAML-backed. Native window
+    enumeration first scopes UIA to the exact taskbar/overflow HWNDs, avoiding
+    a potentially blocking desktop-wide UIA scan. This helper only opens the
+    PanGPA popup; it never touches its Connect/Disconnect control.
+    """
+    log = get_logger()
+    try:
+        from pywinauto import Desktop
+
+        taskbar_hwnd = _gp_find_exact_top_level_hwnd(GP_TASKBAR_CLASS)
+        if not taskbar_hwnd:
+            log.info("gp_tray: Shell_TrayWnd not found")
+            return False
+        desktop = Desktop(backend="uia")
+        taskbar = desktop.window(handle=taskbar_hwnd).wrapper_object()
+
+        icon = _gp_find_exact_tray_icon(taskbar)
+        overflow_hwnd = _gp_find_exact_top_level_hwnd(GP_TRAY_OVERFLOW_CLASS)
+        if not icon and not overflow_hwnd:
+            toggle = _gp_find_show_hidden_button(taskbar)
+            if not toggle:
+                log.info("gp_tray: Show Hidden Icons button not found")
+                return False
+            if not _gp_activate_overflow_toggle(toggle):
+                return False
+            log.info("gp_tray: notification overflow opened")
+
+        deadline = time.monotonic() + max(0.2, timeout)
+        while not icon and time.monotonic() < deadline:
+            if _autofill_cancel.is_set():
+                return False
+
+            # The icon can be configured as always visible, or migrate there
+            # while PanGPA starts. Re-wrap only the exact taskbar HWND.
+            try:
+                taskbar = desktop.window(handle=taskbar_hwnd).wrapper_object()
+                icon = _gp_find_exact_tray_icon(taskbar)
+            except Exception:
+                icon = None
+
+            if not icon:
+                overflow_hwnd = _gp_find_exact_top_level_hwnd(
+                    GP_TRAY_OVERFLOW_CLASS
+                )
+                if overflow_hwnd:
+                    try:
+                        overflow = desktop.window(
+                            handle=overflow_hwnd
+                        ).wrapper_object()
+                        icon = _gp_find_exact_tray_icon(overflow)
+                    except Exception:
+                        icon = None
+            if not icon and _autofill_cancel.wait(0.2):
+                return False
+
+        if not icon:
+            log.info("gp_tray: exact GlobalProtect icon not found")
+            return False
+
+        # A manual click can race this worker. Never invoke the tray item if
+        # the popup has become visible, because that would hide it again.
+        live_window = _gp_get_window(timeout=0.2)
+        if (
+            _gp_main_window_is_visible(live_window)
+            or _gp_any_native_main_window_visible()
+        ):
+            log.info("gp_tray: main popup became visible before tray click")
+            return True
+
+        if not _gp_is_exact_tray_icon(icon) or not _gp_uia_control_is_actionable(icon):
+            log.warning("gp_tray: icon identity/visibility changed before click")
+            return False
+        try:
+            icon.click_input()
+            log.info(
+                "gp_tray: clicked exact notification icon name=%r",
+                _gp_uia_control_text(icon),
+            )
+            return True
+        except Exception as exc:
+            # A physical click can be delivered before the wrapper raises. Do
+            # not issue a second click or an InvokePattern fallback here.
+            log.warning("gp_tray: exact icon click raised: %s", exc)
+            return False
+    except Exception as exc:
+        log.warning("gp_tray: activation failed: %s", exc)
+        return False
+
+
+def _ensure_gp_main_window(exe_path: str, *, deadline: float | None = None):
+    """Open PanGPA's popup through its exact notification-area icon."""
+    log = get_logger()
+
+    def _time_left() -> float | None:
+        if deadline is None:
+            return None
+        return max(0.0, deadline - time.monotonic())
+
+    def _bounded_timeout(requested: float) -> float:
+        remaining = _time_left()
+        if remaining is None:
+            return requested
+        return min(requested, remaining)
+
+    initial_timeout = _bounded_timeout(0.6)
+    if initial_timeout <= 0.0:
+        return None
+    existing = _gp_get_window(timeout=initial_timeout)
+    if _gp_main_window_is_visible(existing):
+        return existing
+
+    launched = False
+    if not _gp_process_running("PanGPA.exe"):
+        log.info(
+            "gp_window: starting PanGPA before tray activation (PanGPS=%s)",
+            _gp_process_running("PanGPS.exe"),
+        )
+        if (_time_left() == 0.0) or not _open_gui(exe_path):
+            return existing
+        launched = True
+
+        # ShellExecute can occasionally open the popup itself. Give it a
+        # bounded opportunity so a later tray invoke cannot toggle it closed.
+        launch_deadline = time.monotonic() + 1.5
+        if deadline is not None:
+            launch_deadline = min(launch_deadline, deadline)
+        while time.monotonic() < launch_deadline:
+            if _autofill_cancel.is_set():
+                return None
+            lookup_timeout = _bounded_timeout(0.25)
+            if lookup_timeout <= 0.0:
+                break
+            launched_window = _gp_get_window(timeout=lookup_timeout)
+            if _gp_main_window_is_visible(launched_window):
+                return launched_window
+            if launched_window:
+                existing = launched_window
+            wait_time = _bounded_timeout(0.15)
+            if wait_time <= 0.0 or _autofill_cancel.wait(wait_time):
+                return None
+
+    if _autofill_cancel.is_set() or _time_left() == 0.0:
+        return None
+    activation_timeout = _bounded_timeout(8.0 if launched else 4.0)
+    # The tray helper has a deliberate 200 ms minimum polling window. Do not
+    # start it when the caller's operation has less time remaining than that.
+    if activation_timeout < 0.2:
+        return None
+    activated = _gp_activate_from_system_tray(timeout=activation_timeout)
+    if activated:
+        visible_deadline = time.monotonic() + 4.0
+        if deadline is not None:
+            visible_deadline = min(visible_deadline, deadline)
+        last_hydrated = existing
+        while time.monotonic() < visible_deadline:
+            if _autofill_cancel.is_set():
+                return None
+            lookup_timeout = _bounded_timeout(0.35)
+            if lookup_timeout <= 0.0:
+                break
+            win = _gp_get_window(timeout=lookup_timeout)
+            if win:
+                last_hydrated = win
+                if _gp_main_window_is_visible(win):
+                    log.info("gp_window: visible after exact tray activation")
+                    return win
+            wait_time = _bounded_timeout(0.15)
+            if wait_time <= 0.0 or _autofill_cancel.wait(wait_time):
+                return None
+        existing = last_hydrated
+
+    # Ask PanGPA to expose its own active popup. ShowWindow on one of its hidden
+    # MFC dialogs can expose an obsolete shell whose Connect button is inert.
+    # Such a shell must never become our fallback action target.
+    if exe_path and not _autofill_cancel.is_set() and _time_left() != 0.0:
+        log.info("gp_window: requesting popup through PanGPA launcher")
+        if not _open_gui(exe_path):
+            return None
+        restore_deadline = time.monotonic() + 2.0
+        if deadline is not None:
+            restore_deadline = min(restore_deadline, deadline)
+        while time.monotonic() < restore_deadline:
+            if _autofill_cancel.is_set():
+                return None
+            lookup_timeout = _bounded_timeout(0.25)
+            if lookup_timeout <= 0.0:
+                break
+            restored = _gp_get_window(timeout=lookup_timeout)
+            if _gp_main_window_is_visible(restored):
+                return restored
+            wait_time = _bounded_timeout(0.1)
+            if wait_time <= 0.0 or _autofill_cancel.wait(wait_time):
+                return None
     return None
 
 def _gp_find_descendant_by_autoid(win, auto_id: str):
@@ -509,7 +1112,10 @@ def _gp_login_window_present() -> bool:
             if length:
                 buf = ctypes.create_unicode_buffer(length + 1)
                 user32.GetWindowTextW(hwnd, buf, length + 1)
-                if buf.value == GP_LOGIN_TITLE:
+                if (
+                    buf.value == GP_LOGIN_TITLE
+                    and _gp_is_exact_pangpa_window(hwnd, GP_LOGIN_TITLE)
+                ):
                     if user32.IsWindowVisible(hwnd):
                         found[0] = True
                         return False
@@ -545,6 +1151,8 @@ def _gp_dump_descendants(win, max_items: int = 40):
                 pass
     except Exception as e:
         log.warning(f"gp_descendants: dump failed: {e}")
+
+
 
 def _gp_invoke_connect_button(
     win,
@@ -613,12 +1221,16 @@ def _gp_invoke_connect_button(
         log.error(f"gp_invoke: failed: {e}")
     return False
 
-def _gp_get_login_window(timeout: float = 1.0):
+def _gp_get_login_window(
+    timeout: float = 1.0,
+    *,
+    ignored_hwnds: set[int] | None = None,
+):
     """Find the SAML 'GlobalProtect Login' window (class #32770) via UIA.
 
     PanGPA renders the SAML auth flow inside an embedded WebView2 hosted in
     this dialog. When an identity provider returns Microsoft, the WebView2
-    sometimes shows a 'Pick an account' picker � we need the UIA wrapper to
+    sometimes shows a 'Pick an account' picker — we need the UIA wrapper to
     walk its descendants and click the configured account.
     """
     log = get_logger()
@@ -627,38 +1239,51 @@ def _gp_get_login_window(timeout: float = 1.0):
         deadline = time.time() + timeout
         while time.time() < deadline:
             try:
+                hwnd = _gp_find_login_hwnd(ignored_hwnds=ignored_hwnds)
+                if not hwnd:
+                    time.sleep(0.2)
+                    continue
+                if not _gp_is_exact_pangpa_window(hwnd, GP_LOGIN_TITLE):
+                    log.warning(
+                        "gp_get_login_window: refusing window whose native "
+                        "identity changed hwnd=%s",
+                        hwnd,
+                    )
+                    time.sleep(0.2)
+                    continue
                 desktop = Desktop(backend="uia")
-                for w in desktop.windows():
-                    try:
-                        if (w.window_text() == GP_LOGIN_TITLE
-                                and w.element_info.class_name == GP_CLASS):
-                            return w
-                    except Exception:
-                        pass
-                # UIA's top-level enumeration can omit the hidden #32770
-                # host even though Win32 can see it. Resolve the HWND and wrap
-                # it explicitly so the WebView2 descendants can be inspected.
-                hwnd = _gp_find_login_hwnd()
-                if hwnd:
-                    try:
-                        wrapped = desktop.window(handle=hwnd).wrapper_object()
-                        log.info("gp_get_login_window: wrapped Win32 hwnd=%s", hwnd)
-                        return wrapped
-                    except Exception as exc:
-                        log.debug(
-                            "gp_get_login_window: could not wrap hwnd=%s: %s",
+                try:
+                    wrapped = desktop.window(handle=hwnd).wrapper_object()
+                    if not _gp_is_exact_pangpa_window(hwnd, GP_LOGIN_TITLE):
+                        log.warning(
+                            "gp_get_login_window: identity changed while wrapping "
+                            "hwnd=%s",
                             hwnd,
-                            exc,
                         )
+                        time.sleep(0.2)
+                        continue
+                    log.info("gp_get_login_window: wrapped Win32 hwnd=%s", hwnd)
+                    return wrapped
+                except Exception as exc:
+                    log.debug(
+                        "gp_get_login_window: could not wrap hwnd=%s: %s",
+                        hwnd,
+                        exc,
+                    )
             except Exception as e:
                 log.debug(f"gp_get_login_window: iteration error: {e}")
-            time.sleep(0.4)
+            time.sleep(0.2)
     except Exception as e:
         log.warning(f"gp_get_login_window: failed: {e}")
     return None
 
-def _gp_find_login_hwnd():
+def _gp_find_login_hwnd(*, ignored_hwnds: set[int] | None = None):
     """Find the Win32 hwnd for the GlobalProtect SAML dialog."""
+    ignored = {
+        _gp_hwnd_value(hwnd)
+        for hwnd in (ignored_hwnds or ())
+        if _gp_hwnd_value(hwnd)
+    }
     try:
         import ctypes
         import ctypes.wintypes
@@ -676,8 +1301,13 @@ def _gp_find_login_hwnd():
                 if buf.value == GP_LOGIN_TITLE:
                     cls_buf = ctypes.create_unicode_buffer(256)
                     user32.GetClassNameW(hwnd, cls_buf, 256)
-                    if cls_buf.value == GP_CLASS:
-                        found.append((hwnd, bool(user32.IsWindowVisible(hwnd))))
+                    handle = _gp_hwnd_value(hwnd)
+                    if (
+                        handle not in ignored
+                        and cls_buf.value == GP_CLASS
+                        and _gp_is_exact_pangpa_window(handle, GP_LOGIN_TITLE)
+                    ):
+                        found.append((handle, bool(user32.IsWindowVisible(hwnd))))
             return True
 
         user32.EnumWindows(WNDENUMPROC(_enum), 0)
@@ -688,28 +1318,39 @@ def _gp_find_login_hwnd():
     except Exception:
         return None
 
-def _gp_close_login_window(hwnd=None) -> bool:
+def _gp_close_login_window(
+    hwnd=None,
+    *,
+    ignored_hwnds: set[int] | None = None,
+) -> bool:
     """Post a non-blocking close only to the exact GlobalProtect SAML dialog."""
     log = get_logger()
     try:
         import ctypes
 
         user32 = ctypes.windll.user32
-        candidate = hwnd or _gp_find_login_hwnd()
+        ignored = {
+            _gp_hwnd_value(value)
+            for value in (ignored_hwnds or ())
+            if _gp_hwnd_value(value)
+        }
+        candidate = hwnd or _gp_find_login_hwnd(ignored_hwnds=ignored)
         if not candidate:
             return False
 
-        title_length = user32.GetWindowTextLengthW(candidate)
-        title_buffer = ctypes.create_unicode_buffer(title_length + 1)
-        class_buffer = ctypes.create_unicode_buffer(256)
-        user32.GetWindowTextW(candidate, title_buffer, title_length + 1)
-        user32.GetClassNameW(candidate, class_buffer, 256)
-        if title_buffer.value != GP_LOGIN_TITLE or class_buffer.value != GP_CLASS:
+        candidate = _gp_hwnd_value(candidate)
+        if candidate in ignored:
+            log.info("gp_saml: refusing to close ignored stale login hwnd=%s", candidate)
+            return False
+        if not _gp_is_exact_pangpa_window(candidate, GP_LOGIN_TITLE):
+            title, class_name, process_name = _gp_native_window_identity(candidate)
             log.warning(
-                "gp_saml: refusing to close unexpected window hwnd=%s title=%r class=%r",
+                "gp_saml: refusing to close unexpected window hwnd=%s title=%r "
+                "class=%r process=%r",
                 candidate,
-                title_buffer.value,
-                class_buffer.value,
+                title,
+                class_name,
+                process_name,
             )
             return False
 
@@ -771,6 +1412,16 @@ def _gp_native_window_identity(hwnd) -> tuple[str, str, str]:
         return title_buffer.value, class_buffer.value, process_name
     except Exception:
         return "", "", ""
+
+
+def _gp_is_exact_pangpa_window(hwnd, expected_title: str) -> bool:
+    """Verify a top-level window immediately before Banco credential UI use."""
+    title, class_name, process_name = _gp_native_window_identity(hwnd)
+    return (
+        title == expected_title
+        and class_name == GP_CLASS
+        and process_name.casefold() == "pangpa.exe"
+    )
 
 def _gp_list_terminal_windows(portal: str = "") -> list[tuple[int, str]]:
     """List only PanGPA Login/Notification windows, including hidden ones."""
@@ -856,24 +1507,89 @@ def _gp_cleanup_terminal_windows(portal: str = "", wait_seconds: float = 0.0) ->
             time.sleep(0.25)
     return len(posted)
 
+
+def _gp_login_reports_success(
+    *,
+    ignored_hwnds: set[int] | None = None,
+) -> bool:
+    """Return True only when a fresh exact Login window exposes a success page."""
+    ignored = set(ignored_hwnds or ())
+    login_win = (
+        _gp_get_login_window(timeout=0.25, ignored_hwnds=ignored)
+        if ignored
+        else _gp_get_login_window(timeout=0.25)
+    )
+    if not login_win:
+        return False
+    hwnd = _gp_hwnd_value(getattr(login_win, "handle", 0))
+    if not hwnd or hwnd in ignored or not _gp_is_exact_pangpa_window(
+        hwnd,
+        GP_LOGIN_TITLE,
+    ):
+        return False
+    try:
+        texts = [_gp_control_text(ctrl).casefold() for ctrl in login_win.descendants()]
+        page_text = " ".join(text for text in texts if text)
+    except Exception:
+        return False
+    return any(
+        marker in page_text
+        for marker in (
+            "login successful",
+            "sign-in successful",
+            "sign in successful",
+            "inicio de sesión exitoso",
+            "inicio de sesión correcto",
+        )
+    )
+
+
 def _gp_cleanup_after_confirmed_connection(
     portal: str,
     *,
     attempts: int = 5,
     interval: float = 0.4,
+    ignored_login_hwnds: set[int] | None = None,
 ) -> bool:
-    """Close terminal dialogs only after both UI and adapter confirm success.
+    """Close success dialogs only after adapter and exact-portal evidence.
 
-    The main-window status and the virtual adapter can settle a little apart.
-    Give them a short grace period, then leave any sign-in window untouched if
-    the strong confirmation never materializes.
+    PanGPA can hide or rebuild its main popup just as the tunnel comes up.  An
+    exact Banco notification is therefore valid portal evidence even when that
+    popup is unreadable.  A generic Login window is only closed when its page
+    explicitly reports success and the persisted portal still matches exactly.
     """
     log = get_logger()
+    ignored = set(ignored_login_hwnds or ())
     for attempt in range(max(1, attempts)):
         win = _gp_get_window(timeout=0.5)
         status = _gp_get_status_text(win).strip().casefold() if win else ""
-        adapter = _gp_adapter_status().strip().casefold()
-        if status == "connected" and adapter == "up":
+        live_portal = _gp_get_portal_text(win) if win else ""
+        probe_ok, sampled_adapter = _gp_adapter_status_sample(max_age=0.0)
+        adapter = sampled_adapter.strip().casefold()
+        terminal_windows = _gp_list_terminal_windows(portal)
+        exact_notification = any(
+            title.casefold() != GP_LOGIN_TITLE.casefold()
+            for _hwnd, title in terminal_windows
+        )
+        live_portal_confirmed = (
+            status == "connected" and _gp_portal_matches(live_portal, portal)
+        )
+        successful_login = False
+        if (
+            probe_ok
+            and adapter == "up"
+            and not live_portal_confirmed
+            and not exact_notification
+            and _gp_portal_matches(_gp_get_last_portal(), portal)
+        ):
+            successful_login = _gp_login_reports_success(
+                ignored_hwnds=ignored,
+            )
+        if (
+            probe_ok
+            and adapter == "up"
+            and (live_portal_confirmed or exact_notification or successful_login)
+        ):
             _gp_cleanup_terminal_windows(portal, wait_seconds=1.5)
             return True
         if attempt < max(1, attempts) - 1:
@@ -910,11 +1626,11 @@ def _gp_wait_for_connect_transition(
         if status == "connection failed":
             return "failed"
 
-        fresh_terminal_window = any(
-            hwnd not in ignored
-            for hwnd, _title in _gp_list_terminal_windows(portal)
+        fresh_login_window = any(
+            hwnd not in ignored and title == GP_LOGIN_TITLE
+            for hwnd, title in _gp_list_terminal_windows(portal)
         )
-        if fresh_terminal_window:
+        if fresh_login_window:
             return "started"
 
         terminal_ui = status == "connected" or (
@@ -924,11 +1640,15 @@ def _gp_wait_for_connect_transition(
             return "connected_status" if status == "connected" else "started"
 
         # Get-NetAdapter starts a subprocess, so probe it only every few frames.
-        if attempt % 3 == 2 and _gp_adapter_status().casefold() == "up":
-            return "connected_adapter"
+        if attempt % 3 == 2:
+            probe_ok, adapter = _gp_adapter_status_sample(max_age=0.0)
+            if probe_ok and adapter.casefold() == "up":
+                return "connected_adapter"
         if attempt < max(1, attempts) - 1:
             time.sleep(0.35)
     return "not_started"
+
+
 
 def _gp_prepare_login_window(login_win=None) -> bool:
     """Restore and resize GlobalProtect Login if WebView2 opens collapsed.
@@ -988,21 +1708,31 @@ def _gp_prepare_login_window(login_win=None) -> bool:
         return False
 
 def _gp_try_click(ctrl, where: str) -> bool:
-    """Invoke() then click_input() on a control. Logs which path worked."""
+    """Send one physical click to a verified SAML control.
+
+    WebView2 can report a successful UIA InvokePattern without navigating. A
+    physical click is the only supported path here, and an exception is treated
+    as ambiguous instead of issuing a second action immediately.
+    """
     log = get_logger()
     try:
-        ctrl.invoke()
-        log.info(f"gp_picker: invoke() on {where} succeeded")
-        return True
-    except Exception:
-        pass
-    try:
+        visible = getattr(ctrl, "is_visible", None)
+        enabled = getattr(ctrl, "is_enabled", None)
+        if callable(visible) and not visible():
+            return False
+        if callable(enabled) and not enabled():
+            return False
         ctrl.click_input()
         log.info(f"gp_picker: click_input() on {where} succeeded")
         return True
     except Exception as e:
-        log.debug(f"gp_picker: click_input() on {where} failed: {e}")
-    return False
+        log.info(
+            "gp_picker: click_input() on %s raised after one physical action "
+            "(%s); waiting for page-state verification",
+            where,
+            e,
+        )
+        return True
 
 def _gp_try_click_with_ancestors(ctrl, where: str, max_depth: int = 5) -> bool:
     """Try clicking a UIA node, then walk up to clickable row containers."""
@@ -1092,7 +1822,7 @@ def _gp_is_password_edit(ctrl) -> bool:
     descriptor = _gp_edit_descriptor(ctrl)
     return any(
         marker in descriptor
-        for marker in ("password", "passwd", "contrase�a")
+        for marker in ("password", "passwd", "contraseña")
     )
 
 def _gp_find_edit(
@@ -1117,6 +1847,10 @@ def _gp_handle_saml_signin(
     connected_probe=None,
     status_probe=None,
     progress=None,
+    flow_mode: str = "detect",
+    flow_steps=None,
+    ignored_login_hwnds: set[int] | None = None,
+    connected_adapter_grace: float = GP_CONNECTED_ADAPTER_GRACE_SECONDS,
 ) -> str:
     """Drive known Microsoft SAML pages and stop safely on unknown pages.
 
@@ -1126,19 +1860,39 @@ def _gp_handle_saml_signin(
     """
     log = get_logger()
     target = str(username or "").strip().casefold()
+    custom_flow = str(flow_mode or "detect").strip().casefold() == "custom"
+    configured_steps = {
+        str(step).strip().casefold()
+        for step in (flow_steps or ())
+        if str(step).strip().casefold() in {"account", "password", "mfa"}
+    }
+    if not custom_flow:
+        configured_steps = {"account", "password", "mfa"}
+    ignored = {
+        _gp_hwnd_value(hwnd)
+        for hwnd in (ignored_login_hwnds or ())
+        if _gp_hwnd_value(hwnd)
+    }
     deadline = time.time() + total_timeout
     password_submitted = False
-    email_submitted = False
     mfa_reported = False
     unknown_reported = False
+    account_wait_reported = False
+    password_wait_reported = False
     password_prompt_without_edit_frames = 0
     password_error_present_at_submit = False
     password_error_cleared_after_submit = False
     persistent_password_error_frames = 0
     stale_password_error_grace_frames = 12
+    password_submit_wait_frames = 0
+    password_submit_retry_done = False
+    account_click_attempts = 0
+    account_click_wait_frames = 0
     saw_connecting = False
     terminal_state_frames = 0
+    terminal_state_samples = 0
     prepared_login_hwnds: set[int] = set()
+    connected_ui_started_at: float | None = None
 
     log.info("gp_saml: monitoring Microsoft sign-in flow (timeout=%ss)", total_timeout)
     while time.time() < deadline:
@@ -1151,29 +1905,44 @@ def _gp_handle_saml_signin(
                 connection_state = str(status_probe() or "").strip().casefold()
             except Exception as exc:
                 log.debug("gp_saml: status probe failed: %s", exc)
+            # PanGPA's status label can remain frozen on Connected after a
+            # manual disconnect.  Treat it only as UI progress; the separate
+            # connected_probe must confirm a successful adapter sample at Up.
             if connection_state == "connected":
-                log.info("gp_saml: tunnel connected via main-window status")
-                return "connected"
-            if connection_state.startswith("connecting"):
+                if connected_ui_started_at is None:
+                    connected_ui_started_at = time.monotonic()
+            elif connection_state.startswith("connecting"):
+                connected_ui_started_at = None
                 saw_connecting = True
                 terminal_state_frames = 0
             elif saw_connecting and connection_state == "connection failed":
                 log.warning("gp_saml: main window reports Connection Failed")
-                _gp_close_login_window()
+                if ignored:
+                    _gp_close_login_window(ignored_hwnds=ignored)
+                else:
+                    _gp_close_login_window()
                 return "connection_failed"
             elif saw_connecting and connection_state in {
                 "disconnected",
                 "not connected",
             }:
                 terminal_state_frames += 1
-                if terminal_state_frames >= 3:
+                terminal_state_samples += 1
+                if terminal_state_frames >= 3 or terminal_state_samples >= 8:
                     log.warning(
-                        "gp_saml: connection returned to terminal state='%s'",
+                        "gp_saml: connection returned to terminal state='%s' "
+                        "(consecutive=%s total=%s)",
                         connection_state,
+                        terminal_state_frames,
+                        terminal_state_samples,
                     )
-                    _gp_close_login_window()
+                    if ignored:
+                        _gp_close_login_window(ignored_hwnds=ignored)
+                    else:
+                        _gp_close_login_window()
                     return "connection_failed"
             elif connection_state:
+                connected_ui_started_at = None
                 terminal_state_frames = 0
         try:
             if callable(connected_probe) and connected_probe():
@@ -1182,11 +1951,42 @@ def _gp_handle_saml_signin(
         except Exception as exc:
             log.debug("gp_saml: connection probe failed: %s", exc)
 
-        login_win = _gp_get_login_window(timeout=0.5)
+        login_win = (
+            _gp_get_login_window(timeout=0.5, ignored_hwnds=ignored)
+            if ignored
+            else _gp_get_login_window(timeout=0.5)
+        )
+        if login_win and connection_state == "connected":
+            # A live, fresh SAML page (especially MFA) can coexist with a stale
+            # Connected label from the prior session. Do not spend the adapter
+            # grace period while the user is still completing that page.
+            connected_ui_started_at = None
+        if (
+            not login_win
+            and connected_ui_started_at is not None
+            and time.monotonic() - connected_ui_started_at
+            >= max(0.0, connected_adapter_grace)
+        ):
+            log.warning(
+                "gp_saml: UI remained Connected for %.1fs without a confirmed "
+                "Up adapter",
+                max(0.0, connected_adapter_grace),
+            )
+            return "adapter_not_up"
         if not login_win:
             time.sleep(0.5)
             continue
         login_hwnd = int(getattr(login_win, "handle", 0) or 0)
+        if login_hwnd and not _gp_is_exact_pangpa_window(
+            login_hwnd,
+            GP_LOGIN_TITLE,
+        ):
+            log.error(
+                "gp_saml: refusing credential automation because the login "
+                "window identity changed hwnd=%s",
+                login_hwnd,
+            )
+            return "unknown_page"
         if not login_hwnd or login_hwnd not in prepared_login_hwnds:
             _gp_prepare_login_window(login_win)
             if login_hwnd:
@@ -1204,20 +2004,26 @@ def _gp_handle_saml_signin(
         authentication_failed_markers = (
             "authentication failed",
             "please contact the administrator for further assistance",
-            "autenticaci�n fallida",
+            "autenticación fallida",
             "contacte al administrador",
         )
         if any(marker in page_text for marker in authentication_failed_markers):
             log.warning("gp_saml: GlobalProtect reported Authentication Failed")
-            _gp_close_login_window(getattr(login_win, "handle", None))
+            if ignored:
+                _gp_close_login_window(
+                    getattr(login_win, "handle", None),
+                    ignored_hwnds=ignored,
+                )
+            else:
+                _gp_close_login_window(getattr(login_win, "handle", None))
             return "authentication_failed"
 
         wrong_password_markers = (
             "password is incorrect",
             "incorrect password",
             "account or password is incorrect",
-            "contrase�a es incorrecta",
-            "cuenta o contrase�a es incorrecta",
+            "contraseña es incorrecta",
+            "cuenta o contraseña es incorrecta",
         )
         wrong_password_page = any(
             marker in page_text for marker in wrong_password_markers
@@ -1237,14 +2043,14 @@ def _gp_handle_saml_signin(
             "approve sign in request",
             "approve sign-in request",
             "open your authenticator app and approve",
-            "aprobar solicitud de inicio de sesi�n",
-            "aprueba la solicitud de inicio de sesi�n",
-            "abra la aplicaci�n authenticator y apruebe",
+            "aprobar solicitud de inicio de sesión",
+            "aprueba la solicitud de inicio de sesión",
+            "abra la aplicación authenticator y apruebe",
         )
         mfa_number_markers = (
             "enter the number",
-            "escriba el n�mero",
-            "ingresa el n�mero",
+            "escriba el número",
+            "ingresa el número",
         )
         mfa_page = any(marker in page_text for marker in mfa_approval_markers) or (
             "authenticator" in page_text
@@ -1253,7 +2059,7 @@ def _gp_handle_saml_signin(
         if mfa_page:
             if not mfa_reported:
                 log.info("gp_saml: MFA approval is required")
-                if callable(progress):
+                if callable(progress) and "mfa" in configured_steps:
                     progress("Approve the MFA request in Microsoft Authenticator.")
                 mfa_reported = True
             time.sleep(0.5)
@@ -1262,9 +2068,9 @@ def _gp_handle_saml_signin(
         password_markers = (
             "enter password",
             "enter your password",
-            "escriba su contrase�a",
-            "ingrese su contrase�a",
-            "introduzca su contrase�a",
+            "escriba su contraseña",
+            "ingrese su contraseña",
+            "introduzca su contraseña",
         )
         password_prompt = (
             any(marker in page_text for marker in password_markers)
@@ -1274,6 +2080,7 @@ def _gp_handle_saml_signin(
             (ctrl for ctrl in descendants if _gp_is_password_edit(ctrl)),
             None,
         )
+        password_page = password_prompt and password_edit is not None
         if password_submitted:
             if not wrong_password_page:
                 if password_error_present_at_submit:
@@ -1299,7 +2106,34 @@ def _gp_handle_saml_signin(
                     return "wrong_password"
                 time.sleep(0.5)
                 continue
-        password_page = password_prompt and password_edit is not None
+            if password_page and not wrong_password_page:
+                password_submit_wait_frames += 1
+                if (
+                    password_submit_wait_frames >= 8
+                    and not password_submit_retry_done
+                ):
+                    if _autofill_cancel.is_set():
+                        return "cancelled"
+                    log.warning(
+                        "gp_saml: password page did not navigate; retrying the "
+                        "verified submit action once"
+                    )
+                    if not _gp_submit_login_page(
+                        descendants,
+                        password_edit,
+                        ("sign in", "iniciar sesión", "continuar", "next", "siguiente"),
+                    ):
+                        return "password_submit_failed"
+                    password_submit_retry_done = True
+                    password_submit_wait_frames = 0
+                elif password_submit_retry_done and password_submit_wait_frames >= 16:
+                    log.warning(
+                        "gp_saml: password page remained unchanged after the "
+                        "single physical submit retry"
+                    )
+                    return "password_submit_failed"
+                time.sleep(0.5)
+                continue
         if password_prompt and password_edit is None:
             password_prompt_without_edit_frames += 1
             if password_prompt_without_edit_frames < 6:
@@ -1311,6 +2145,14 @@ def _gp_handle_saml_signin(
         password_prompt_without_edit_frames = 0
         if password_page:
             if password_submitted:
+                time.sleep(0.5)
+                continue
+            if "password" not in configured_steps:
+                if not password_wait_reported:
+                    log.info("gp_saml: custom flow leaves password entry manual")
+                    if callable(progress):
+                        progress("Enter the Microsoft password manually.")
+                    password_wait_reported = True
                 time.sleep(0.5)
                 continue
             edit = password_edit
@@ -1331,7 +2173,7 @@ def _gp_handle_saml_signin(
             if not _gp_submit_login_page(
                 descendants,
                 edit,
-                ("sign in", "iniciar sesi�n", "continuar", "next", "siguiente"),
+                ("sign in", "iniciar sesión", "continuar", "next", "siguiente"),
             ):
                 log.warning("gp_saml: password entered but submit action failed")
                 return "password_submit_failed"
@@ -1339,6 +2181,8 @@ def _gp_handle_saml_signin(
             password_error_present_at_submit = wrong_password_page
             password_error_cleared_after_submit = False
             persistent_password_error_frames = 0
+            password_submit_wait_frames = 0
+            password_submit_retry_done = False
             log.info("gp_saml: password submitted")
             if callable(progress):
                 progress("Password submitted. Waiting for MFA approval or connection.")
@@ -1364,61 +2208,62 @@ def _gp_handle_saml_signin(
             marker in page_text for marker in account_picker_markers
         )
         if account_picker_page and not password_submitted:
-            use_another_ctrl = None
+            if "account" not in configured_steps:
+                if not account_wait_reported:
+                    log.info("gp_saml: custom flow leaves account selection manual")
+                    if callable(progress):
+                        progress("Select the Banco de Chile Microsoft account manually.")
+                    account_wait_reported = True
+                time.sleep(0.5)
+                continue
+            if not target:
+                log.info("gp_saml: account picker detected but no account is configured")
+                return "username_required"
+            if account_click_attempts:
+                account_click_wait_frames += 1
+                if account_click_attempts >= 2 or account_click_wait_frames < 4:
+                    time.sleep(0.5)
+                    continue
             account_clicked = False
             for ctrl, text in zip(descendants, texts):
-                if (
-                    "use another account" in text
-                    or "usar otra cuenta" in text
-                    or "usar una cuenta diferente" in text
-                ):
-                    use_another_ctrl = ctrl
                 if target and " ".join(text.split()) == target:
                     log.info("gp_saml: configured account row found")
                     if _autofill_cancel.is_set():
                         return "cancelled"
                     if _gp_try_click_with_ancestors(ctrl, "picker_match"):
                         account_clicked = True
+                        account_click_attempts += 1
+                        account_click_wait_frames = 0
                         break
             if account_clicked:
                 time.sleep(0.7)
                 continue
-            if use_another_ctrl and not email_submitted:
-                log.info("gp_saml: choosing explicit account entry")
-                if _autofill_cancel.is_set():
-                    return "cancelled"
-                if _gp_try_click_with_ancestors(use_another_ctrl, "use_another_account"):
-                    time.sleep(0.7)
-                    continue
+            if not account_wait_reported:
+                log.info("gp_saml: exact configured account row is not available")
+                if callable(progress):
+                    progress("Select the saved Banco de Chile account manually.")
+                account_wait_reported = True
+            time.sleep(0.5)
+            continue
 
         email_markers = (
             "email, phone, or skype",
             "enter email",
-            "correo electr�nico, tel�fono o skype",
+            "correo electrónico, teléfono o skype",
             "escriba su correo",
         )
         if not target and any(marker in page_text for marker in email_markers):
             log.info("gp_saml: email prompt detected but no username is configured")
             return "username_required"
         if target and any(marker in page_text for marker in email_markers):
-            edit = _gp_find_edit(descendants, ("email", "correo", "skype"))
-            if edit is None:
-                return "unknown_page"
-            if _autofill_cancel.is_set():
-                return "cancelled"
-            if not _gp_set_edit_value(edit, username):
-                return "email_input_failed"
-            if _autofill_cancel.is_set():
-                return "cancelled"
-            if not _gp_submit_login_page(
-                descendants,
-                edit,
-                ("next", "siguiente", "continuar", "sign in", "iniciar sesi�n"),
-            ):
-                return "email_submit_failed"
-            email_submitted = True
-            log.info("gp_saml: username submitted")
-            time.sleep(0.7)
+            # Banco's supported flow selects the saved Microsoft account row.
+            # Never type an email address into a WebView2 page automatically.
+            if not account_wait_reported:
+                log.info("gp_saml: email page left for manual completion")
+                if callable(progress):
+                    progress("Select the saved Banco de Chile account; email is not typed automatically.")
+                account_wait_reported = True
+            time.sleep(0.5)
             continue
 
         # Unknown SAML pages are deliberately passive: never type a
@@ -1436,15 +2281,28 @@ class BancoChileSwitcher:
     def __init__(self, config: dict):
             self.config = config
             self._last_gp_target = None
+            # ``None`` means no status sample has been requested yet.  The
+            # coordinator uses this explicit signal to distinguish a real
+            # non-Banco GlobalProtect portal from a failed Get-NetAdapter
+            # probe; both intentionally map to GPROT_UNKNOWN at the public
+            # status boundary.
+            self._last_status_probe_ok: bool | None = None
             # Distinguish a PanGPA status label that is merely stale after a
             # disconnect from the short adapter/UI skew while a new tunnel starts.
             # This flag is set only after disconnect_globalprotect has confirmed
             # two terminal adapter samples.
             self._gp_disconnect_confirmed = False
+            self._terminal_adapter_samples = 0
+            self._next_connect_not_before = 0.0
+
+    @property
+    def last_status_probe_ok(self) -> bool | None:
+        """Whether the adapter probe used by the latest status read succeeded."""
+        return self._last_status_probe_ok
 
     def _gp_connected_target(self) -> str:
-        win = _gp_get_window(timeout=0.4)
-        portal = _gp_get_portal_text(win) if win else ""
+        win = _gp_get_monitor_window(timeout=0.4)
+        portal = _gp_get_monitor_portal_text(win) if win else ""
         if not portal and self._last_gp_target == BANCOCHILE:
             # During an app-initiated Connecting/SAML flow the registry can
             # still contain the previous LastUrl. Preserve the target that was
@@ -1456,9 +2314,7 @@ class BancoChileSwitcher:
             self.config.get("bancochile_portal_url", BANCOCHILE_PORTAL)
             or BANCOCHILE_PORTAL
         )
-        if _gp_portal_matches(normalized, bancochile_portal) or normalized.endswith(
-            ".bancochile.cl"
-        ):
+        if _gp_portal_matches(normalized, bancochile_portal):
             self._last_gp_target = BANCOCHILE
             return BANCOCHILE
         if normalized:
@@ -1472,38 +2328,53 @@ class BancoChileSwitcher:
         The registry's LastUrl may belong to an earlier session, so it is not
         safe evidence when deciding whether another GlobalProtect route may run.
         """
-        win = _gp_get_window(timeout=0.4)
-        portal = _gp_get_portal_text(win) if win else ""
+        win = _gp_get_monitor_window(timeout=0.4)
+        portal = _gp_get_monitor_portal_text(win) if win else ""
         expected = _normalize_gp_portal(
             self.config.get("bancochile_portal_url", BANCOCHILE_PORTAL)
             or BANCOCHILE_PORTAL
         )
-        active = bool(portal) and (
-            _gp_portal_matches(portal, expected)
-            or _normalize_gp_portal(portal).endswith(".bancochile.cl")
-        )
+        active = bool(portal) and _gp_portal_matches(portal, expected)
         if active:
             self._last_gp_target = BANCOCHILE
         return active
 
-    def get_bancochile_status(self, adapter_status: str = "") -> str:
+    def get_bancochile_status(self, adapter_status: str | None = None) -> str:
         """Report Banco independently from legacy GlobalProtect UI state.
 
         Once this switcher confirms teardown, a stale PanGPA ``Connected``
         label must not make this Banco-only service own another profile.
         """
-        adapter_state = (adapter_status or _gp_adapter_status()).strip().casefold()
-        win = _gp_get_window(timeout=0.4)
-        portal = _gp_get_portal_text(win) if win else ""
-        normalized_portal = _normalize_gp_portal(portal)
+        if adapter_status is None:
+            probe_ok, sampled_status = _gp_adapter_status_sample()
+        else:
+            # Callers that already ran the shared adapter probe pass its result
+            # explicitly.  An empty value here means a successful probe found
+            # no GlobalProtect adapter; it is not a transport/probe failure.
+            probe_ok, sampled_status = True, adapter_status
+        self._last_status_probe_ok = probe_ok
+        if not probe_ok:
+            # Preserve ownership/debounce exactly as-is.  A technical failure
+            # must never manufacture either a connected or disconnected state.
+            return GPROT_UNKNOWN
+
+        adapter_state = str(sampled_status or "").strip().casefold()
+        adapter_terminal = (
+            not adapter_state or adapter_state in GP_ADAPTER_DISCONNECTED_STATES
+        )
+        if adapter_state == "up":
+            self._terminal_adapter_samples = 0
+        elif adapter_terminal:
+            self._terminal_adapter_samples += 1
+        else:
+            self._terminal_adapter_samples = 0
+        win = _gp_get_monitor_window(timeout=0.4)
+        portal = _gp_get_monitor_portal_text(win) if win else ""
         expected = _normalize_gp_portal(
             self.config.get("bancochile_portal_url", BANCOCHILE_PORTAL)
             or BANCOCHILE_PORTAL
         )
-        live_banco = bool(portal) and (
-            _gp_portal_matches(portal, expected)
-            or normalized_portal.endswith(".bancochile.cl")
-        )
+        live_banco = bool(portal) and _gp_portal_matches(portal, expected)
         if portal and not live_banco:
             # Positive evidence of another live portal always wins over stale
             # ownership left by a cancelled Banco attempt.
@@ -1512,36 +2383,49 @@ class BancoChileSwitcher:
             return GPROT_UNKNOWN
         if (
             self._gp_disconnect_confirmed
-            and adapter_state in GP_ADAPTER_DISCONNECTED_STATES
+            and adapter_terminal
         ):
             self._last_gp_target = None
             return NONE
         if live_banco:
             self._last_gp_target = BANCOCHILE
         banco_owned = live_banco or self._last_gp_target == BANCOCHILE
-        status = _gp_get_status_text(win).strip().casefold() if win else ""
+        status = _gp_get_monitor_status_text(win).strip().casefold() if win else ""
         if not banco_owned:
             # No Banco portal/attempt plus terminal (or completely absent)
             # GlobalProtect evidence means the failed Banco attempt owns
             # nothing. An Up/connecting/connected state remains unknown so we
             # never operate on another profile.
-            if adapter_state in GP_ADAPTER_DISCONNECTED_STATES or status in {
+            if adapter_terminal or status in {
                 "disconnected",
                 "not connected",
                 "connection failed",
             }:
                 return NONE
-            if not adapter_state and not status:
-                return NONE
             return GPROT_UNKNOWN
         if adapter_state == "up":
             return BANCOCHILE
+
+        if adapter_terminal:
+            if status in {"disconnected", "not connected", "connection failed"}:
+                self._last_gp_target = None
+                return NONE
+            if (
+                status == "connected"
+                and self._terminal_adapter_samples >= 2
+                and not _gp_login_window_present()
+            ):
+                # Manual disconnect can leave PanGPA's Connected label frozen.
+                # Two independent terminal adapter samples are stronger than
+                # that stale UI, while one sample remains safe during startup.
+                self._last_gp_target = None
+                return NONE
 
         if live_banco and status.startswith(("connected", "connecting", "disconnecting")):
             return BANCOCHILE
         if self._last_gp_target == BANCOCHILE and _gp_login_window_present():
             return BANCOCHILE
-        if adapter_state in GP_ADAPTER_DISCONNECTED_STATES or status in {
+        if adapter_terminal or status in {
             "disconnected",
             "not connected",
             "connection failed",
@@ -1553,7 +2437,36 @@ class BancoChileSwitcher:
         return BANCOCHILE
 
     def connect_bancochile(self, progress=None) -> Tuple[bool, str]:
-            return self._connect_bancochile_profile(progress=progress)
+            while True:
+                remaining = self._next_connect_not_before - time.monotonic()
+                if remaining <= 0:
+                    break
+                if _autofill_cancel.is_set():
+                    return False, "__GP_CANCELLED__"
+                if callable(progress):
+                    progress(
+                        "Waiting for the previous GlobalProtect sign-in to close "
+                        f"({int(remaining + 0.999)}s)..."
+                    )
+                if _autofill_cancel.wait(min(1.0, remaining)):
+                    return False, "__GP_CANCELLED__"
+
+            result = self._connect_bancochile_profile(progress=progress)
+            ok, message = result
+            if ok:
+                self._next_connect_not_before = 0.0
+            elif message == "__GP_CANCELLED__" or any(
+                marker in message.casefold()
+                for marker in (
+                    "stopped connecting",
+                    "authentication failed",
+                    "mfa sign-in",
+                    "authenticator approval",
+                    "did not connect before",
+                )
+            ):
+                self._next_connect_not_before = time.monotonic() + 20.0
+            return result
 
     def _connect_bancochile_profile(self, progress=None) -> Tuple[bool, str]:
             """Launch (if needed), bring the GlobalProtect window forward, click
@@ -1614,20 +2527,28 @@ class BancoChileSwitcher:
             button_label = _gp_get_button_label(win)
             log.info(f"connect_globalprotect: pre-click status='{status_before}' button='{button_label}'")
             if not status_before and not button_label:
-                log.warning("connect_globalprotect: could not read status or button � Palo Alto may have changed auto_ids; dumping tree:")
+                log.warning("connect_globalprotect: could not read status or button — Palo Alto may have changed auto_ids; dumping tree:")
                 _gp_dump_descendants(win)
 
             # PanGPA reports one of: Disconnected / Not Connected / Connecting... /
             # Connected / Disconnecting... / Connection Failed. Only bail out when
-            # the status is exactly 'Connected' � substring matching here used to
+            # the status is exactly 'Connected' — substring matching here used to
             # mis-classify 'Not Connected' as connected and silently no-op.
             status_state = status_before.strip().casefold()
             button_state = button_label.strip().casefold()
-            adapter_state = _gp_adapter_status().strip().casefold()
+            adapter_probe_ok, sampled_adapter = _gp_adapter_status_sample(max_age=0.0)
+            if not adapter_probe_ok:
+                return False, (
+                    "Could not verify the GlobalProtect adapter state. "
+                    "No connection action was taken; retry in a moment."
+                )
+            adapter_state = sampled_adapter.strip().casefold()
             adapter_up = adapter_state == "up"
             require_strong_connect_transition = self._gp_disconnect_confirmed
             terminal_ui = status_state == "connected" or "disconnect" in button_state
-            explicit_terminal_adapter = adapter_state in GP_ADAPTER_DISCONNECTED_STATES
+            explicit_terminal_adapter = (
+                not adapter_state or adapter_state in GP_ADAPTER_DISCONNECTED_STATES
+            )
 
             # PanGPA may leave Connected/Disconnect visible after teardown, including
             # across an app restart. Never press that shared toggle as Connect when
@@ -1658,7 +2579,16 @@ class BancoChileSwitcher:
                         continue
                     candidate_status = _gp_get_status_text(candidate).strip().casefold()
                     candidate_button = _gp_get_button_label(candidate).strip().casefold()
-                    candidate_adapter = _gp_adapter_status().strip().casefold()
+                    candidate_probe_ok, candidate_sample = _gp_adapter_status_sample(
+                        max_age=0.0
+                    )
+                    if not candidate_probe_ok:
+                        log.warning(
+                            "connect_globalprotect: adapter probe failed while "
+                            "waiting for stale UI to settle"
+                        )
+                        continue
+                    candidate_adapter = candidate_sample.strip().casefold()
                     win = candidate
                     status_state = candidate_status
                     button_state = candidate_button
@@ -1688,7 +2618,7 @@ class BancoChileSwitcher:
 
             if adapter_up:
                 self._gp_disconnect_confirmed = False
-            if status_state == "connected" or adapter_up:
+            if adapter_up:
                 connected_target = self._gp_connected_target()
                 if connected_target == BANCOCHILE:
                     self._last_gp_target = BANCOCHILE
@@ -1715,6 +2645,7 @@ class BancoChileSwitcher:
                 else:
                     return False, "GlobalProtect is changing state. Wait a moment and retry."
 
+            stale_login_hwnds: set[int] = set()
             connect_transition = "started" if resume_existing_attempt else ""
             if not resume_existing_attempt:
                 if _autofill_cancel.is_set():
@@ -1725,7 +2656,8 @@ class BancoChileSwitcher:
                 if status_state in {"disconnected", "not connected", "connection failed"}:
                     _gp_cleanup_terminal_windows(portal, wait_seconds=0.5)
                 stale_login_hwnds = {
-                    hwnd for hwnd, _title in _gp_list_terminal_windows(portal)
+                    hwnd for hwnd, title in _gp_list_terminal_windows(portal)
+                    if title == GP_LOGIN_TITLE
                 }
                 if not _gp_set_portal(win, portal):
                     return False, f"Could not select the {profile_name} GlobalProtect portal."
@@ -1779,7 +2711,8 @@ class BancoChileSwitcher:
                         "disconnect" in retry_button and "connect" in retry_button
                     )
                     late_login_hwnds = {
-                        hwnd for hwnd, _title in _gp_list_terminal_windows(portal)
+                        hwnd for hwnd, title in _gp_list_terminal_windows(portal)
+                        if title == GP_LOGIN_TITLE
                     }
                     if late_login_hwnds - stale_login_hwnds:
                         # The first action did work, but WebView2 published its
@@ -1854,8 +2787,9 @@ class BancoChileSwitcher:
                             else:
                                 fresh_before_retry = {
                                     hwnd
-                                    for hwnd, _title in _gp_list_terminal_windows(portal)
-                                    if hwnd not in retry_stale_login_hwnds
+                                    for hwnd, title in _gp_list_terminal_windows(portal)
+                                    if title == GP_LOGIN_TITLE
+                                    and hwnd not in retry_stale_login_hwnds
                                 }
                                 if fresh_before_retry:
                                     connect_transition = "started"
@@ -1918,22 +2852,22 @@ class BancoChileSwitcher:
                 return status
 
             def _connected_probe():
-                # Prefer the cheap/authoritative UI state, but still sample the
-                # adapter periodically while PanGPA remains on Connecting.  Some
-                # builds hide/recreate the main window before changing its text.
-                if last_main_status[0] == "connected":
-                    return True
+                # Only a successful adapter probe at Up confirms the tunnel.
+                # PanGPA's UI can remain frozen on Connected after teardown.
                 now = time.time()
                 if now >= next_adapter_probe[0]:
-                    adapter_connected[0] = _gp_adapter_status().casefold() == "up"
+                    probe_ok, sampled = _gp_adapter_status_sample(max_age=0.0)
+                    adapter_connected[0] = (
+                        probe_ok and sampled.strip().casefold() == "up"
+                    )
                     next_adapter_probe[0] = now + 2.0
                 return adapter_connected[0]
 
-            if connect_transition in {"connected_status", "connected_adapter"}:
+            if connect_transition == "connected_adapter":
                 outcome = "connected"
+            else:
                 if connect_transition == "connected_status":
                     last_main_status[0] = "connected"
-            else:
                 outcome = _gp_handle_saml_signin(
                     username,
                     password_provider=_password_provider,
@@ -1941,9 +2875,26 @@ class BancoChileSwitcher:
                     connected_probe=_connected_probe,
                     status_probe=_status_probe,
                     progress=progress,
+                    flow_mode=self.config.get("bancochile_flow_mode", "detect"),
+                    flow_steps=self.config.get(
+                        "bancochile_flow_steps",
+                        ["account", "password", "mfa"],
+                    ),
+                    ignored_login_hwnds=stale_login_hwnds,
                 )
             log.info("connect_globalprotect: SAML outcome=%s", outcome)
             if outcome == "connected":
+                final_probe_ok, final_adapter = _gp_adapter_status_sample(max_age=0.0)
+                if not final_probe_ok:
+                    return False, (
+                        "GlobalProtect reported Connected, but the adapter state "
+                        "could not be verified. Retry status detection in a moment."
+                    )
+                if final_adapter.strip().casefold() != "up":
+                    return False, (
+                        "GlobalProtect reported Connected, but its adapter is not Up. "
+                        "The connection was not accepted as successful."
+                    )
                 self._last_gp_target = BANCOCHILE
                 self._gp_disconnect_confirmed = False
                 # Closing is best-effort and never changes the connection result.
@@ -1975,6 +2926,12 @@ class BancoChileSwitcher:
                     "if it repeats, the VPN access or SAML mapping must be checked by its "
                     "administrator."
                 )
+            if outcome == "adapter_not_up":
+                return False, (
+                    "GlobalProtect reported Connected, but its adapter did not "
+                    "reach Up within the safe verification window. Retry after "
+                    "the client finishes settling."
+                )
             if outcome in {
                 "password_input_failed",
                 "password_submit_failed",
@@ -1998,27 +2955,35 @@ class BancoChileSwitcher:
                 or BANCOCHILE_PORTAL
             )
 
-            def _finished(message: str) -> Tuple[bool, str]:
+            def _finished(
+                message: str,
+                *,
+                apply_reconnect_cooldown: bool = False,
+            ) -> Tuple[bool, str]:
                 self._gp_disconnect_confirmed = True
                 self._last_gp_target = None
+                if apply_reconnect_cooldown:
+                    self._next_connect_not_before = max(
+                        self._next_connect_not_before,
+                        time.monotonic() + GP_POST_DISCONNECT_COOLDOWN_SECONDS,
+                    )
                 _gp_cleanup_terminal_windows(active_portal, wait_seconds=0.5)
                 return True, message
 
-            win = _gp_get_window(timeout=2)
-            gp_exe = None
-            if not win:
-                gp_exe = _find_exe(
-                    GP_EXE_CANDIDATES,
-                    self.config.get("bancochile_gp_exe_path", ""),
-                )
-                log.info(f"disconnect_globalprotect: launching {gp_exe} to find window")
-                if gp_exe:
-                    if _autofill_cancel.is_set():
-                        return False, "__GP_CANCELLED__"
-                    _open_gui(gp_exe)
-                    win = _gp_get_window(timeout=10)
+            gp_exe = _find_exe(
+                GP_EXE_CANDIDATES,
+                self.config.get("bancochile_gp_exe_path", ""),
+            )
+            if _autofill_cancel.is_set():
+                return False, "__GP_CANCELLED__"
+            # Always ask PanGPA for a visible, freshly wrapped main popup before
+            # inspecting the shared Connect/Disconnect toggle. This is harmless
+            # when it is already visible and avoids acting on a hidden stale HWND.
+            win = _ensure_gp_main_window(gp_exe or "")
 
             if not win:
+                if _autofill_cancel.is_set():
+                    return False, "__GP_CANCELLED__"
                 log.error("disconnect_globalprotect: window not found")
                 return False, "GlobalProtect window not found."
 
@@ -2035,8 +3000,83 @@ class BancoChileSwitcher:
             # Connect/Disconnect toggle.  Let the bounded adapter polling below
             # confirm teardown instead; the adapter can lag behind PanGPA's text.
             low_before = status_before.strip().lower()
-            adapter_before = _gp_adapter_status().strip().casefold()
+            adapter_probe_ok, adapter_sample = _gp_adapter_status_sample(max_age=0.0)
+            if not adapter_probe_ok:
+                return False, (
+                    "Could not verify the GlobalProtect adapter state. "
+                    "No disconnect action was taken; retry in a moment."
+                )
+            adapter_before = adapter_sample.strip().casefold()
             button_state = button_label.strip().casefold()
+            disconnect_deadline = (
+                time.monotonic() + GP_DISCONNECT_VERIFY_TIMEOUT_SECONDS
+            )
+
+            def _reacquire_disconnect_snapshot():
+                """Return one visible, current popup snapshot for a physical action."""
+                if _autofill_cancel.is_set():
+                    return "cancelled", None, "", "", ""
+                if time.monotonic() >= disconnect_deadline:
+                    return "timed_out", None, "", "", ""
+                fresh_win = _ensure_gp_main_window(
+                    gp_exe or "",
+                    deadline=disconnect_deadline,
+                )
+                if _autofill_cancel.is_set():
+                    return "cancelled", None, "", "", ""
+                if not fresh_win:
+                    return (
+                        "timed_out" if time.monotonic() >= disconnect_deadline else "missing",
+                        None,
+                        "",
+                        "",
+                        "",
+                    )
+                fresh_status = _gp_get_status_text(fresh_win).strip().casefold()
+                fresh_button = _gp_get_button_label(fresh_win).strip().casefold()
+                remaining = disconnect_deadline - time.monotonic()
+                if remaining < 0.1:
+                    return "timed_out", fresh_win, fresh_status, fresh_button, ""
+                fresh_probe_ok, fresh_sample = _gp_adapter_status_sample(
+                    max_age=0.0,
+                    probe_timeout=min(GP_ADAPTER_PROBE_TIMEOUT_SECONDS, remaining),
+                )
+                if not fresh_probe_ok:
+                    return "adapter_unknown", fresh_win, fresh_status, fresh_button, ""
+                fresh_adapter = fresh_sample.strip().casefold()
+                return (
+                    "ready",
+                    fresh_win,
+                    fresh_status,
+                    fresh_button,
+                    fresh_adapter,
+                )
+
+            def _snapshot_has_safe_disconnect(
+                snapshot_status: str,
+                snapshot_button: str,
+                snapshot_adapter: str,
+                *,
+                require_adapter_up: bool = False,
+            ) -> bool:
+                if "disconnect" not in snapshot_button:
+                    return False
+                if require_adapter_up:
+                    return (
+                        snapshot_adapter == "up"
+                        and (
+                            snapshot_status == "connected"
+                            or snapshot_status.startswith("connecting")
+                        )
+                    )
+                if snapshot_status == "connected":
+                    # A terminal/unknown adapter with a lingering Connected label
+                    # is the stale-frame race that can turn a second click into a
+                    # new Connect attempt.
+                    return snapshot_adapter == "up"
+                # Connecting can be cancelled before the adapter reaches Up.
+                return snapshot_status.startswith("connecting")
+
             terminal_before = low_before in {
                 "disconnected",
                 "not connected",
@@ -2051,7 +3091,10 @@ class BancoChileSwitcher:
             stale_connected_without_adapter = (
                 low_before == "connected"
                 and disconnect_button_before
-                and adapter_before in GP_ADAPTER_DISCONNECTED_STATES
+                and (
+                    not adapter_before
+                    or adapter_before in GP_ADAPTER_DISCONNECTED_STATES
+                )
             )
             initially_disconnected_ui = (
                 terminal_before or (not low_before and connect_button_before)
@@ -2064,7 +3107,11 @@ class BancoChileSwitcher:
                     "waiting without pressing the toggle again"
                 )
             elif connecting_before:
-                if disconnect_button_before:
+                if _snapshot_has_safe_disconnect(
+                    low_before,
+                    button_state,
+                    adapter_before,
+                ):
                     if _autofill_cancel.is_set():
                         return False, "__GP_CANCELLED__"
                     if not _gp_invoke_connect_button(win, expected_action="disconnect"):
@@ -2081,13 +3128,22 @@ class BancoChileSwitcher:
                     "already terminal; treating the toggle as stale until independent "
                     "state confirms a tunnel or a safe disconnected UI"
                 )
-            elif not initially_disconnected_ui:
+            elif not initially_disconnected_ui and _snapshot_has_safe_disconnect(
+                low_before,
+                button_state,
+                adapter_before,
+            ):
                 if _autofill_cancel.is_set():
                     return False, "__GP_CANCELLED__"
                 if not _gp_invoke_connect_button(win, expected_action="disconnect"):
                     log.error("disconnect_globalprotect: failed to click Disconnect button")
                     return False, "Could not click Disconnect button."
                 disconnect_action_sent = True
+            elif not initially_disconnected_ui:
+                log.info(
+                    "disconnect_globalprotect: visible state/adapter did not jointly "
+                    "confirm a safe Disconnect action; waiting without clicking"
+                )
             else:
                 log.info(
                     "disconnect_globalprotect: UI already looks disconnected; "
@@ -2105,20 +3161,36 @@ class BancoChileSwitcher:
             adapter_clear_samples = (
                 1
                 if initially_disconnected_ui
-                and adapter_before in GP_ADAPTER_DISCONNECTED_STATES
+                and (
+                    not adapter_before
+                    or adapter_before in GP_ADAPTER_DISCONNECTED_STATES
+                )
                 else 0
             )
-            for attempt in range(18):
+            saw_adapter_probe_failure = False
+            attempt_index = 0
+            while (
+                attempt_index < 18
+                and time.monotonic() < disconnect_deadline
+            ):
+                attempt = attempt_index
+                attempt_index += 1
                 if _autofill_cancel.is_set():
                     if not (disconnect_action_sent or disconnect_already_in_progress):
                         return False, "__GP_CANCELLED__"
                     cancel_after_action = True
-                time.sleep(0.2 if cancel_after_action else 0.7)
+                remaining = disconnect_deadline - time.monotonic()
+                if remaining <= 0.0:
+                    break
+                time.sleep(min(0.2 if cancel_after_action else 0.7, remaining))
                 if _autofill_cancel.is_set():
                     if not (disconnect_action_sent or disconnect_already_in_progress):
                         return False, "__GP_CANCELLED__"
                     cancel_after_action = True
-                cur_win = _gp_get_window(timeout=0.5)
+                remaining = disconnect_deadline - time.monotonic()
+                if remaining <= 0.0:
+                    break
+                cur_win = _gp_get_window(timeout=min(0.5, remaining))
                 cur_status = _gp_get_status_text(cur_win) if cur_win else ""
                 if cur_status and cur_status != last_status:
                     log.info(f"disconnect_globalprotect: status '{last_status}' -> '{cur_status}'")
@@ -2159,7 +3231,25 @@ class BancoChileSwitcher:
                     and (cancel_after_action or not cur_win or attempt % 3 == 2)
                 )
                 if should_probe_adapter:
-                    adapter_state = _gp_adapter_status().strip().casefold()
+                    remaining = disconnect_deadline - time.monotonic()
+                    if remaining < 0.1:
+                        break
+                    probe_ok, sampled_adapter = _gp_adapter_status_sample(
+                        max_age=0.0,
+                        probe_timeout=min(
+                            GP_ADAPTER_PROBE_TIMEOUT_SECONDS,
+                            remaining,
+                        ),
+                    )
+                    if not probe_ok:
+                        saw_adapter_probe_failure = True
+                        adapter_clear_samples = 0
+                        log.warning(
+                            "disconnect_globalprotect: adapter probe failed during "
+                            "teardown verification"
+                        )
+                        continue
+                    adapter_state = sampled_adapter.strip().casefold()
                     if stale_connected_without_adapter and adapter_state == "up":
                         log.info(
                             "disconnect_globalprotect: adapter became Up; the Connected "
@@ -2168,7 +3258,10 @@ class BancoChileSwitcher:
                         stale_connected_without_adapter = False
                         adapter_clear_samples = 0
                     elif (
-                        adapter_state in GP_ADAPTER_DISCONNECTED_STATES
+                        (
+                            not adapter_state
+                            or adapter_state in GP_ADAPTER_DISCONNECTED_STATES
+                        )
                         and (
                             ui_reports_disconnected
                             or not stale_connected_without_adapter
@@ -2181,10 +3274,15 @@ class BancoChileSwitcher:
                                 "state=%r",
                                 adapter_state,
                             )
+                            completed_transition = (
+                                disconnect_action_sent
+                                or disconnect_already_in_progress
+                            )
                             finished = _finished(
                                 "GlobalProtect disconnected."
-                                if disconnect_action_sent or disconnect_already_in_progress
-                                else "GlobalProtect already disconnected."
+                                if completed_transition
+                                else "GlobalProtect already disconnected.",
+                                apply_reconnect_cooldown=completed_transition,
                             )
                             if cancel_after_action:
                                 return False, "__GP_CANCELLED__"
@@ -2211,10 +3309,35 @@ class BancoChileSwitcher:
                         "disconnect_globalprotect: UI returned to Connected; "
                         "sending the first safe Disconnect action"
                     )
-                    if _autofill_cancel.is_set():
+                    (
+                        snapshot_kind,
+                        action_win,
+                        action_status,
+                        action_button,
+                        action_adapter,
+                    ) = _reacquire_disconnect_snapshot()
+                    if snapshot_kind == "cancelled":
                         return False, "__GP_CANCELLED__"
+                    if snapshot_kind != "ready":
+                        log.info(
+                            "disconnect_globalprotect: popup could not be reacquired "
+                            "before the first deferred Disconnect action"
+                        )
+                        continue
+                    if not _snapshot_has_safe_disconnect(
+                        action_status,
+                        action_button,
+                        action_adapter,
+                    ):
+                        if action_status.startswith("disconnecting"):
+                            disconnect_already_in_progress = True
+                        log.info(
+                            "disconnect_globalprotect: state changed before the first "
+                            "deferred Disconnect action; no button was pressed"
+                        )
+                        continue
                     if not _gp_invoke_connect_button(
-                        cur_win,
+                        action_win,
                         expected_action="disconnect",
                     ):
                         return False, "Could not click the GlobalProtect Disconnect button."
@@ -2233,36 +3356,48 @@ class BancoChileSwitcher:
                         "disconnect_globalprotect: first action had no observable effect; "
                         "retrying once with click_input"
                     )
-                    retry_adapter = _gp_adapter_status().strip().casefold()
+                    (
+                        snapshot_kind,
+                        retry_win,
+                        latest_status,
+                        latest_button,
+                        retry_adapter,
+                    ) = _reacquire_disconnect_snapshot()
+                    if snapshot_kind == "cancelled":
+                        return False, "__GP_CANCELLED__"
+                    if snapshot_kind != "ready":
+                        log.info(
+                            "disconnect_globalprotect: popup could not be reacquired "
+                            "before the physical retry"
+                        )
+                        continue
                     if retry_adapter != "up":
                         log.info(
                             "disconnect_globalprotect: skipping physical retry because "
                             "adapter is no longer confirmed Up (state=%r)",
                             retry_adapter or "unknown",
                         )
-                        if retry_adapter in GP_ADAPTER_DISCONNECTED_STATES:
+                        if (
+                            not retry_adapter
+                            or retry_adapter in GP_ADAPTER_DISCONNECTED_STATES
+                        ):
                             # Once teardown is independently visible, a later stale
                             # Connected label must never re-enable the second click.
                             physical_retry = True
                         continue
-                    latest_status = _gp_get_status_text(cur_win).strip().casefold()
-                    latest_button = _gp_get_button_label(cur_win).strip().casefold()
-                    if not (
-                        (
-                            latest_status == "connected"
-                            or latest_status.startswith("connecting")
-                        )
-                        and "disconnect" in latest_button
+                    if not _snapshot_has_safe_disconnect(
+                        latest_status,
+                        latest_button,
+                        retry_adapter,
+                        require_adapter_up=True,
                     ):
                         log.info(
                             "disconnect_globalprotect: state changed before physical retry; "
                             "continuing verification without another click"
                         )
                         continue
-                    if _autofill_cancel.is_set():
-                        return False, "__GP_CANCELLED__"
                     if not _gp_invoke_connect_button(
-                        cur_win,
+                        retry_win,
                         expected_action="disconnect",
                         prefer_click_input=True,
                     ):
@@ -2280,21 +3415,34 @@ class BancoChileSwitcher:
                     )
                 )
                 if needs_rehydrate:
-                    if gp_exe is None:
-                        gp_exe = _find_exe(
-                            GP_EXE_CANDIDATES,
-                            self.config.get("bancochile_gp_exe_path", ""),
-                        )
-                    if not gp_exe:
-                        continue
                     log.info(
                         "disconnect_globalprotect: main controls disappeared; reopening "
                         "PanGPA to verify the action"
                     )
-                    if _autofill_cancel.is_set():
+                    (
+                        snapshot_kind,
+                        rehydrated_win,
+                        rehydrated_status,
+                        rehydrated_button,
+                        rehydrated_adapter,
+                    ) = _reacquire_disconnect_snapshot()
+                    if snapshot_kind == "cancelled":
                         return False, "__GP_CANCELLED__"
-                    _open_gui(gp_exe)
                     relaunched = True
+                    if snapshot_kind == "ready":
+                        cur_win = rehydrated_win
+                        log.info(
+                            "disconnect_globalprotect: rehydrated snapshot status=%r "
+                            "button=%r adapter=%r",
+                            rehydrated_status,
+                            rehydrated_button,
+                            rehydrated_adapter,
+                        )
+                    else:
+                        log.info(
+                            "disconnect_globalprotect: PanGPA popup remained unavailable "
+                            "after the bounded rehydrate attempt"
+                        )
 
                 if cancel_after_action:
                     cancel_verification_attempts += 1
@@ -2305,5 +3453,15 @@ class BancoChileSwitcher:
                         )
                         return False, "__GP_CANCELLED__"
 
+            if time.monotonic() >= disconnect_deadline:
+                log.warning(
+                    "disconnect_globalprotect: verification reached %.1fs deadline",
+                    GP_DISCONNECT_VERIFY_TIMEOUT_SECONDS,
+                )
+            if saw_adapter_probe_failure:
+                return False, (
+                    "GlobalProtect disconnect could not be verified because the "
+                    "adapter status probe failed."
+                )
             log.warning(f"disconnect_globalprotect: did not confirm disconnect, last='{last_status}'")
             return False, "GlobalProtect did not finish disconnecting."

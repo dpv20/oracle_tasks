@@ -37,6 +37,11 @@ class BancoChileConfigTests(unittest.TestCase):
         self.assertEqual(saved["bancochile_username"], "")
         self.assertEqual(saved["bancochile_password_enc"], "")
         self.assertEqual(saved["bancochile_gp_exe_path"], "")
+        self.assertEqual(saved["bancochile_flow_mode"], "detect")
+        self.assertEqual(
+            saved["bancochile_flow_steps"],
+            ["account", "password", "mfa"],
+        )
         self.assertTrue(saved["vpn_show_bancochile"])
         self.assertFalse(any(key.startswith("gp_") for key in saved))
 
@@ -64,6 +69,8 @@ class BancoChileConfigTests(unittest.TestCase):
             "bancochile_password_enc": "dedicated-secret",
             "bancochile_portal_url": "custom.bancochile.cl",
             "bancochile_gp_exe_path": "dedicated.exe",
+            "bancochile_flow_mode": "custom",
+            "bancochile_flow_steps": ["account", "mfa"],
             "vpn_show_bancochile": False,
         })
 
@@ -73,6 +80,11 @@ class BancoChileConfigTests(unittest.TestCase):
         self.assertEqual(config.values["bancochile_password_enc"], "dedicated-secret")
         self.assertEqual(config.values["bancochile_portal_url"], "custom.bancochile.cl")
         self.assertEqual(config.values["bancochile_gp_exe_path"], "dedicated.exe")
+        self.assertEqual(config.values["bancochile_flow_mode"], "custom")
+        self.assertEqual(
+            config.values["bancochile_flow_steps"],
+            ["account", "mfa"],
+        )
         self.assertFalse(config.values["vpn_show_bancochile"])
         self.assertEqual(config.updates, [])
 

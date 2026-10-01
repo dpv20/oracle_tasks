@@ -53,7 +53,7 @@ def _bare_panel():
 
 
 class VPNSettingsPanelTests(unittest.TestCase):
-    def test_legacy_tab_names_remain_unchanged_and_banco_is_additive(self) -> None:
+    def test_vpn_tab_names_are_plain_profile_names(self) -> None:
         previous = i18n.get_language()
         try:
             for language in ("en", "es"):
@@ -63,12 +63,36 @@ class VPNSettingsPanelTests(unittest.TestCase):
                     self.assertEqual(
                         settings_panel.VPNSettingsPanel._tab_names(),
                         (
-                            "Oracle / Cisco",
-                            "Falabella / FortiClient",
-                            "BICE / GlobalProtect",
+                            "Oracle",
+                            "Falabella",
+                            "BICE",
                             "Banco de Chile",
                             diagnostics,
                         ),
+                    )
+        finally:
+            i18n.set_language(previous)
+
+    def test_visibility_checkbox_labels_are_plain_profile_names(self) -> None:
+        previous = i18n.get_language()
+        try:
+            for language in ("en", "es"):
+                with self.subTest(language=language):
+                    i18n.set_language(language)
+                    self.assertEqual(i18n.t("vpn.show_forti"), "Falabella")
+                    self.assertEqual(i18n.t("vpn.show_bice"), "BICE")
+                    self.assertEqual(
+                        i18n.t("vpn.show_bancochile"),
+                        "Banco de Chile",
+                    )
+                    self.assertEqual(
+                        i18n.t("settings.vpn.show_forti"),
+                        "Falabella",
+                    )
+                    self.assertEqual(i18n.t("settings.vpn.show_bice"), "BICE")
+                    self.assertEqual(
+                        i18n.t("settings.vpn.show_bancochile"),
+                        "Banco de Chile",
                     )
         finally:
             i18n.set_language(previous)
@@ -117,6 +141,10 @@ class VPNSettingsPanelTests(unittest.TestCase):
             password=_Value("bancochile-password"),
             portal=_Value("   "),
             gp_exe=_Value("BancoPanGPA.exe"),
+            flow=_Value("settings.vpn.flow_custom"),
+            step_account=_Value(True),
+            step_password=_Value(False),
+            step_mfa=_Value(True),
             visible=_Value(True),
         )
 
@@ -125,6 +153,11 @@ class VPNSettingsPanelTests(unittest.TestCase):
                 settings_bancodechile,
                 "encrypt_password",
                 return_value="cipher:bancochile-password",
+            ),
+            patch.object(
+                settings_bancodechile,
+                "t",
+                side_effect=lambda key, **_kwargs: key,
             ),
         ):
             settings_bancodechile.BancoChileSettingsSection.save(section)
@@ -140,6 +173,8 @@ class VPNSettingsPanelTests(unittest.TestCase):
             "bchmfa.bancochile.cl",
         )
         self.assertEqual(saved["bancochile_gp_exe_path"], "BancoPanGPA.exe")
+        self.assertEqual(saved["bancochile_flow_mode"], "custom")
+        self.assertEqual(saved["bancochile_flow_steps"], ["account", "mfa"])
         self.assertNotIn("gp_username", saved)
         self.assertNotIn("gp_password_enc", saved)
 

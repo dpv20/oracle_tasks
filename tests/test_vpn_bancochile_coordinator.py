@@ -16,6 +16,7 @@ from features.vpn.coordinator_bancodechile import (  # noqa: E402
     CISCO,
     FORTI,
     GPROT,
+    GPROT_UNKNOWN,
     NONE,
     BancoChileVPNCoordinator,
     VPNResult,
@@ -52,6 +53,16 @@ class _LegacyService:
         self.last_status = self.try_get_status_result
         return self.try_get_status_result
 
+    def try_get_monitor_status(self):
+        self.calls.append(("try_get_monitor_status",))
+        self.last_status = self.try_get_status_result
+        return self.try_get_status_result
+
+    def get_monitor_status(self):
+        self.calls.append(("get_monitor_status",))
+        self.last_status = self.get_status_result
+        return self.get_status_result
+
     def retry_forti_credentials(self):
         self.calls.append(("retry_forti_credentials",))
         self.last_status = self.retry_result.status
@@ -71,8 +82,10 @@ class _BancoSwitcher:
         self.connect_result = (True, "Banco connected")
         self.disconnect_result = (True, "Banco disconnected")
         self.status = BANCOCHILE
+        self.last_status_probe_ok: bool | None = True
         self.cancel_values: list[bool] = []
         self.cancel_current_calls = 0
+        self.adapter_statuses: list[str] = []
 
     def connect_bancochile(self, progress=None):
         self.events.append(("bank_connect", progress))
@@ -84,8 +97,9 @@ class _BancoSwitcher:
             self.status = NONE
         return self.disconnect_result
 
-    def get_bancochile_status(self):
+    def get_bancochile_status(self, adapter_status=""):
         self.events.append(("bank_status",))
+        self.adapter_statuses.append(adapter_status)
         return self.status
 
     def cancel_current(self):
@@ -151,6 +165,105 @@ class BancoChileCoordinatorIsolationTests(unittest.TestCase):
         self.assertEqual(new_status, BANCOCHILE)
         self.assertTrue(coordinator.is_status_snapshot_current(new_revision))
 
+    def test_monitor_adopts_a_manually_connected_banco_portal(self) -> None:
+        coordinator, legacy, created = self._coordinator()
+
+        revision, status = coordinator.reconcile_monitored_status(GPROT)
+
+        self.assertEqual(status, BANCOCHILE)
+        self.assertTrue(coordinator.owns_bancochile)
+        self.assertTrue(coordinator.is_status_snapshot_current(revision))
+        self.assertEqual(created[0].events, [("bank_status",)])
+        self.assertEqual(created[0].adapter_statuses, ["Up"])
+        self.assertEqual(legacy.calls, [])
+
+    def test_monitor_releases_banco_after_manual_disconnect(self) -> None:
+        coordinator, _legacy, created = self._coordinator()
+        coordinator._set_owned(True, BANCOCHILE, confirmed=True)
+        switcher = coordinator._get_switcher()
+        switcher.status = NONE
+
+        _revision, status = coordinator.reconcile_monitored_status(NONE)
+
+        self.assertEqual(status, NONE)
+        self.assertFalse(coordinator.owns_bancochile)
+        self.assertIsNone(coordinator.last_status)
+        self.assertEqual(created[0].adapter_statuses, ["Disabled"])
+
+    def test_monitor_preserves_new_legacy_vpn_when_releasing_banco(self) -> None:
+        coordinator, _legacy, _created = self._coordinator()
+        coordinator._set_owned(True, BANCOCHILE, confirmed=True)
+        coordinator._get_switcher().status = NONE
+
+        _revision, status = coordinator.reconcile_monitored_status(CISCO)
+
+        self.assertEqual(status, CISCO)
+        self.assertFalse(coordinator.owns_bancochile)
+
+    def test_monitor_releases_banco_when_another_gp_portal_replaces_it(self) -> None:
+        coordinator, _legacy, _created = self._coordinator()
+        coordinator._set_owned(True, BANCOCHILE, confirmed=True)
+        switcher = coordinator._get_switcher()
+        switcher.status = GPROT_UNKNOWN
+
+        _revision, status = coordinator.reconcile_monitored_status(GPROT)
+
+        self.assertEqual(status, GPROT)
+        self.assertFalse(coordinator.owns_bancochile)
+
+    def test_monitor_keeps_banco_owned_when_its_adapter_probe_fails(self) -> None:
+        coordinator, _legacy, _created = self._coordinator()
+        coordinator._set_owned(True, BANCOCHILE, confirmed=True)
+        switcher = coordinator._get_switcher()
+        switcher.status = GPROT_UNKNOWN
+        switcher.last_status_probe_ok = False
+
+        _revision, status = coordinator.try_get_monitored_status()
+
+        self.assertEqual(status, BANCOCHILE)
+        self.assertTrue(coordinator.owns_bancochile)
+        self.assertEqual(coordinator.last_status, BANCOCHILE)
+
+    def test_monitor_does_not_load_banco_for_non_globalprotect_legacy_status(self) -> None:
+        coordinator, _legacy, created = self._coordinator()
+
+        _revision, status = coordinator.reconcile_monitored_status(CISCO)
+
+        self.assertEqual(status, CISCO)
+        self.assertEqual(created, [])
+
+    def test_unified_monitor_reads_banco_directly_while_owned(self) -> None:
+        coordinator, legacy, created = self._coordinator()
+        coordinator._set_owned(True, BANCOCHILE, confirmed=True)
+
+        _revision, status = coordinator.try_get_monitored_status()
+
+        self.assertEqual(status, BANCOCHILE)
+        self.assertEqual(created[0].events, [("bank_status",)])
+        self.assertEqual(legacy.calls, [])
+
+    def test_unified_monitor_reads_legacy_once_after_manual_banco_teardown(self) -> None:
+        coordinator, legacy, _created = self._coordinator()
+        coordinator._set_owned(True, BANCOCHILE, confirmed=True)
+        coordinator._get_switcher().status = NONE
+        legacy.try_get_status_result = FORTI
+
+        _revision, status = coordinator.try_get_monitored_status()
+
+        self.assertEqual(status, FORTI)
+        self.assertFalse(coordinator.owns_bancochile)
+        self.assertEqual(legacy.calls, [("try_get_monitor_status",)])
+
+    def test_unified_monitor_uses_legacy_fast_path_while_banco_is_idle(self) -> None:
+        coordinator, legacy, created = self._coordinator()
+        legacy.try_get_status_result = CISCO
+
+        _revision, status = coordinator.try_get_monitored_status()
+
+        self.assertEqual(status, CISCO)
+        self.assertEqual(legacy.calls, [("try_get_monitor_status",)])
+        self.assertEqual(created, [])
+
     def test_monitor_snapshots_are_invalidated_at_banco_operation_boundaries(self) -> None:
         coordinator, _legacy, _created = self._coordinator()
 
@@ -209,6 +322,7 @@ class BancoChileCoordinatorIsolationTests(unittest.TestCase):
     def test_connecting_bancochile_disconnects_legacy_then_uses_switcher(self) -> None:
         events: list[tuple] = []
         legacy = _LegacyService()
+        legacy.get_status_result = CISCO
 
         def legacy_switch(target, progress=None):
             events.append(("legacy_switch", target, progress))
@@ -230,7 +344,6 @@ class BancoChileCoordinatorIsolationTests(unittest.TestCase):
             [
                 ("legacy_switch", NONE, progress),
                 ("bank_connect", progress),
-                ("bank_status",),
             ],
         )
         self.assertEqual(result, VPNResult(True, "Banco connected", BANCOCHILE))
@@ -239,6 +352,35 @@ class BancoChileCoordinatorIsolationTests(unittest.TestCase):
             switcher.config,
             {"bancochile_username": "user@example.test"},
         )
+
+    def test_manual_banco_session_is_adopted_without_disconnect_or_reconnect(self) -> None:
+        coordinator, legacy, created = self._coordinator()
+        legacy.get_status_result = GPROT
+
+        result = coordinator.switch_to(BANCOCHILE)
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.status, BANCOCHILE)
+        self.assertEqual(result.message, "VPN is already connected.")
+        self.assertTrue(coordinator.owns_bancochile)
+        self.assertEqual(legacy.calls, [("get_monitor_status",)])
+        self.assertEqual(created[0].events, [("bank_status",)])
+        self.assertNotIn(("bank_connect", None), created[0].events)
+
+    def test_unknown_active_gp_portal_is_never_disconnected_to_connect_banco(self) -> None:
+        coordinator, legacy, created = self._coordinator()
+        legacy.get_status_result = GPROT
+        switcher = coordinator._get_switcher()
+        switcher.status = GPROT_UNKNOWN
+        switcher.last_status_probe_ok = True
+
+        result = coordinator.switch_to(BANCOCHILE)
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error_code, "gp_portal_unknown")
+        self.assertEqual(result.status, GPROT_UNKNOWN)
+        self.assertEqual(legacy.calls, [("get_monitor_status",)])
+        self.assertEqual(created[0].events, [("bank_status",)])
 
     def test_leaving_owned_bancochile_disconnects_before_exact_legacy_result(self) -> None:
         events: list[tuple] = []
@@ -270,7 +412,6 @@ class BancoChileCoordinatorIsolationTests(unittest.TestCase):
             [
                 ("bank_status",),
                 ("bank_disconnect",),
-                ("bank_status",),
                 ("legacy_switch", CISCO, progress),
             ],
         )
@@ -333,7 +474,7 @@ class BancoChileCoordinatorIsolationTests(unittest.TestCase):
         self.assertEqual(second.status, BANCOCHILE)
         self.assertEqual(
             [call for call in legacy.calls if call[0] == "switch_to"],
-            [("switch_to", NONE, None)],
+            [],
         )
 
     def test_cancel_does_not_reach_banco_after_legacy_handoff_begins(self) -> None:
@@ -473,7 +614,7 @@ class BancoChileCoordinatorIsolationTests(unittest.TestCase):
         self.assertNotIn(("bank_connect", None), switcher.events)
         self.assertEqual(
             [call for call in legacy.calls if call[0] == "switch_to"],
-            [("switch_to", NONE, None)],
+            [],
         )
 
     def test_prepared_token_cannot_be_stolen_or_cancelled_by_another_request(self) -> None:
@@ -499,15 +640,14 @@ class BancoChileCoordinatorIsolationTests(unittest.TestCase):
         )
         self.assertTrue(coordinator.switch_to(BANCOCHILE).ok)
         legacy.calls.clear()
-        original_status = switcher.get_bancochile_status
+        original_disconnect = switcher.disconnect_bancochile
 
-        def status_with_cancel():
-            status = original_status()
-            if status == NONE:
-                coordinator.cancel_current()
-            return status
+        def disconnect_with_cancel():
+            result = original_disconnect()
+            coordinator.cancel_current()
+            return result
 
-        switcher.get_bancochile_status = status_with_cancel
+        switcher.disconnect_bancochile = disconnect_with_cancel
 
         result = coordinator.switch_to(CISCO)
 
@@ -545,7 +685,6 @@ class BancoChileCoordinatorIsolationTests(unittest.TestCase):
                 ("progress", "Disconnecting Banco de Chile VPN (GlobalProtect)..."),
                 ("bank_status",),
                 ("bank_disconnect",),
-                ("bank_status",),
                 ("progress", BANCOCHILE_LEGACY_HANDOFF),
                 ("legacy_switch", CISCO),
             ],

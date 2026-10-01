@@ -43,6 +43,8 @@ _BANCOCHILE_CONFIG_KEYS = (
     "bancochile_password_enc",
     "bancochile_portal_url",
     "bancochile_gp_exe_path",
+    "bancochile_flow_mode",
+    "bancochile_flow_steps",
 )
 
 
@@ -106,6 +108,7 @@ class BancoChileVPNCoordinator:
         self._bank_connected_confirmed = False
         self._bank_last_status: str | None = None
         self._state_revision = 0
+        self._status_probe_failed = False
 
     @property
     def busy(self) -> bool:
@@ -134,6 +137,48 @@ class BancoChileVPNCoordinator:
             )
             return self._state_revision, visible
 
+    def reconcile_monitored_status(self, legacy_status: str) -> tuple[int, str]:
+        """Reconcile cached Banco ownership with one live monitor sample.
+
+        The legacy monitor deliberately remains the owner of Oracle, Falabella
+        and BICE.  A live Banco probe is only needed while Banco is already
+        owned, or when the legacy monitor sees an active GlobalProtect tunnel
+        that may have been connected manually.  The operation lock keeps this
+        read-only reconciliation out of an in-flight connect/disconnect.
+        """
+        if not self._operation_lock.acquire(blocking=False):
+            return self.visible_status_snapshot(legacy_status)
+        try:
+            owned = self._owns_bancochile()
+            if not owned and legacy_status != GPROT:
+                return self.visible_status_snapshot(legacy_status)
+
+            # The unchanged legacy monitor has just sampled the same adapter.
+            # When it reports no active VPN, reuse that terminal evidence for
+            # Banco's debounce instead of spawning another Get-NetAdapter
+            # PowerShell process (twice on the manual-disconnect path).
+            adapter_hint = "Up" if legacy_status == GPROT else "Disabled"
+            banco_status = self._safe_bancochile_status(adapter_hint)
+            if self._status_probe_failed:
+                return self.visible_status_snapshot(legacy_status)
+            if banco_status == BANCOCHILE:
+                self._set_owned(True, BANCOCHILE, confirmed=True)
+                return self.visible_status_snapshot(BANCOCHILE)
+
+            if owned:
+                # NONE means a manual teardown was observed.  UNKNOWN means a
+                # different live GlobalProtect portal replaced Banco.  In both
+                # cases Banco must release ownership so the unchanged legacy
+                # status can become visible again.
+                self._set_owned(False, NONE, confirmed=False)
+                return self.visible_status_snapshot(legacy_status)
+
+            # A live GlobalProtect tunnel that is not Banco belongs to the
+            # original legacy service (normally BICE).
+            return self.visible_status_snapshot(legacy_status)
+        finally:
+            self._operation_lock.release()
+
     def is_status_snapshot_current(self, revision: int) -> bool:
         with self._state_lock:
             return revision == self._state_revision
@@ -155,6 +200,43 @@ class BancoChileVPNCoordinator:
             return self._read_owned_bancochile_status()
         finally:
             self._operation_lock.release()
+
+    def try_get_monitored_status(self) -> tuple[int, str] | None:
+        """Read one unified monitor sample without slowing an owned Banco VPN.
+
+        While Banco owns GlobalProtect, its dedicated native-window probe is
+        enough and reacts immediately to a manual teardown. Otherwise the
+        unchanged legacy targets are sampled by the legacy service's fast
+        background path, then GlobalProtect is classified as Banco or BICE.
+        """
+        released_banco = False
+        if self._owns_bancochile():
+            if not self._operation_lock.acquire(blocking=False):
+                return self.visible_status_snapshot(NONE)
+            try:
+                if self._owns_bancochile():
+                    banco_status = self._safe_bancochile_status()
+                    if self._status_probe_failed:
+                        return self.visible_status_snapshot(NONE)
+                    if banco_status == BANCOCHILE:
+                        self._set_owned(True, BANCOCHILE, confirmed=True)
+                        return self.visible_status_snapshot(BANCOCHILE)
+                    self._set_owned(False, NONE, confirmed=False)
+                    released_banco = True
+            finally:
+                self._operation_lock.release()
+
+        reader = getattr(
+            self._legacy,
+            "try_get_monitor_status",
+            self._legacy.try_get_status,
+        )
+        legacy_status = reader()
+        if legacy_status is None:
+            return self.visible_status_snapshot(NONE) if released_banco else None
+        if released_banco:
+            return self.visible_status_snapshot(legacy_status)
+        return self.reconcile_monitored_status(legacy_status)
 
     def switch_to(
         self,
@@ -273,11 +355,44 @@ class BancoChileVPNCoordinator:
             resume_owned_attempt = status == BANCOCHILE
 
         # Legacy owns all legacy detection/disconnection. Banco code is not
-        # involved until that unchanged service confirms NONE.
+        # involved until the shared fast monitor sample identifies the active
+        # adapter. This avoids a stale PanGPA Connected label making the legacy
+        # BICE disconnect path toggle a tunnel that is already down.
         if not resume_owned_attempt:
-            legacy_result = self._legacy.switch_to(NONE, progress)
-            if not legacy_result.ok:
-                return legacy_result
+            legacy_status = self._read_legacy_monitor_status()
+            if legacy_status is None:
+                return VPNResult(
+                    False,
+                    "Could not verify the current VPN adapter state. "
+                    "No connection or disconnect action was sent.",
+                    self.last_status or self._legacy.last_status or NONE,
+                    "vpn_status_unknown",
+                )
+            if legacy_status == GPROT:
+                banco_status = self._safe_bancochile_status("Up")
+                if self._status_probe_failed:
+                    return VPNResult(
+                        False,
+                        "Could not identify the active GlobalProtect portal. "
+                        "No disconnect action was sent.",
+                        GPROT_UNKNOWN,
+                        "gp_portal_unknown",
+                    )
+                if banco_status == BANCOCHILE:
+                    self._set_owned(True, BANCOCHILE, confirmed=True)
+                    return VPNResult(True, "VPN is already connected.", BANCOCHILE)
+                if banco_status == GPROT_UNKNOWN:
+                    return VPNResult(
+                        False,
+                        "Could not identify the active GlobalProtect portal. "
+                        "No disconnect action was sent.",
+                        GPROT_UNKNOWN,
+                        "gp_portal_unknown",
+                    )
+            if legacy_status != NONE:
+                legacy_result = self._legacy.switch_to(NONE, progress)
+                if not legacy_result.ok:
+                    return legacy_result
             if self._cancel_requested.is_set():
                 return self._cancelled_result(NONE)
 
@@ -322,17 +437,13 @@ class BancoChileVPNCoordinator:
             self._set_owned(status != NONE, status, confirmed=False)
             return VPNResult(False, message, status)
 
-        status = self._safe_bancochile_status()
         if not self._close_cancellation_phase():
-            self._set_owned(status != NONE, status, confirmed=False)
-            return self._cancelled_result(status)
-        if status != BANCOCHILE:
-            self._set_owned(status != NONE, status, confirmed=False)
-            return VPNResult(
-                False,
-                "Banco de Chile reported success, but the connection could not be confirmed.",
-                status,
-            )
+            # A successful switcher result already means the configured portal
+            # and a live adapter at Up were both confirmed. Preserve that real
+            # state even if cancellation arrived immediately after the tunnel
+            # completed; no extra status probe is needed here.
+            self._set_owned(True, BANCOCHILE, confirmed=True)
+            return self._cancelled_result(BANCOCHILE)
         self._set_owned(True, BANCOCHILE, confirmed=True)
         return VPNResult(True, message, BANCOCHILE)
 
@@ -386,14 +497,11 @@ class BancoChileVPNCoordinator:
             status = self._safe_bancochile_status()
             self._set_owned(status != NONE, status, confirmed=False)
             return VPNResult(False, message, status)
-        status = self._safe_bancochile_status()
-        if status != NONE:
-            self._set_owned(True, status, confirmed=False)
-            return VPNResult(
-                False,
-                "Banco de Chile reported success, but disconnection could not be confirmed.",
-                status,
-            )
+        # ``disconnect_bancochile`` returns success only after the switcher has
+        # observed two terminal adapter samples.  Do not immediately perform a
+        # third independent probe here: a transient Get-NetAdapter failure (or a
+        # stale PanGPA frame) must not turn that strong confirmation into a false
+        # failure and leave the coordinator stuck owning Banco.
         self._set_owned(False, NONE, confirmed=False)
         return VPNResult(True, message, NONE)
 
@@ -515,10 +623,20 @@ class BancoChileVPNCoordinator:
             self._bank_last_status = next_status
             self._bank_connected_confirmed = next_confirmed
 
-    def _safe_bancochile_status(self) -> str:
+    def _safe_bancochile_status(self, adapter_status: str = "") -> str:
+        self._status_probe_failed = False
         try:
-            status = str(self._get_switcher().get_bancochile_status())
+            switcher = self._get_switcher()
+            if adapter_status:
+                status = str(
+                    switcher.get_bancochile_status(adapter_status=adapter_status)
+                )
+            else:
+                status = str(switcher.get_bancochile_status())
+            if getattr(switcher, "last_status_probe_ok", None) is False:
+                self._status_probe_failed = True
         except Exception:
+            self._status_probe_failed = True
             log.exception("Banco de Chile status detection failed")
             return GPROT_UNKNOWN
         if status in (BANCOCHILE, GPROT_UNKNOWN, NONE):
@@ -526,8 +644,23 @@ class BancoChileVPNCoordinator:
         log.warning("Unexpected Banco de Chile status: %r", status)
         return GPROT_UNKNOWN
 
+    def _read_legacy_monitor_status(self) -> str | None:
+        reader = getattr(self._legacy, "get_monitor_status", None)
+        if callable(reader):
+            status = reader()
+            return None if status is None else str(status)
+        quick_reader = getattr(self._legacy, "try_get_monitor_status", None)
+        if callable(quick_reader):
+            status = quick_reader()
+            if status is not None:
+                return str(status)
+        return str(self._legacy.get_status())
+
     def _read_owned_bancochile_status(self) -> str:
         status = self._safe_bancochile_status()
+        if self._status_probe_failed:
+            with self._state_lock:
+                return self._bank_last_status or BANCOCHILE
         if status == NONE:
             self._set_owned(False, NONE, confirmed=False)
             return NONE

@@ -46,6 +46,9 @@ class AppBackgroundTests(unittest.TestCase):
         app.bancochile_vpn_service.visible_status_snapshot.side_effect = (
             lambda status: (0, BANCOCHILE if bank_owned else status)
         )
+        app.bancochile_vpn_service.reconcile_monitored_status.side_effect = (
+            lambda status: (0, BANCOCHILE if bank_owned else status)
+        )
         app.bancochile_vpn_service.is_status_snapshot_current.side_effect = (
             lambda revision: revision == 0
         )
@@ -107,23 +110,27 @@ class AppBackgroundTests(unittest.TestCase):
 
         app._finish_vpn_action.assert_called_once_with(result)
 
-    def test_legacy_monitor_never_probes_banco(self) -> None:
+    def test_legacy_monitor_uses_banco_reconciliation_boundary(self) -> None:
         app = self._vpn_app()
 
         app._queue_legacy_vpn_status(CISCO)
 
-        app.bancochile_vpn_service.try_get_status.assert_not_called()
+        app.bancochile_vpn_service.reconcile_monitored_status.assert_called_once_with(
+            CISCO
+        )
         self.assertEqual(
             app._background_requests.get_nowait(),
             ("vpn_status", CISCO, 0),
         )
 
-    def test_owned_banco_monitor_uses_cached_status_without_probe(self) -> None:
+    def test_owned_banco_monitor_applies_reconciled_status(self) -> None:
         app = self._vpn_app(bank_owned=True)
 
         app._queue_legacy_vpn_status(CISCO)
 
-        app.bancochile_vpn_service.try_get_status.assert_not_called()
+        app.bancochile_vpn_service.reconcile_monitored_status.assert_called_once_with(
+            CISCO
+        )
         self.assertEqual(
             app._background_requests.get_nowait(),
             ("vpn_status", BANCOCHILE, 0),

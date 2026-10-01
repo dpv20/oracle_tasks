@@ -28,7 +28,7 @@ _FORTI_RETRY_ERRORS = (
 
 ProgressCallback = Callable[[str], None]
 StatusCallback = Callable[[str], None]
-MONITOR_INTERVAL_SECONDS = 15
+MONITOR_INTERVAL_SECONDS = 5
 
 
 @dataclass(frozen=True)
@@ -82,6 +82,32 @@ class VPNService:
                 return status
         finally:
             self._operation_lock.release()
+
+    def try_get_monitor_status(self) -> str | None:
+        """Return the non-interactive status sample used by the shared monitor."""
+        if not self._operation_lock.acquire(blocking=False):
+            return None
+        try:
+            with _com_apartment():
+                controller = self._get_controller()
+                self._reload_controller_config(controller)
+                status = _read_controller_monitor_status(controller)
+                if status is not None:
+                    self._last_status = status
+                return status
+        finally:
+            self._operation_lock.release()
+
+    def get_monitor_status(self) -> str | None:
+        """Blocking counterpart used by a user-initiated cross-VPN preflight."""
+        with self._operation_lock:
+            with _com_apartment():
+                controller = self._get_controller()
+                self._reload_controller_config(controller)
+                status = _read_controller_monitor_status(controller)
+                if status is not None:
+                    self._last_status = status
+                return status
 
     def switch_to(
         self,
@@ -178,7 +204,7 @@ class VPNService:
         def worker() -> None:
             while not self._monitor_stop.wait(MONITOR_INTERVAL_SECONDS):
                 try:
-                    status = self.try_get_status()
+                    status = self.try_get_monitor_status()
                     if status is not None:
                         on_status(status)
                 except Exception:
@@ -286,6 +312,19 @@ def _read_controller_status(controller, attempts: int = 2) -> str:
         if attempt + 1 < attempts:
             time.sleep(0.2)
     return NONE
+
+
+def _read_controller_monitor_status(controller) -> str | None:
+    reader = getattr(controller, "get_monitor_status", controller.get_status)
+    try:
+        raw_status = reader()
+    except Exception:
+        log.exception("VPN monitor status detection failed")
+        return None
+    if raw_status is None:
+        return None
+    status = str(raw_status)
+    return status if status in (CISCO, FORTI, GPROT) else NONE
 
 
 def _is_recoverable_forti_error(message: str) -> bool:

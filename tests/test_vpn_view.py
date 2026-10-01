@@ -27,6 +27,19 @@ class _Variable:
 
 
 class VPNViewTests(unittest.TestCase):
+    def test_stale_manual_refresh_snapshot_is_not_applied(self) -> None:
+        bank_service = Mock()
+        bank_service.is_status_snapshot_current.return_value = False
+        view = SimpleNamespace(
+            bancochile_service=bank_service,
+            _apply_status=Mock(),
+        )
+
+        VPNView._apply_monitored_status(view, BANCOCHILE, 4)
+
+        bank_service.is_status_snapshot_current.assert_called_once_with(4)
+        view._apply_status.assert_not_called()
+
     def test_active_bancochile_button_disconnects_instead_of_reconnecting(self) -> None:
         view = SimpleNamespace(
             _status=BANCOCHILE,
@@ -80,6 +93,21 @@ class VPNViewTests(unittest.TestCase):
             _switch_to=Mock(),
             _switch_bancochile=Mock(),
             app=SimpleNamespace(_vpn_action_in_progress=lambda: True),
+            bancochile_service=SimpleNamespace(owns_bancochile=False),
+        )
+
+        VPNView._on_target_button(view, CISCO)
+
+        view._switch_to.assert_not_called()
+        view._switch_bancochile.assert_not_called()
+
+    def test_refresh_gate_blocks_connection_card_requests(self) -> None:
+        view = SimpleNamespace(
+            _status=NONE,
+            _refreshing=True,
+            _switch_to=Mock(),
+            _switch_bancochile=Mock(),
+            app=SimpleNamespace(_vpn_action_in_progress=lambda: False),
             bancochile_service=SimpleNamespace(owns_bancochile=False),
         )
 
@@ -340,6 +368,21 @@ class VPNViewTests(unittest.TestCase):
         VPNView._toggle_bancochile(view)
 
         config.set.assert_called_once_with("vpn_show_bancochile", False)
+        view._apply_bice_visibility.assert_called_once_with()
+        tray.refresh_menu.assert_called_once_with()
+
+    def test_falabella_checkbox_persists_and_refreshes_tray(self) -> None:
+        config = Mock()
+        tray = Mock()
+        view = SimpleNamespace(
+            app=SimpleNamespace(config=config, _tray=tray),
+            show_forti_var=_Variable(False),
+            _apply_bice_visibility=Mock(),
+        )
+
+        VPNView._toggle_forti(view)
+
+        config.set.assert_called_once_with("vpn_show_forti", False)
         view._apply_bice_visibility.assert_called_once_with()
         tray.refresh_menu.assert_called_once_with()
 

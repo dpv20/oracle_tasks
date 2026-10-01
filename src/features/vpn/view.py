@@ -90,26 +90,38 @@ class VPNView(ctk.CTkFrame):
             font=ctk.CTkFont(size=22, weight="bold"),
             text_color=("#0f172a", "#ffffff"),
         ).pack(side="left", padx=16)
+        visibility_controls = ctk.CTkFrame(header, fg_color="transparent")
+        visibility_controls.pack(side="right")
+        self.show_forti_var = ctk.BooleanVar(
+            value=bool(self.app.config.get("vpn_show_forti", True))
+        )
+        self.show_forti_checkbox = ctk.CTkCheckBox(
+            visibility_controls,
+            text=t("vpn.show_forti"),
+            variable=self.show_forti_var,
+            command=self._toggle_forti,
+        )
+        self.show_forti_checkbox.pack(side="left", padx=(0, 16))
         self.show_bice_var = ctk.BooleanVar(
             value=bool(self.app.config.get("vpn_show_bice", False))
         )
         self.show_bice_checkbox = ctk.CTkCheckBox(
-            header,
+            visibility_controls,
             text=t("vpn.show_bice"),
             variable=self.show_bice_var,
             command=self._toggle_bice,
         )
-        self.show_bice_checkbox.pack(side="right", padx=(0, 16))
+        self.show_bice_checkbox.pack(side="left", padx=(0, 16))
         self.show_bancochile_var = ctk.BooleanVar(
             value=bool(self.app.config.get("vpn_show_bancochile", True))
         )
         self.show_bancochile_checkbox = ctk.CTkCheckBox(
-            header,
+            visibility_controls,
             text=t("vpn.show_bancochile"),
             variable=self.show_bancochile_var,
             command=self._toggle_bancochile,
         )
-        self.show_bancochile_checkbox.pack(side="right", padx=(0, 16))
+        self.show_bancochile_checkbox.pack(side="left", padx=(0, 16))
 
         self.status_band = ctk.CTkFrame(
             self.body,
@@ -230,6 +242,7 @@ class VPNView(ctk.CTkFrame):
         self.settings_panel.pack(fill="both", expand=True)
 
     def on_show(self) -> None:
+        self.show_forti_var.set(bool(self.app.config.get("vpn_show_forti", True)))
         self.show_bice_var.set(bool(self.app.config.get("vpn_show_bice", False)))
         self.show_bancochile_var.set(
             bool(self.app.config.get("vpn_show_bancochile", True))
@@ -248,44 +261,25 @@ class VPNView(ctk.CTkFrame):
         self.tabs.set(self._settings_tab)
 
     def _refresh_selected_status(self) -> None:
-        """Use Banco status only while the Banco-only service owns it."""
-        if not self.bancochile_service.owns_bancochile:
-            self.refresh_status()
-            return
-        if self._running or self._refreshing:
-            return
-        self._refreshing = True
-        self.refresh_button.configure(state="disabled")
-        self.message_label.configure(text=t("vpn.checking"))
-
-        def worker() -> None:
-            try:
-                status = self.bancochile_service.try_get_status()
-                if status is not None:
-                    self._ui(lambda: self._apply_status(status))
-                else:
-                    self._ui(
-                        lambda: self.message_label.configure(text=t("vpn.ready"))
-                    )
-            except Exception as exc:
-                self._ui(lambda: self._show_error(str(exc)))
-            finally:
-                self._ui(self._finish_refresh)
-
-        threading.Thread(target=worker, daemon=True).start()
+        """Refresh all VPNs through the same monitor classification path."""
+        self.refresh_status()
 
     def refresh_status(self) -> None:
         if self._running or self._refreshing:
             return
         self._refreshing = True
         self.refresh_button.configure(state="disabled")
+        self._set_controls_enabled(False)
         self.message_label.configure(text=t("vpn.checking"))
 
         def worker() -> None:
             try:
-                status = self.service.try_get_status()
-                if status is not None:
-                    self._ui(lambda: self._apply_status(status))
+                snapshot = self.bancochile_service.try_get_monitored_status()
+                if snapshot is not None:
+                    revision, status = snapshot
+                    self._ui(
+                        lambda: self._apply_monitored_status(status, revision)
+                    )
                 else:
                     self._ui(
                         lambda: self.message_label.configure(text=t("vpn.ready"))
@@ -413,6 +407,7 @@ class VPNView(ctk.CTkFrame):
             messagebox.showerror(t("common.error"), result.message, parent=self)
 
     def _refresh_preferences(self) -> None:
+        self.show_forti_var.set(bool(self.app.config.get("vpn_show_forti", True)))
         self.show_bice_var.set(bool(self.app.config.get("vpn_show_bice", False)))
         self._apply_bice_visibility()
         self.app._tray.refresh_menu()
@@ -500,9 +495,14 @@ class VPNView(ctk.CTkFrame):
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _apply_monitored_status(self, status: str, revision: int) -> None:
+        """Ignore a refresh result superseded by a VPN ownership transition."""
+        if self.bancochile_service.is_status_snapshot_current(revision):
+            self._apply_status(status)
+
     def _on_target_button(self, target: str) -> None:
         """Route only Banco-owned work through Banco-specific UI handling."""
-        if self.app._vpn_action_in_progress():
+        if getattr(self, "_refreshing", False) or self.app._vpn_action_in_progress():
             return
         bank_owned = self.bancochile_service.owns_bancochile
         if target == BANCOCHILE and (target == self._status or bank_owned):
@@ -535,6 +535,11 @@ class VPNView(ctk.CTkFrame):
 
     def _toggle_bice(self) -> None:
         self.app.config.set("vpn_show_bice", bool(self.show_bice_var.get()))
+        self._apply_bice_visibility()
+        self.app._tray.refresh_menu()
+
+    def _toggle_forti(self) -> None:
+        self.app.config.set("vpn_show_forti", bool(self.show_forti_var.get()))
         self._apply_bice_visibility()
         self.app._tray.refresh_menu()
 
@@ -593,7 +598,7 @@ class VPNView(ctk.CTkFrame):
             text_color=("#475569", "#94a3b8"),
         )
         self._style_cards()
-        self._set_controls_enabled(not self._running)
+        self._set_controls_enabled(not self._running and not self._refreshing)
 
     def _show_error(self, message: str) -> None:
         self.status_dot.configure(text_color="#dc2626")
@@ -603,12 +608,13 @@ class VPNView(ctk.CTkFrame):
             text=message,
             text_color=("#b91c1c", "#fca5a5"),
         )
-        self._set_controls_enabled(not self._running)
+        self._set_controls_enabled(not self._running and not self._refreshing)
 
     def _finish_refresh(self) -> None:
         self._refreshing = False
         if not self._running:
             self.refresh_button.configure(state="normal")
+            self._set_controls_enabled(True)
 
     def _style_cards(self) -> None:
         for target, card in self._cards.items():

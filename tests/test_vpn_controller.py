@@ -24,5 +24,57 @@ class FortiControllerTests(unittest.TestCase):
         self.assertEqual(result, "closed")
 
 
+class VPNMonitorStatusTests(unittest.TestCase):
+    def test_failed_adapter_probe_keeps_partial_legacy_adapter_fields(self) -> None:
+        output = """
+Name : Ethernet 4
+InterfaceDescription : PANGP Virtual Ethernet Adapter Secure
+Status : Up
+"""
+        with patch.object(controller, "_run", return_value=(1, output, "warning")):
+            adapters = controller._get_adapter_status()
+
+        self.assertFalse(adapters["_probe_ok"])
+        self.assertEqual(adapters["globalprotect"], "Up")
+
+    def test_monitor_uses_adapter_snapshot_without_globalprotect_uia(self) -> None:
+        instance = controller.VPNController({})
+
+        with (
+            patch.object(instance, "_cisco_connected", return_value=False),
+            patch.object(instance, "_forti_connected", return_value=False),
+            patch.object(
+                controller,
+                "_get_adapter_status",
+                return_value={"_probe_ok": True, "globalprotect": "Up"},
+            ) as adapters,
+            patch.object(instance, "_gp_connected") as gp_connected,
+        ):
+            status = instance.get_monitor_status()
+
+        self.assertEqual(status, controller.GPROT)
+        adapters.assert_called_once_with()
+        gp_connected.assert_not_called()
+
+    def test_monitor_returns_unknown_when_adapter_probe_fails(self) -> None:
+        instance = controller.VPNController({})
+
+        with (
+            patch.object(instance, "_cisco_connected", return_value=False),
+            patch.object(
+                controller,
+                "_get_adapter_status",
+                return_value={"_probe_ok": False},
+            ),
+            patch.object(instance, "_forti_connected") as forti_connected,
+            patch.object(instance, "_gp_connected") as gp_connected,
+        ):
+            status = instance.get_monitor_status()
+
+        self.assertIsNone(status)
+        forti_connected.assert_not_called()
+        gp_connected.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

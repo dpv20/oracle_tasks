@@ -686,9 +686,9 @@ class OracleTasksApp:
             return revision == self._vpn_result_revision
 
     def _queue_legacy_vpn_status(self, status: str) -> None:
-        """Forward legacy monitoring without probing Banco in the background."""
+        """Merge the unchanged legacy monitor with Banco's live portal state."""
         revision, visible_status = (
-            self.bancochile_vpn_service.visible_status_snapshot(status)
+            self.bancochile_vpn_service.reconcile_monitored_status(status)
         )
         self._background_requests.put(("vpn_status", visible_status, revision))
 

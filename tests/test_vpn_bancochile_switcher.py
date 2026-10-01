@@ -7,7 +7,7 @@ import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import ANY, Mock
 from unittest.mock import call
 from unittest.mock import patch
 
@@ -45,6 +45,30 @@ class _Window:
         return list(self._controls)
 
 
+def _uia_button(
+    name: str,
+    *,
+    automation_id: str,
+    class_name: str = "SystemTray.NormalButton",
+    visible: bool = True,
+):
+    control = Mock()
+    control.window_text.return_value = name
+    control.element_info = SimpleNamespace(
+        control_type="Button",
+        name=name,
+        automation_id=automation_id,
+        class_name=class_name,
+    )
+    control.is_visible.return_value = visible
+    control.is_enabled.return_value = True
+    rectangle = Mock()
+    rectangle.width.return_value = 24
+    rectangle.height.return_value = 24
+    control.rectangle.return_value = rectangle
+    return control
+
+
 class _PortalControl(_Control):
     def __init__(self, text: str, *, update_on_set: bool = True) -> None:
         super().__init__(text, "Edit", "Portal", controller.GP_PORTAL_AUTOIDS[0])
@@ -58,6 +82,50 @@ class _PortalControl(_Control):
 
 
 class GlobalProtectTerminalWindowTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.adapter_status_patcher = patch.object(
+            controller,
+            "_gp_adapter_status",
+            return_value="Disabled",
+        )
+        self.adapter_status_patcher.start()
+        self.adapter_sample_patcher = patch.object(
+            controller,
+            "_gp_adapter_status_sample",
+            side_effect=lambda **_kwargs: (True, controller._gp_adapter_status()),
+        )
+        self.adapter_sample_patcher.start()
+
+    def tearDown(self) -> None:
+        self.adapter_sample_patcher.stop()
+        self.adapter_status_patcher.stop()
+
+    def test_switcher_source_has_no_unicode_replacement_characters(self) -> None:
+        source = (
+            SRC_DIR / "features" / "vpn" / "switcher_bancodechile.py"
+        ).read_text(encoding="utf-8")
+
+        self.assertNotIn("\ufffd", source)
+
+    def test_saml_click_uses_one_physical_action_and_never_invoke(self) -> None:
+        control = Mock()
+
+        clicked = controller._gp_try_click(control, "saml_submit")
+
+        self.assertTrue(clicked)
+        control.click_input.assert_called_once_with()
+        control.invoke.assert_not_called()
+
+    def test_saml_click_exception_does_not_issue_a_second_action(self) -> None:
+        control = Mock()
+        control.click_input.side_effect = RuntimeError("ambiguous delivery")
+
+        clicked = controller._gp_try_click(control, "picker_match")
+
+        self.assertTrue(clicked)
+        control.click_input.assert_called_once_with()
+        control.invoke.assert_not_called()
+
     def test_button_action_mismatch_is_refused_without_clicking(self) -> None:
         for expected, actual in (("connect", "Disconnect"), ("disconnect", "Connect")):
             with self.subTest(expected=expected, actual=actual):
@@ -219,6 +287,11 @@ class GlobalProtectTerminalWindowTests(unittest.TestCase):
             patch.object(controller, "_gp_get_status_text", return_value="Connected"),
             patch.object(
                 controller,
+                "_gp_get_portal_text",
+                return_value=controller.BANCOCHILE_PORTAL,
+            ),
+            patch.object(
+                controller,
                 "_gp_adapter_status",
                 side_effect=("Down", "Up"),
             ),
@@ -242,6 +315,8 @@ class GlobalProtectTerminalWindowTests(unittest.TestCase):
             patch.object(controller, "_gp_get_window", return_value=window),
             patch.object(controller, "_gp_get_status_text", return_value="Connecting..."),
             patch.object(controller, "_gp_adapter_status", return_value="Up"),
+            patch.object(controller, "_gp_list_terminal_windows", return_value=[]),
+            patch.object(controller, "_gp_get_last_portal", return_value=""),
             patch.object(controller, "_gp_cleanup_terminal_windows") as cleanup,
             patch.object(controller.time, "sleep", return_value=None),
         ):
@@ -252,6 +327,88 @@ class GlobalProtectTerminalWindowTests(unittest.TestCase):
 
         self.assertFalse(confirmed)
         cleanup.assert_not_called()
+
+    def test_cleanup_uses_exact_notification_when_main_popup_is_unreadable(self) -> None:
+        notification = "GlobalProtect Notification - bchmfa"
+        with (
+            patch.object(controller, "_gp_get_window", return_value=None),
+            patch.object(
+                controller,
+                "_gp_adapter_status_sample",
+                return_value=(True, "Up"),
+            ),
+            patch.object(
+                controller,
+                "_gp_list_terminal_windows",
+                return_value=[(20, notification)],
+            ),
+            patch.object(controller, "_gp_cleanup_terminal_windows") as cleanup,
+        ):
+            confirmed = controller._gp_cleanup_after_confirmed_connection(
+                controller.BANCOCHILE_PORTAL,
+                attempts=1,
+            )
+
+        self.assertTrue(confirmed)
+        cleanup.assert_called_once_with(
+            controller.BANCOCHILE_PORTAL,
+            wait_seconds=1.5,
+        )
+
+    def test_cleanup_uses_successful_login_and_exact_persisted_portal(self) -> None:
+        with (
+            patch.object(controller, "_gp_get_window", return_value=None),
+            patch.object(
+                controller,
+                "_gp_adapter_status_sample",
+                return_value=(True, "Up"),
+            ),
+            patch.object(
+                controller,
+                "_gp_list_terminal_windows",
+                return_value=[(10, controller.GP_LOGIN_TITLE)],
+            ),
+            patch.object(
+                controller,
+                "_gp_get_last_portal",
+                return_value=controller.BANCOCHILE_PORTAL,
+            ),
+            patch.object(
+                controller,
+                "_gp_login_reports_success",
+                return_value=True,
+            ) as login_success,
+            patch.object(controller, "_gp_cleanup_terminal_windows") as cleanup,
+        ):
+            confirmed = controller._gp_cleanup_after_confirmed_connection(
+                controller.BANCOCHILE_PORTAL,
+                attempts=1,
+                ignored_login_hwnds={9},
+            )
+
+        self.assertTrue(confirmed)
+        login_success.assert_called_once_with(ignored_hwnds={9})
+        cleanup.assert_called_once_with(
+            controller.BANCOCHILE_PORTAL,
+            wait_seconds=1.5,
+        )
+
+    def test_login_success_detection_revalidates_exact_fresh_window(self) -> None:
+        window = _Window([_Control("Login Successful!")])
+        window.handle = 77
+        with (
+            patch.object(controller, "_gp_get_login_window", return_value=window),
+            patch.object(
+                controller,
+                "_gp_is_exact_pangpa_window",
+                return_value=True,
+            ),
+        ):
+            successful = controller._gp_login_reports_success(
+                ignored_hwnds={10},
+            )
+
+        self.assertTrue(successful)
 
     def test_connect_transition_fails_fast_when_invoke_was_a_noop(self) -> None:
         window = Mock()
@@ -328,6 +485,25 @@ class GlobalProtectTerminalWindowTests(unittest.TestCase):
 
         self.assertEqual(stale, "not_started")
         self.assertEqual(fresh, "started")
+
+    def test_connect_transition_does_not_treat_notification_as_fresh_login(self) -> None:
+        window = Mock()
+        with (
+            patch.object(controller, "_gp_get_window", return_value=window),
+            patch.object(controller, "_gp_get_status_text", return_value="Disconnected"),
+            patch.object(controller, "_gp_get_button_label", return_value="Connect"),
+            patch.object(
+                controller,
+                "_gp_list_terminal_windows",
+                return_value=[(20, "GlobalProtect Notification - bchmfa")],
+            ),
+        ):
+            result = controller._gp_wait_for_connect_transition(
+                controller.BANCOCHILE_PORTAL,
+                attempts=1,
+            )
+
+        self.assertEqual(result, "not_started")
 
 
 class LegacyControllerIsolationRegressionTests(unittest.TestCase):
@@ -563,7 +739,7 @@ class BancoChileSwitcherTests(unittest.TestCase):
         instance = controller.BancoChileSwitcher({})
 
         with (
-            patch.object(controller, "_gp_get_window", return_value=None),
+            patch.object(controller, "_gp_get_monitor_window", return_value=None),
             patch.object(controller, "_gp_adapter_status", return_value=""),
         ):
             status = instance.get_bancochile_status()
@@ -574,7 +750,7 @@ class BancoChileSwitcherTests(unittest.TestCase):
         instance = controller.BancoChileSwitcher({})
 
         with (
-            patch.object(controller, "_gp_get_window", return_value=None),
+            patch.object(controller, "_gp_get_monitor_window", return_value=None),
             patch.object(controller, "_gp_adapter_status", return_value="Up"),
         ):
             status = instance.get_bancochile_status()
@@ -586,18 +762,65 @@ class BancoChileSwitcherTests(unittest.TestCase):
         window = Mock()
 
         with (
-            patch.object(controller, "_gp_get_window", return_value=window),
+            patch.object(controller, "_gp_get_monitor_window", return_value=window),
             patch.object(
                 controller,
-                "_gp_get_portal_text",
+                "_gp_get_monitor_portal_text",
                 return_value=controller.BANCOCHILE_PORTAL,
             ),
-            patch.object(controller, "_gp_get_status_text", return_value="Connected"),
+            patch.object(controller, "_gp_get_monitor_status_text", return_value="Connected"),
         ):
             status = instance.get_bancochile_status("Disabled")
 
         self.assertEqual(status, controller.BANCOCHILE)
         self.assertFalse(instance._gp_disconnect_confirmed)
+
+    def test_manual_disconnect_overrides_stale_connected_ui_after_two_samples(self) -> None:
+        instance = controller.BancoChileSwitcher({})
+        window = Mock()
+
+        with (
+            patch.object(controller, "_gp_get_monitor_window", return_value=window),
+            patch.object(
+                controller,
+                "_gp_get_monitor_portal_text",
+                return_value=controller.BANCOCHILE_PORTAL,
+            ),
+            patch.object(controller, "_gp_get_monitor_status_text", return_value="Connected"),
+            patch.object(controller, "_gp_login_window_present", return_value=False),
+        ):
+            first = instance.get_bancochile_status("Disabled")
+            second = instance.get_bancochile_status("Disabled")
+
+        self.assertEqual(first, controller.BANCOCHILE)
+        self.assertEqual(second, controller.NONE)
+
+    def test_adapter_up_resets_manual_disconnect_debounce(self) -> None:
+        instance = controller.BancoChileSwitcher({})
+        window = Mock()
+
+        with (
+            patch.object(controller, "_gp_get_monitor_window", return_value=window),
+            patch.object(
+                controller,
+                "_gp_get_monitor_portal_text",
+                return_value=controller.BANCOCHILE_PORTAL,
+            ),
+            patch.object(controller, "_gp_get_monitor_status_text", return_value="Connected"),
+            patch.object(controller, "_gp_login_window_present", return_value=False),
+        ):
+            self.assertEqual(
+                instance.get_bancochile_status("Disabled"),
+                controller.BANCOCHILE,
+            )
+            self.assertEqual(
+                instance.get_bancochile_status("Up"),
+                controller.BANCOCHILE,
+            )
+            self.assertEqual(
+                instance.get_bancochile_status("Disabled"),
+                controller.BANCOCHILE,
+            )
 
     def test_status_uses_disabled_adapter_over_stale_ui_after_confirmed_disconnect(
         self,
@@ -607,9 +830,9 @@ class BancoChileSwitcherTests(unittest.TestCase):
         window = Mock()
 
         with (
-            patch.object(controller, "_gp_get_window", return_value=window) as get_window,
-            patch.object(controller, "_gp_get_portal_text", return_value=""),
-            patch.object(controller, "_gp_get_status_text", return_value="Connected"),
+            patch.object(controller, "_gp_get_monitor_window", return_value=window) as get_window,
+            patch.object(controller, "_gp_get_monitor_portal_text", return_value=""),
+            patch.object(controller, "_gp_get_monitor_status_text", return_value="Connected"),
         ):
             status = instance.get_bancochile_status("Disabled")
 
@@ -624,9 +847,9 @@ class BancoChileSwitcherTests(unittest.TestCase):
         window = Mock()
 
         with (
-            patch.object(controller, "_gp_get_window", return_value=window),
-            patch.object(controller, "_gp_get_portal_text", return_value=""),
-            patch.object(controller, "_gp_get_status_text", return_value="Connecting..."),
+            patch.object(controller, "_gp_get_monitor_window", return_value=window),
+            patch.object(controller, "_gp_get_monitor_portal_text", return_value=""),
+            patch.object(controller, "_gp_get_monitor_status_text", return_value="Connecting..."),
         ):
             status = instance.get_bancochile_status("Disabled")
 
@@ -641,22 +864,74 @@ class BancoChileSwitcherTests(unittest.TestCase):
         window = Mock()
 
         with (
-            patch.object(controller, "_gp_get_window", return_value=window),
-            patch.object(controller, "_gp_get_portal_text", return_value=""),
-            patch.object(controller, "_gp_adapter_status", return_value=""),
-            patch.object(controller, "_gp_get_status_text", return_value="Connected"),
+            patch.object(controller, "_gp_get_monitor_window", return_value=window),
+            patch.object(controller, "_gp_get_monitor_portal_text", return_value=""),
+            patch.object(
+                controller,
+                "_gp_adapter_status_sample",
+                return_value=(False, ""),
+            ),
+            patch.object(controller, "_gp_get_monitor_status_text", return_value="Connected"),
         ):
             status = instance.get_bancochile_status()
 
         self.assertEqual(status, controller.GPROT_UNKNOWN)
+        self.assertFalse(instance.last_status_probe_ok)
         self.assertTrue(instance._gp_disconnect_confirmed)
+
+    def test_failed_status_probe_preserves_existing_banco_ownership(self) -> None:
+        instance = controller.BancoChileSwitcher({})
+        instance._last_gp_target = controller.BANCOCHILE
+        instance._gp_disconnect_confirmed = True
+        instance._terminal_adapter_samples = 1
+
+        with (
+            patch.object(
+                controller,
+                "_gp_adapter_status_sample",
+                return_value=(False, ""),
+            ),
+            patch.object(controller, "_gp_get_monitor_window") as get_window,
+        ):
+            status = instance.get_bancochile_status()
+
+        self.assertEqual(status, controller.GPROT_UNKNOWN)
+        self.assertFalse(instance.last_status_probe_ok)
+        self.assertEqual(instance._last_gp_target, controller.BANCOCHILE)
+        self.assertTrue(instance._gp_disconnect_confirmed)
+        self.assertEqual(instance._terminal_adapter_samples, 1)
+        get_window.assert_not_called()
+
+    def test_other_bancochile_domain_is_not_the_configured_portal(self) -> None:
+        instance = controller.BancoChileSwitcher(
+            {"bancochile_portal_url": controller.BANCOCHILE_PORTAL}
+        )
+        window = Mock()
+
+        with (
+            patch.object(controller, "_gp_get_monitor_window", return_value=window),
+            patch.object(
+                controller,
+                "_gp_get_monitor_portal_text",
+                return_value="different.bancochile.cl",
+            ),
+            patch.object(controller, "_gp_get_monitor_status_text", return_value="Connected"),
+        ):
+            target = instance._gp_connected_target()
+            active = instance.is_bancochile_active()
+            status = instance.get_bancochile_status("Up")
+
+        self.assertEqual(target, controller.GPROT_UNKNOWN)
+        self.assertFalse(active)
+        self.assertEqual(status, controller.GPROT_UNKNOWN)
+        self.assertTrue(instance.last_status_probe_ok)
 
     def test_connected_short_bancochile_portal_is_identified_after_restart(self) -> None:
         instance = controller.BancoChileSwitcher({})
 
         with (
-            patch.object(controller, "_gp_get_window", return_value=Mock()),
-            patch.object(controller, "_gp_get_portal_text", return_value="bchmfa"),
+            patch.object(controller, "_gp_get_monitor_window", return_value=Mock()),
+            patch.object(controller, "_gp_get_monitor_portal_text", return_value="bchmfa"),
             patch.object(controller, "_gp_get_last_portal", return_value=""),
         ):
             status = instance._gp_connected_target()
@@ -667,8 +942,8 @@ class BancoChileSwitcherTests(unittest.TestCase):
         instance = controller.BancoChileSwitcher({})
 
         with (
-            patch.object(controller, "_gp_get_window", return_value=Mock()),
-            patch.object(controller, "_gp_get_portal_text", return_value="ext"),
+            patch.object(controller, "_gp_get_monitor_window", return_value=Mock()),
+            patch.object(controller, "_gp_get_monitor_portal_text", return_value="ext"),
             patch.object(controller, "_gp_get_last_portal", return_value=""),
         ):
             status = instance._gp_connected_target()
@@ -682,8 +957,8 @@ class BancoChileSwitcherTests(unittest.TestCase):
         instance._last_gp_target = controller.BANCOCHILE
 
         with (
-            patch.object(controller, "_gp_get_window", return_value=Mock()),
-            patch.object(controller, "_gp_get_portal_text", return_value=""),
+            patch.object(controller, "_gp_get_monitor_window", return_value=Mock()),
+            patch.object(controller, "_gp_get_monitor_portal_text", return_value=""),
             patch.object(controller, "_gp_get_last_portal") as last_portal,
         ):
             status = instance._gp_connected_target()
@@ -693,6 +968,27 @@ class BancoChileSwitcherTests(unittest.TestCase):
 
     def setUp(self) -> None:
         controller._autofill_cancel.clear()
+        # Production decisions use the tri-state sampler.  Keep the older
+        # per-test string mocks readable while making every sample explicitly
+        # successful unless a test overrides the sampler to exercise failure.
+        self.adapter_status_patcher = patch.object(
+            controller,
+            "_gp_adapter_status",
+            return_value="Disabled",
+        )
+        self.adapter_status_patcher.start()
+        self.adapter_sample_patcher = patch.object(
+            controller,
+            "_gp_adapter_status_sample",
+            side_effect=lambda **_kwargs: (True, controller._gp_adapter_status()),
+        )
+        self.adapter_sample_patcher.start()
+        self.native_main_visible_patcher = patch.object(
+            controller,
+            "_gp_any_native_main_window_visible",
+            return_value=False,
+        )
+        self.native_main_visible_patcher.start()
         self.cleanup_patcher = patch.object(
             controller,
             "_gp_cleanup_terminal_windows",
@@ -723,6 +1019,9 @@ class BancoChileSwitcherTests(unittest.TestCase):
         self.terminal_list_patcher.stop()
         self.confirmed_cleanup_patcher.stop()
         self.cleanup_patcher.stop()
+        self.native_main_visible_patcher.stop()
+        self.adapter_sample_patcher.stop()
+        self.adapter_status_patcher.stop()
         controller._autofill_cancel.clear()
 
     def test_portal_normalization_accepts_url_form_without_changing_host(self) -> None:
@@ -744,11 +1043,315 @@ class BancoChileSwitcherTests(unittest.TestCase):
         with (
             patch("pywinauto.Desktop", return_value=desktop),
             patch.object(controller, "_gp_find_login_hwnd", return_value=4321),
+            patch.object(
+                controller,
+                "_gp_is_exact_pangpa_window",
+                return_value=True,
+            ) as exact_identity,
         ):
             result = controller._gp_get_login_window(timeout=0.2)
 
         self.assertIs(result, wrapped)
+        self.assertGreaterEqual(exact_identity.call_count, 2)
         desktop.window.assert_called_once_with(handle=4321)
+        desktop.windows.assert_not_called()
+
+    def test_login_window_is_not_wrapped_after_native_identity_changes(self) -> None:
+        desktop = Mock()
+
+        with (
+            patch("pywinauto.Desktop", return_value=desktop),
+            patch.object(controller, "_gp_find_login_hwnd", return_value=4321),
+            patch.object(
+                controller,
+                "_gp_is_exact_pangpa_window",
+                return_value=False,
+            ),
+            patch.object(controller.time, "sleep", return_value=None),
+            patch.object(
+                controller.time,
+                "time",
+                side_effect=(0.0, 0.0, 1.0),
+            ),
+        ):
+            result = controller._gp_get_login_window(timeout=0.2)
+
+        self.assertIsNone(result)
+        desktop.window.assert_not_called()
+
+    def test_login_window_forwards_stale_hwnds_to_native_finder(self) -> None:
+        desktop = Mock()
+        with (
+            patch("pywinauto.Desktop", return_value=desktop),
+            patch.object(
+                controller,
+                "_gp_find_login_hwnd",
+                return_value=None,
+            ) as find_login,
+            patch.object(controller.time, "sleep", return_value=None),
+            patch.object(
+                controller.time,
+                "time",
+                side_effect=(0.0, 0.0, 1.0),
+            ),
+        ):
+            result = controller._gp_get_login_window(
+                timeout=0.2,
+                ignored_hwnds={4321},
+            )
+
+        self.assertIsNone(result)
+        find_login.assert_called_with(ignored_hwnds={4321})
+        desktop.window.assert_not_called()
+
+    def test_monitor_window_wraps_exact_hwnd_without_global_uia_enumeration(self) -> None:
+        wrapped = Mock()
+        wrapped.is_visible.return_value = True
+        desktop = Mock()
+        desktop.window.return_value.wrapper_object.return_value = wrapped
+        connect_button = Mock()
+        connect_button.window_text.return_value = "Connect"
+        status_control = Mock()
+        status_control.window_text.return_value = "Not Connected"
+
+        with (
+            patch("pywinauto.Desktop", return_value=desktop) as desktop_factory,
+            patch.object(controller, "_gp_find_main_hwnds", return_value=[1234]),
+            patch.object(
+                controller,
+                "_gp_find_monitor_control",
+                side_effect=lambda _window, auto_id: (
+                    connect_button
+                    if auto_id == controller.GP_BTN_CONNECT_AUTOID
+                    else status_control
+                ),
+            ),
+            patch.object(controller, "_gp_find_monitor_portal_control", return_value=None),
+        ):
+            result = controller._gp_get_monitor_window(timeout=0.2)
+
+        self.assertIs(result, wrapped)
+        desktop_factory.assert_called_once_with(backend="win32")
+        desktop.window.assert_called_once_with(handle=1234)
+        desktop.windows.assert_not_called()
+        wrapped.set_focus.assert_not_called()
+        wrapped.click_input.assert_not_called()
+
+    def test_tray_activation_clicks_exact_visible_icon_once(self) -> None:
+        gp_icon = _uia_button(
+            "GlobalProtect Disconnected",
+            automation_id=controller.GP_TRAY_ITEM_AUTOID,
+        )
+        taskbar = _Window([gp_icon])
+        taskbar_spec = Mock()
+        taskbar_spec.wrapper_object.return_value = taskbar
+        desktop = Mock()
+        desktop.window.return_value = taskbar_spec
+
+        with (
+            patch("pywinauto.Desktop", return_value=desktop),
+            patch.object(
+                controller,
+                "_gp_find_exact_top_level_hwnd",
+                side_effect=lambda window_class: (
+                    111 if window_class == controller.GP_TASKBAR_CLASS else None
+                ),
+            ),
+            patch.object(controller, "_gp_get_window", return_value=None),
+        ):
+            activated = controller._gp_activate_from_system_tray(timeout=0.2)
+
+        self.assertTrue(activated)
+        gp_icon.click_input.assert_called_once_with()
+        gp_icon.invoke.assert_not_called()
+        desktop.window.assert_called_once_with(handle=111)
+        desktop.windows.assert_not_called()
+
+    def test_tray_activation_refuses_disabled_exact_icon(self) -> None:
+        gp_icon = _uia_button(
+            "GlobalProtect Disconnected",
+            automation_id=controller.GP_TRAY_ITEM_AUTOID,
+        )
+        gp_icon.is_enabled.return_value = False
+        taskbar = _Window([gp_icon])
+        taskbar_spec = Mock()
+        taskbar_spec.wrapper_object.return_value = taskbar
+        desktop = Mock()
+        desktop.window.return_value = taskbar_spec
+
+        with (
+            patch("pywinauto.Desktop", return_value=desktop),
+            patch.object(
+                controller,
+                "_gp_find_exact_top_level_hwnd",
+                side_effect=lambda window_class: (
+                    111 if window_class == controller.GP_TASKBAR_CLASS else None
+                ),
+            ),
+            patch.object(controller, "_gp_get_window", return_value=None),
+        ):
+            activated = controller._gp_activate_from_system_tray(timeout=0.2)
+
+        self.assertFalse(activated)
+        gp_icon.click_input.assert_not_called()
+        gp_icon.invoke.assert_not_called()
+
+    def test_tray_activation_does_not_hide_visible_unhydrated_native_popup(self) -> None:
+        gp_icon = _uia_button(
+            "GlobalProtect Disconnected",
+            automation_id=controller.GP_TRAY_ITEM_AUTOID,
+        )
+        taskbar = _Window([gp_icon])
+        taskbar_spec = Mock()
+        taskbar_spec.wrapper_object.return_value = taskbar
+        desktop = Mock()
+        desktop.window.return_value = taskbar_spec
+
+        with (
+            patch("pywinauto.Desktop", return_value=desktop),
+            patch.object(
+                controller,
+                "_gp_find_exact_top_level_hwnd",
+                side_effect=lambda window_class: (
+                    111 if window_class == controller.GP_TASKBAR_CLASS else None
+                ),
+            ),
+            patch.object(controller, "_gp_get_window", return_value=None),
+            patch.object(
+                controller,
+                "_gp_any_native_main_window_visible",
+                return_value=True,
+            ),
+        ):
+            activated = controller._gp_activate_from_system_tray(timeout=0.2)
+
+        self.assertTrue(activated)
+        gp_icon.click_input.assert_not_called()
+        gp_icon.invoke.assert_not_called()
+
+    def test_tray_activation_uses_already_open_overflow_without_toggling(self) -> None:
+        toggle = _uia_button(
+            "Show Hidden Icons Hide",
+            automation_id=controller.GP_SHOW_HIDDEN_AUTOID,
+        )
+        gp_icon = _uia_button(
+            "GlobalProtect Connected",
+            automation_id=controller.GP_TRAY_ITEM_AUTOID,
+        )
+        taskbar = _Window([toggle])
+        overflow = _Window([gp_icon])
+        specs = {111: Mock(), 222: Mock()}
+        specs[111].wrapper_object.return_value = taskbar
+        specs[222].wrapper_object.return_value = overflow
+        desktop = Mock()
+        desktop.window.side_effect = lambda *, handle: specs[handle]
+
+        with (
+            patch("pywinauto.Desktop", return_value=desktop),
+            patch.object(
+                controller,
+                "_gp_find_exact_top_level_hwnd",
+                side_effect=lambda window_class: (
+                    111
+                    if window_class == controller.GP_TASKBAR_CLASS
+                    else 222
+                ),
+            ),
+            patch.object(controller, "_gp_get_window", return_value=None),
+        ):
+            activated = controller._gp_activate_from_system_tray(timeout=0.2)
+
+        self.assertTrue(activated)
+        toggle.invoke.assert_not_called()
+        toggle.click_input.assert_not_called()
+        gp_icon.click_input.assert_called_once_with()
+        gp_icon.invoke.assert_not_called()
+        desktop.windows.assert_not_called()
+
+    def test_tray_activation_opens_overflow_then_clicks_gp_once(self) -> None:
+        overflow_is_open = False
+        toggle = _uia_button(
+            "Show Hidden Icons",
+            automation_id=controller.GP_SHOW_HIDDEN_AUTOID,
+        )
+        def _open_overflow():
+            nonlocal overflow_is_open
+            overflow_is_open = True
+
+        toggle.click_input.side_effect = _open_overflow
+        gp_icon = _uia_button(
+            "GlobalProtect Disconnected",
+            automation_id=controller.GP_TRAY_ITEM_AUTOID,
+        )
+        taskbar = _Window([toggle])
+        overflow = _Window([gp_icon])
+        specs = {111: Mock(), 222: Mock()}
+        specs[111].wrapper_object.return_value = taskbar
+        specs[222].wrapper_object.return_value = overflow
+        desktop = Mock()
+        desktop.window.side_effect = lambda *, handle: specs[handle]
+
+        def _find_hwnd(window_class):
+            if window_class == controller.GP_TASKBAR_CLASS:
+                return 111
+            return 222 if overflow_is_open else None
+
+        with (
+            patch("pywinauto.Desktop", return_value=desktop),
+            patch.object(
+                controller,
+                "_gp_find_exact_top_level_hwnd",
+                side_effect=_find_hwnd,
+            ),
+            patch.object(controller, "_gp_get_window", return_value=None),
+        ):
+            activated = controller._gp_activate_from_system_tray(timeout=0.2)
+
+        self.assertTrue(activated)
+        toggle.click_input.assert_called_once_with()
+        toggle.invoke.assert_not_called()
+        gp_icon.click_input.assert_called_once_with()
+        gp_icon.invoke.assert_not_called()
+
+    def test_existing_visible_popup_never_toggles_tray_or_launches(self) -> None:
+        window = Mock()
+        window.is_visible.return_value = True
+
+        with (
+            patch.object(controller, "_gp_get_window", return_value=window),
+            patch.object(controller, "_gp_activate_from_system_tray") as tray,
+            patch.object(controller, "_open_gui") as open_gui,
+        ):
+            result = controller._ensure_gp_main_window("PanGPA.exe")
+
+        self.assertIs(result, window)
+        tray.assert_not_called()
+        open_gui.assert_not_called()
+
+    def test_cold_start_launches_once_then_activates_tray_once(self) -> None:
+        window = Mock()
+        window.is_visible.return_value = True
+
+        with (
+            patch.object(controller, "_gp_get_window", side_effect=(None, window)),
+            patch.object(controller, "_open_gui", return_value=True) as open_gui,
+            patch.object(
+                controller,
+                "_gp_activate_from_system_tray",
+                return_value=True,
+            ) as tray,
+            patch.object(controller, "_gp_process_running", return_value=False),
+            patch.object(
+                controller.time,
+                "monotonic",
+                side_effect=(0.0, 2.0, 2.0, 2.1),
+            ),
+        ):
+            result = controller._ensure_gp_main_window("PanGPA.exe")
+
+        self.assertIs(result, window)
+        open_gui.assert_called_once_with("PanGPA.exe")
+        tray.assert_called_once_with(timeout=8.0)
 
     def test_close_login_window_posts_wm_close_only_after_exact_identity(self) -> None:
         user32 = SimpleNamespace(
@@ -766,11 +1369,18 @@ class BancoChileSwitcherTests(unittest.TestCase):
             PostMessageW=Mock(return_value=1),
         )
 
-        with patch.object(
-            ctypes,
-            "windll",
-            SimpleNamespace(user32=user32),
-            create=True,
+        with (
+            patch.object(
+                ctypes,
+                "windll",
+                SimpleNamespace(user32=user32),
+                create=True,
+            ),
+            patch.object(
+                controller,
+                "_gp_is_exact_pangpa_window",
+                return_value=True,
+            ),
         ):
             closed = controller._gp_close_login_window(4321)
 
@@ -816,18 +1426,18 @@ class BancoChileSwitcherTests(unittest.TestCase):
         window = object()
 
         with (
-            patch.object(controller, "_gp_get_window", return_value=window),
+            patch.object(controller, "_gp_get_monitor_window", return_value=window),
             patch.object(
                 controller,
-                "_gp_get_portal_text",
+                "_gp_get_monitor_portal_text",
                 return_value="bchmfa.bancochile.cl",
             ),
         ):
             self.assertEqual(instance._gp_connected_target(), controller.BANCOCHILE)
 
         with (
-            patch.object(controller, "_gp_get_window", return_value=window),
-            patch.object(controller, "_gp_get_portal_text", return_value="ext.bice.cl"),
+            patch.object(controller, "_gp_get_monitor_window", return_value=window),
+            patch.object(controller, "_gp_get_monitor_portal_text", return_value="ext.bice.cl"),
         ):
             self.assertEqual(
                 instance._gp_connected_target(),
@@ -839,10 +1449,10 @@ class BancoChileSwitcherTests(unittest.TestCase):
         window = object()
 
         with (
-            patch.object(controller, "_gp_get_window", return_value=window),
+            patch.object(controller, "_gp_get_monitor_window", return_value=window),
             patch.object(
                 controller,
-                "_gp_get_portal_text",
+                "_gp_get_monitor_portal_text",
                 return_value="another.example.test",
             ),
         ):
@@ -1173,6 +1783,112 @@ class BancoChileSwitcherTests(unittest.TestCase):
         self.assertEqual(result, "connected")
         click.assert_not_called()
 
+    def test_custom_flow_clicks_only_the_exact_saved_account(self) -> None:
+        target = "user@bch.bancodechile.cl"
+        account = _Control(target)
+        window = _Window([_Control("Pick an account"), account])
+        connection_states = iter((False, True))
+
+        with (
+            patch.object(controller, "_gp_get_login_window", return_value=window),
+            patch.object(controller, "_gp_prepare_login_window", return_value=True),
+            patch.object(
+                controller,
+                "_gp_try_click_with_ancestors",
+                return_value=True,
+            ) as click,
+            patch.object(controller, "_gp_set_edit_value") as set_value,
+            patch.object(controller.time, "sleep", return_value=None),
+        ):
+            result = controller._gp_handle_saml_signin(
+                target,
+                password_provider=Mock(return_value="must-not-be-read"),
+                connected_probe=lambda: next(connection_states),
+                flow_mode="custom",
+                flow_steps=["account", "mfa"],
+            )
+
+        self.assertEqual(result, "connected")
+        click.assert_called_once_with(account, "picker_match")
+        set_value.assert_not_called()
+
+    def test_custom_flow_can_leave_account_selection_manual(self) -> None:
+        target = "user@bch.bancodechile.cl"
+        window = _Window([_Control("Pick an account"), _Control(target)])
+        connection_states = iter((False, True))
+        progress = Mock()
+
+        with (
+            patch.object(controller, "_gp_get_login_window", return_value=window),
+            patch.object(controller, "_gp_prepare_login_window", return_value=True),
+            patch.object(controller, "_gp_try_click_with_ancestors") as click,
+            patch.object(controller.time, "sleep", return_value=None),
+        ):
+            result = controller._gp_handle_saml_signin(
+                target,
+                password_provider=Mock(return_value="must-not-be-read"),
+                connected_probe=lambda: next(connection_states),
+                progress=progress,
+                flow_mode="custom",
+                flow_steps=["mfa"],
+            )
+
+        self.assertEqual(result, "connected")
+        click.assert_not_called()
+        self.assertIn("manually", progress.call_args.args[0])
+
+    def test_custom_flow_can_leave_password_manual_without_reading_secret(self) -> None:
+        password_provider = Mock(return_value="must-not-be-read")
+        password_edit = _Control("", "Edit", "Password")
+        window = _Window(
+            [_Control("Enter password"), password_edit, _Control("Sign in", "Button")]
+        )
+        connection_states = iter((False, True))
+
+        with (
+            patch.object(controller, "_gp_get_login_window", return_value=window),
+            patch.object(controller, "_gp_prepare_login_window", return_value=True),
+            patch.object(controller, "_gp_set_edit_value") as set_value,
+            patch.object(controller, "_gp_submit_login_page") as submit,
+            patch.object(controller.time, "sleep", return_value=None),
+        ):
+            result = controller._gp_handle_saml_signin(
+                "user@bch.bancodechile.cl",
+                password_provider=password_provider,
+                connected_probe=lambda: next(connection_states),
+                flow_mode="custom",
+                flow_steps=["account", "mfa"],
+            )
+
+        self.assertEqual(result, "connected")
+        password_provider.assert_not_called()
+        set_value.assert_not_called()
+        submit.assert_not_called()
+
+    def test_bancochile_never_types_a_configured_email(self) -> None:
+        email_edit = _Control("", "Edit", "Email")
+        window = _Window(
+            [_Control("Email, phone, or Skype"), email_edit, _Control("Next", "Button")]
+        )
+        connection_states = iter((False, True))
+
+        with (
+            patch.object(controller, "_gp_get_login_window", return_value=window),
+            patch.object(controller, "_gp_prepare_login_window", return_value=True),
+            patch.object(controller, "_gp_set_edit_value") as set_value,
+            patch.object(controller, "_gp_submit_login_page") as submit,
+            patch.object(controller.time, "sleep", return_value=None),
+        ):
+            result = controller._gp_handle_saml_signin(
+                "user@bch.bancodechile.cl",
+                password_provider=Mock(return_value="must-not-be-read"),
+                connected_probe=lambda: next(connection_states),
+            )
+
+        self.assertEqual(result, "connected")
+        set_value.assert_not_called()
+        submit.assert_not_called()
+
     def test_email_header_is_not_clicked_after_password_submission(self) -> None:
         target = "user@bch.bancodechile.cl"
         password_edit = _Control("", "Edit", "Password")
@@ -1220,6 +1936,11 @@ class BancoChileSwitcherTests(unittest.TestCase):
 
         with (
             patch.object(controller, "_gp_get_login_window", return_value=window),
+            patch.object(
+                controller,
+                "_gp_is_exact_pangpa_window",
+                return_value=True,
+            ),
             patch.object(controller, "_gp_prepare_login_window", return_value=True),
             patch.object(controller, "_gp_close_login_window") as close_login,
         ):
@@ -1258,6 +1979,11 @@ class BancoChileSwitcherTests(unittest.TestCase):
 
         with (
             patch.object(controller, "_gp_get_login_window", return_value=window),
+            patch.object(
+                controller,
+                "_gp_is_exact_pangpa_window",
+                return_value=True,
+            ),
             patch.object(controller, "_gp_prepare_login_window") as prepare,
             patch.object(controller.time, "sleep", return_value=None),
         ):
@@ -1269,6 +1995,28 @@ class BancoChileSwitcherTests(unittest.TestCase):
 
         self.assertEqual(result, "connected")
         prepare.assert_called_once_with(window)
+
+    def test_saml_refuses_a_spoofed_login_window_before_reading_credentials(self) -> None:
+        password_provider = Mock(return_value="must-not-be-read")
+        window = _Window([_Control("Enter password")])
+        window.handle = 9999
+
+        with (
+            patch.object(controller, "_gp_get_login_window", return_value=window),
+            patch.object(
+                controller,
+                "_gp_is_exact_pangpa_window",
+                return_value=False,
+            ),
+        ):
+            result = controller._gp_handle_saml_signin(
+                "user@bch.bancodechile.cl",
+                password_provider=password_provider,
+                connected_probe=lambda: False,
+            )
+
+        self.assertEqual(result, "unknown_page")
+        password_provider.assert_not_called()
 
     def test_saml_timeout_is_not_reported_as_connected(self) -> None:
         password_provider = Mock(return_value="must-not-be-read")
@@ -1287,6 +2035,107 @@ class BancoChileSwitcherTests(unittest.TestCase):
 
         self.assertEqual(result, "timeout")
         password_provider.assert_not_called()
+
+    def test_connected_ui_without_adapter_up_is_not_connection_success(self) -> None:
+        password_provider = Mock(return_value="must-not-be-read")
+
+        with (
+            patch.object(controller, "_gp_get_login_window", return_value=None),
+            patch.object(controller.time, "sleep", return_value=None),
+            patch.object(controller.time, "time", side_effect=(0.0, 0.0, 2.0)),
+        ):
+            result = controller._gp_handle_saml_signin(
+                "user@bch.bancodechile.cl",
+                password_provider=password_provider,
+                total_timeout=1.0,
+                connected_probe=lambda: False,
+                status_probe=lambda: "Connected",
+            )
+
+        self.assertEqual(result, "timeout")
+        password_provider.assert_not_called()
+
+    def test_saml_ignores_login_hwnds_from_before_connect(self) -> None:
+        with (
+            patch.object(controller, "_gp_get_login_window", return_value=None) as get_login,
+            patch.object(controller.time, "sleep", return_value=None),
+            patch.object(controller.time, "time", side_effect=(0.0, 0.0, 2.0)),
+        ):
+            result = controller._gp_handle_saml_signin(
+                "user@bch.bancodechile.cl",
+                total_timeout=1.0,
+                connected_probe=lambda: False,
+                ignored_login_hwnds={10},
+            )
+
+        self.assertEqual(result, "timeout")
+        get_login.assert_called_once_with(timeout=0.5, ignored_hwnds={10})
+
+    def test_connected_ui_has_bounded_wait_for_adapter_up(self) -> None:
+        with (
+            patch.object(controller, "_gp_get_login_window", return_value=None),
+            patch.object(controller.time, "sleep", return_value=None),
+            patch.object(controller.time, "time", side_effect=(0.0, 0.0, 0.0)),
+            patch.object(
+                controller.time,
+                "monotonic",
+                side_effect=(0.0, 0.0, 2.0),
+            ),
+        ):
+            result = controller._gp_handle_saml_signin(
+                "user@bch.bancodechile.cl",
+                total_timeout=100.0,
+                connected_probe=lambda: False,
+                status_probe=lambda: "Connected",
+                connected_adapter_grace=1.0,
+            )
+
+        self.assertEqual(result, "adapter_not_up")
+
+    def test_connected_ui_adapter_wait_remains_cancelable(self) -> None:
+        def cancel_during_wait(_seconds: float) -> None:
+            controller._autofill_cancel.set()
+
+        with (
+            patch.object(controller, "_gp_get_login_window", return_value=None),
+            patch.object(controller.time, "sleep", side_effect=cancel_during_wait),
+            patch.object(controller.time, "time", return_value=0.0),
+            patch.object(controller.time, "monotonic", return_value=0.0),
+        ):
+            result = controller._gp_handle_saml_signin(
+                "user@bch.bancodechile.cl",
+                total_timeout=100.0,
+                connected_probe=lambda: False,
+                status_probe=lambda: "Connected",
+                connected_adapter_grace=10.0,
+            )
+
+        self.assertEqual(result, "cancelled")
+
+    def test_connected_ui_grace_does_not_expire_during_fresh_mfa_page(self) -> None:
+        window = _Window(
+            [
+                _Control("Approve sign in request"),
+                _Control("Enter the number if prompted"),
+            ]
+        )
+
+        with (
+            patch.object(controller, "_gp_get_login_window", return_value=window),
+            patch.object(controller, "_gp_prepare_login_window", return_value=True),
+            patch.object(controller.time, "sleep", return_value=None),
+            patch.object(controller.time, "time", side_effect=(0.0, 0.0, 2.0)),
+            patch.object(controller.time, "monotonic", return_value=0.0),
+        ):
+            result = controller._gp_handle_saml_signin(
+                "user@bch.bancodechile.cl",
+                total_timeout=1.0,
+                connected_probe=lambda: False,
+                status_probe=lambda: "Connected",
+                connected_adapter_grace=0.0,
+            )
+
+        self.assertEqual(result, "mfa_timeout")
 
     def test_saml_stops_when_connecting_returns_to_not_connected(self) -> None:
         states = iter(("Connecting...", "Not Connected", "Not Connected", "Not Connected"))
@@ -1385,6 +2234,63 @@ class BancoChileSwitcherTests(unittest.TestCase):
         self.assertIn("timeout", message.casefold())
         decrypt.assert_not_called()
 
+    def test_connect_aborts_before_action_when_adapter_probe_fails(self) -> None:
+        instance = controller.BancoChileSwitcher({})
+        window = Mock()
+
+        with (
+            patch.object(controller, "_gp_diagnostics"),
+            patch.object(controller, "_gp_get_window", return_value=window),
+            patch.object(controller, "_gp_get_status_text", return_value="Not Connected"),
+            patch.object(controller, "_gp_get_button_label", return_value="Connect"),
+            patch.object(
+                controller,
+                "_gp_adapter_status_sample",
+                return_value=(False, ""),
+            ),
+            patch.object(controller, "_gp_set_portal") as set_portal,
+            patch.object(controller, "_gp_invoke_connect_button") as invoke,
+        ):
+            ok, message = instance.connect_bancochile()
+
+        self.assertFalse(ok)
+        self.assertIn("could not verify", message.casefold())
+        set_portal.assert_not_called()
+        invoke.assert_not_called()
+
+    def test_saml_connected_result_is_rejected_when_adapter_is_not_up(self) -> None:
+        instance = controller.BancoChileSwitcher(
+            {
+                "bancochile_username": "user@bch.bancodechile.cl",
+                "bancochile_password_enc": "ciphertext",
+            }
+        )
+        window = Mock()
+
+        with (
+            patch.object(controller, "_gp_diagnostics"),
+            patch.object(controller, "_gp_get_window", return_value=window),
+            patch.object(controller, "_gp_get_status_text", return_value="Not Connected"),
+            patch.object(controller, "_gp_get_button_label", return_value="Connect"),
+            patch.object(
+                controller,
+                "_gp_adapter_status",
+                side_effect=("Disabled", "Down"),
+            ),
+            patch.object(controller, "_gp_set_portal", return_value=True),
+            patch.object(controller, "_gp_invoke_connect_button", return_value=True),
+            patch.object(
+                controller,
+                "_gp_handle_saml_signin",
+                return_value="connected",
+            ),
+        ):
+            ok, message = instance.connect_bancochile()
+
+        self.assertFalse(ok)
+        self.assertIn("adapter is not Up", message)
+        self.cleanup_after_confirmed_connection.assert_not_called()
+
     def test_cancel_after_portal_selection_never_clicks_connect(self) -> None:
         instance = controller.BancoChileSwitcher(
             {
@@ -1467,7 +2373,7 @@ class BancoChileSwitcherTests(unittest.TestCase):
             patch.object(
                 controller,
                 "_gp_adapter_status",
-                side_effect=("Disabled", "Disabled"),
+                side_effect=("Disabled", "Disabled", "Up"),
             ),
             patch.object(controller, "_gp_set_portal", return_value=True),
             patch.object(
@@ -1499,6 +2405,69 @@ class BancoChileSwitcherTests(unittest.TestCase):
             controller.BANCOCHILE_PORTAL
         )
 
+    def test_connect_retry_uses_uia_popup_from_working_release(
+        self,
+    ) -> None:
+        instance = controller.BancoChileSwitcher(
+            {
+                "bancochile_username": "user@bch.bancodechile.cl",
+                "bancochile_password_enc": "ciphertext",
+            }
+        )
+        first_window = Mock(name="first_window")
+        action_window = Mock(name="action_window")
+        self.wait_for_connect_transition.side_effect = (
+            "not_started",
+            "started",
+        )
+
+        with (
+            patch.object(controller, "_gp_diagnostics"),
+            patch.object(
+                controller,
+                "_gp_get_window",
+                side_effect=(first_window, action_window),
+            ) as get_window,
+            patch.object(
+                controller,
+                "_gp_get_status_text",
+                side_effect=("Not Connected", "Not Connected", "Not Connected"),
+            ),
+            patch.object(controller, "_gp_get_button_label", return_value="Connect"),
+            patch.object(
+                controller,
+                "_gp_adapter_status",
+                side_effect=("Disabled", "Disabled", "Up"),
+            ),
+            patch.object(controller, "_gp_set_portal", return_value=True),
+            patch.object(
+                controller,
+                "_gp_invoke_connect_button",
+                return_value=True,
+            ) as invoke,
+            patch.object(controller, "_gp_handle_saml_signin", return_value="connected"),
+            patch.object(controller, "_find_exe", return_value="PanGPA.exe"),
+        ):
+            ok, message = instance.connect_bancochile()
+
+        self.assertTrue(ok)
+        self.assertIn("connected", message.casefold())
+        self.assertEqual(
+            get_window.call_args_list,
+            [call(timeout=2), call(timeout=1.5)],
+        )
+        self.assertEqual(
+            invoke.call_args_list,
+            [
+                call(first_window, expected_action="connect"),
+                call(
+                    action_window,
+                    expected_action="connect",
+                    prefer_click_input=True,
+                ),
+            ],
+        )
+
     def test_physical_connect_retry_is_skipped_when_adapter_became_up(self) -> None:
         instance = controller.BancoChileSwitcher(
             {
@@ -1517,7 +2486,7 @@ class BancoChileSwitcherTests(unittest.TestCase):
             patch.object(
                 controller,
                 "_gp_adapter_status",
-                side_effect=("Disabled", "Up"),
+                side_effect=("Disabled", "Up", "Up"),
             ),
             patch.object(controller, "_gp_set_portal", return_value=True),
             patch.object(
@@ -1551,7 +2520,11 @@ class BancoChileSwitcherTests(unittest.TestCase):
             patch.object(controller, "_gp_get_window", return_value=window),
             patch.object(controller, "_gp_get_status_text", return_value="Not Connected"),
             patch.object(controller, "_gp_get_button_label", return_value="Connect"),
-            patch.object(controller, "_gp_adapter_status", return_value="Disabled"),
+            patch.object(
+                controller,
+                "_gp_adapter_status",
+                side_effect=("Disabled", "Up", "Up"),
+            ),
             patch.object(
                 controller,
                 "_gp_list_terminal_windows",
@@ -1584,7 +2557,7 @@ class BancoChileSwitcherTests(unittest.TestCase):
             wait_seconds=0.5,
         )
 
-    def test_late_success_notification_prevents_second_connect_toggle(self) -> None:
+    def test_late_notification_is_not_mistaken_for_a_fresh_login(self) -> None:
         instance = controller.BancoChileSwitcher(
             {
                 "bancochile_username": "user@bch.bancodechile.cl",
@@ -1600,13 +2573,23 @@ class BancoChileSwitcherTests(unittest.TestCase):
             patch.object(controller, "_gp_get_window", return_value=window),
             patch.object(controller, "_gp_get_status_text", return_value="Not Connected"),
             patch.object(controller, "_gp_get_button_label", return_value="Connect"),
-            patch.object(controller, "_gp_adapter_status", return_value="Disabled"),
+            patch.object(
+                controller,
+                "_gp_adapter_status",
+                side_effect=("Disabled", "Up", "Up"),
+            ),
             patch.object(
                 controller,
                 "_gp_list_terminal_windows",
-                # It appears only after the first retry snapshot, at the exact
-                # point where the old code used to close it and click again.
-                side_effect=([], [], [(100, notification)]),
+                # A Notification is not sign-in-start evidence.  It remains in
+                # subsequent snapshots while the fresh adapter sample provides
+                # the independent success signal that prevents another toggle.
+                side_effect=(
+                    [],
+                    [],
+                    [(100, notification)],
+                    [(100, notification)],
+                ),
             ),
             patch.object(controller, "_gp_set_portal", return_value=True),
             patch.object(
@@ -1627,7 +2610,7 @@ class BancoChileSwitcherTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertIn("connected", message.casefold())
         invoke.assert_called_once_with(window, expected_action="connect")
-        signin.assert_called_once()
+        signin.assert_not_called()
 
     def test_two_silent_connect_actions_fail_without_entering_long_saml_wait(self) -> None:
         instance = controller.BancoChileSwitcher(
@@ -1703,7 +2686,7 @@ class BancoChileSwitcherTests(unittest.TestCase):
             patch.object(
                 controller,
                 "_gp_adapter_status",
-                side_effect=("Disabled", "Disabled"),
+                side_effect=("Disabled", "Disabled", "Up"),
             ),
             patch.object(
                 controller,
@@ -1751,7 +2734,7 @@ class BancoChileSwitcherTests(unittest.TestCase):
             patch.object(
                 controller,
                 "_gp_adapter_status",
-                side_effect=("Disabled", "Disabled", "Disabled"),
+                side_effect=("Disabled", "Disabled", "Disabled", "Up"),
             ),
             patch.object(controller, "_gp_login_window_present") as login_present,
             patch.object(controller, "_gp_set_portal", return_value=True),
@@ -1863,7 +2846,11 @@ class BancoChileSwitcherTests(unittest.TestCase):
             patch.object(controller, "_gp_get_window", return_value=window),
             patch.object(controller, "_gp_get_status_text", return_value="Connecting..."),
             patch.object(controller, "_gp_get_button_label", return_value="Disconnect"),
-            patch.object(controller, "_gp_adapter_status", return_value="Down"),
+            patch.object(
+                controller,
+                "_gp_adapter_status",
+                side_effect=("Down", "Up"),
+            ),
             patch.object(
                 instance,
                 "_gp_connected_target",
@@ -1902,7 +2889,11 @@ class BancoChileSwitcherTests(unittest.TestCase):
             patch.object(controller, "_gp_get_window", return_value=window),
             patch.object(controller, "_gp_get_status_text", return_value="Connecting..."),
             patch.object(controller, "_gp_get_button_label", return_value="Connect"),
-            patch.object(controller, "_gp_adapter_status", return_value=""),
+            patch.object(
+                controller,
+                "_gp_adapter_status",
+                side_effect=("", "Up"),
+            ),
             patch.object(
                 instance,
                 "_gp_connected_target",
@@ -1947,6 +2938,7 @@ class BancoChileSwitcherTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertIn("already disconnected", message)
         self.assertIsNone(instance._last_gp_target)
+        self.assertEqual(instance._next_connect_not_before, 0.0)
         invoke.assert_not_called()
 
     def test_disconnect_does_not_treat_connecting_with_lagging_connect_as_clear(
@@ -2000,15 +2992,22 @@ class BancoChileSwitcherTests(unittest.TestCase):
         instance = controller.BancoChileSwitcher({})
         instance._last_gp_target = controller.BANCOCHILE
         window = Mock()
+        action_window = Mock()
 
         with (
             patch.object(controller, "_gp_diagnostics"),
             patch.object(controller, "_gp_get_window", return_value=window),
             patch.object(
                 controller,
+                "_ensure_gp_main_window",
+                side_effect=(window, action_window),
+            ) as ensure_window,
+            patch.object(
+                controller,
                 "_gp_get_status_text",
                 side_effect=(
                     "Connected",
+                    "Connecting...",
                     "Connecting...",
                     "Connecting...",
                     "Disconnected",
@@ -2019,7 +3018,7 @@ class BancoChileSwitcherTests(unittest.TestCase):
             patch.object(
                 controller,
                 "_gp_adapter_status",
-                side_effect=("Disabled", "Disabled", "Disabled"),
+                side_effect=("Disabled", "Disabled", "Disabled", "Disabled"),
             ),
             patch.object(
                 controller,
@@ -2027,12 +3026,17 @@ class BancoChileSwitcherTests(unittest.TestCase):
                 return_value=True,
             ) as invoke,
             patch.object(controller.time, "sleep", return_value=None),
+            patch.object(controller, "_find_exe", return_value="PanGPA.exe"),
         ):
             ok, message = instance.disconnect_bancochile()
 
         self.assertTrue(ok)
         self.assertIn("disconnected", message.casefold())
-        invoke.assert_called_once_with(window, expected_action="disconnect")
+        self.assertEqual(
+            ensure_window.call_args_list,
+            [call("PanGPA.exe"), call("PanGPA.exe", deadline=ANY)],
+        )
+        invoke.assert_called_once_with(action_window, expected_action="disconnect")
 
     def test_disconnect_waits_when_ui_already_reports_disconnecting(self) -> None:
         instance = controller.BancoChileSwitcher({})
@@ -2076,6 +3080,7 @@ class BancoChileSwitcherTests(unittest.TestCase):
             ),
             patch.object(controller, "_gp_invoke_connect_button", return_value=True) as invoke,
             patch.object(controller.time, "sleep", return_value=None),
+            patch.object(controller.time, "monotonic", return_value=100.0),
         ):
             ok, message = instance.disconnect_bancochile()
 
@@ -2083,6 +3088,10 @@ class BancoChileSwitcherTests(unittest.TestCase):
         self.assertIn("disconnected", message.casefold())
         self.assertIsNone(instance._last_gp_target)
         self.assertTrue(instance._gp_disconnect_confirmed)
+        self.assertEqual(
+            instance._next_connect_not_before,
+            100.0 + controller.GP_POST_DISCONNECT_COOLDOWN_SECONDS,
+        )
         invoke.assert_called_once_with(window, expected_action="disconnect")
 
     def test_cancel_after_disconnect_click_still_records_confirmed_teardown(self) -> None:
@@ -2123,10 +3132,16 @@ class BancoChileSwitcherTests(unittest.TestCase):
         instance = controller.BancoChileSwitcher({})
         instance._last_gp_target = controller.BANCOCHILE
         window = Mock()
+        retry_window = Mock()
 
         with (
             patch.object(controller, "_gp_diagnostics"),
             patch.object(controller, "_gp_get_window", return_value=window),
+            patch.object(
+                controller,
+                "_ensure_gp_main_window",
+                side_effect=(window, retry_window),
+            ) as ensure_window,
             patch.object(
                 controller,
                 "_gp_get_status_text",
@@ -2160,11 +3175,15 @@ class BancoChileSwitcherTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertIn("disconnected", message.casefold())
         self.assertEqual(
+            ensure_window.call_args_list,
+            [call("PanGPA.exe"), call("PanGPA.exe", deadline=ANY)],
+        )
+        self.assertEqual(
             invoke.call_args_list,
             [
                 call(window, expected_action="disconnect"),
                 call(
-                    window,
+                    retry_window,
                     expected_action="disconnect",
                     prefer_click_input=True,
                 ),
@@ -2237,6 +3256,45 @@ class BancoChileSwitcherTests(unittest.TestCase):
         self.assertEqual(adapter_status.call_count, 3)
         invoke.assert_called_once_with(window, expected_action="disconnect")
 
+    def test_disconnect_rehydrate_uses_visible_window_helper_not_direct_launch(
+        self,
+    ) -> None:
+        instance = controller.BancoChileSwitcher({})
+        instance._last_gp_target = controller.BANCOCHILE
+        initial_window = Mock()
+        rehydrated_window = Mock()
+
+        with (
+            patch.object(controller, "_gp_diagnostics"),
+            patch.object(controller, "_gp_get_window", return_value=None),
+            patch.object(
+                controller,
+                "_ensure_gp_main_window",
+                side_effect=(initial_window, rehydrated_window),
+            ) as ensure_window,
+            patch.object(controller, "_gp_get_status_text", return_value="Connected"),
+            patch.object(controller, "_gp_get_button_label", return_value="Disconnect"),
+            patch.object(controller, "_gp_adapter_status", return_value="Up"),
+            patch.object(
+                controller,
+                "_gp_invoke_connect_button",
+                return_value=True,
+            ) as invoke,
+            patch.object(controller.time, "sleep", return_value=None),
+            patch.object(controller, "_find_exe", return_value="PanGPA.exe"),
+            patch.object(controller, "_open_gui") as open_gui,
+        ):
+            ok, message = instance.disconnect_bancochile()
+
+        self.assertFalse(ok)
+        self.assertIn("did not finish disconnecting", message)
+        self.assertEqual(
+            ensure_window.call_args_list,
+            [call("PanGPA.exe"), call("PanGPA.exe", deadline=ANY)],
+        )
+        open_gui.assert_not_called()
+        invoke.assert_called_once_with(initial_window, expected_action="disconnect")
+
     def test_disconnect_does_not_trust_disconnected_ui_while_adapter_is_up(self) -> None:
         instance = controller.BancoChileSwitcher({})
         instance._last_gp_target = controller.BANCOCHILE
@@ -2275,6 +3333,43 @@ class BancoChileSwitcherTests(unittest.TestCase):
 
         self.assertFalse(ok)
         self.assertIn("did not finish disconnecting", message)
+
+    def test_disconnect_verification_obeys_wall_clock_deadline(self) -> None:
+        instance = controller.BancoChileSwitcher({})
+        instance._last_gp_target = controller.BANCOCHILE
+        window = Mock()
+        deadline = controller.GP_DISCONNECT_VERIFY_TIMEOUT_SECONDS
+
+        with (
+            patch.object(controller, "_gp_diagnostics"),
+            patch.object(
+                controller,
+                "_ensure_gp_main_window",
+                return_value=window,
+            ),
+            patch.object(controller, "_gp_get_window") as get_window,
+            patch.object(controller, "_gp_get_status_text", return_value="Connected"),
+            patch.object(controller, "_gp_get_button_label", return_value="Disconnect"),
+            patch.object(controller, "_gp_adapter_status", return_value="Up"),
+            patch.object(
+                controller,
+                "_gp_invoke_connect_button",
+                return_value=True,
+            ) as invoke,
+            patch.object(controller.time, "sleep") as sleep,
+            patch.object(
+                controller.time,
+                "monotonic",
+                side_effect=(100.0, 100.0 + deadline + 0.1, 100.0 + deadline + 0.1),
+            ),
+        ):
+            ok, message = instance.disconnect_bancochile()
+
+        self.assertFalse(ok)
+        self.assertIn("did not finish disconnecting", message)
+        invoke.assert_called_once_with(window, expected_action="disconnect")
+        get_window.assert_not_called()
+        sleep.assert_not_called()
 
 
 if __name__ == "__main__":

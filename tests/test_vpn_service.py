@@ -39,6 +39,10 @@ class _FakeController:
     def get_status(self) -> str:
         return self.status
 
+    def get_monitor_status(self) -> str:
+        self.calls.append("get_monitor_status")
+        return self.status
+
     def disconnect_cisco(self):
         self.calls.append("disconnect_cisco")
         if self.disconnect_ok:
@@ -214,6 +218,49 @@ class VPNServiceTests(unittest.TestCase):
 
         self.assertEqual(status, NONE)
         self.assertEqual(service.last_status, NONE)
+
+    def test_monitor_status_uses_non_interactive_controller_path(self) -> None:
+        controller = _FakeController(FORTI)
+        service = _bridge(controller)
+
+        status = service.try_get_monitor_status()
+
+        self.assertEqual(status, FORTI)
+        self.assertEqual(service.last_status, FORTI)
+        self.assertEqual(controller.calls, ["get_monitor_status"])
+
+    def test_failed_monitor_sample_preserves_last_known_status(self) -> None:
+        controller = _FakeController(CISCO)
+        service = _bridge(controller)
+        service._last_status = FORTI
+        controller.status = None
+
+        status = service.try_get_monitor_status()
+
+        self.assertIsNone(status)
+        self.assertEqual(service.last_status, FORTI)
+        self.assertEqual(controller.calls, ["get_monitor_status"])
+
+    def test_blocking_monitor_status_uses_same_non_interactive_path(self) -> None:
+        controller = _FakeController(CISCO)
+        service = _bridge(controller)
+
+        status = service.get_monitor_status()
+
+        self.assertEqual(status, CISCO)
+        self.assertEqual(controller.calls, ["get_monitor_status"])
+
+    def test_monitor_status_falls_back_for_older_controller_double(self) -> None:
+        controller = SimpleNamespace(
+            config={},
+            get_status=Mock(return_value=NONE),
+        )
+        service = _bridge(controller)
+
+        status = service.try_get_monitor_status()
+
+        self.assertEqual(status, NONE)
+        controller.get_status.assert_called_once_with()
 
 
 if __name__ == "__main__":
